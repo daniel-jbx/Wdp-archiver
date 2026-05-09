@@ -19,7 +19,7 @@ jobs:
 
       - name: Create resized GIF from all snapshots
         run: |
-          convert -delay 100 -loop 0 -resize 20% wdpsnapshot_*.png timelapse.gif
+          convert -delay 50 -loop 0 -resize 100% wdpsnapshot_*.png timelapse.gif
           echo "GIF created: $(ls -lh timelapse.gif)"
 
       - name: Commit timelapse.gif to assets branch
