@@ -11,22 +11,32 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
+      - name: Checkout assets branch
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: assets
+          # This ensures we fetch the history of the assets branch separately
+          fetch-depth: 0
 
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
+        # This script still outputs 'output.png'
 
-      - name: Commit updated image
+      - name: Rename with timestamp
+        run: |
+          TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
+          mv output.png "snapshot_${TIMESTAMP}.png"
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+
+      - name: Commit new snapshot to assets
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output.png
+          git add snapshot_*.png
+          # Only commit if there's something new
           if ! git diff --cached --quiet; then
-            git commit -m "Snapshot $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
+            git commit -m "Snapshot ${TIMESTAMP} UTC"
+            git push origin assets
           else
-            echo "No changes to commit"
+            echo "No new snapshot (no tile changes detected)"
           fi
