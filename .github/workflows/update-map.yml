@@ -25,7 +25,7 @@ jobs:
       - name: Rename with timestamp
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
-          mv output.png "snapshot_${TIMESTAMP}.png"
+          mv output.png "wdp_${TIMESTAMP}.png"
           echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
 
       - name: Commit new snapshot to assets
