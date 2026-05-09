@@ -2,8 +2,8 @@ name: Update Map Snapshot
 
 on:
   schedule:
-    - cron: '0 */3 * * *'   # every 3 hours
-  workflow_dispatch:          # allows manual trigger
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
 
 jobs:
   update:
@@ -11,10 +11,11 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout repository
+      - name: Checkout assets branch
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: assets
+          fetch-depth: 0
 
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
@@ -22,14 +23,20 @@ jobs:
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
 
-      - name: Commit updated image
+      - name: Rename with timestamp
+        run: |
+          TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
+          mv output.png "wdpsnapshot_${TIMESTAMP}.png"
+          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
+
+      - name: Commit new snapshot to assets
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add output.png
+          git add snapshot_*.png
           if ! git diff --cached --quiet; then
-            git commit -m "Snapshot $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
+            git commit -m "Snapshot ${TIMESTAMP} UTC"
+            git push origin assets
           else
             echo "No changes to commit"
           fi
