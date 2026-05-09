@@ -2,7 +2,7 @@ name: Update Map Snapshot
 
 on:
   schedule:
-    - cron: '0 */3 * * *'   # every 3 hours
+    - cron: '0 */1 * * *'   # every 1 hr
   workflow_dispatch:          # allows manual trigger
 
 jobs:
