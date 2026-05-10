@@ -1,0 +1,2 @@
+Mars	1982  2105	535	489	mars.gif
+Main	2512	2026	1508	894	main.gif
