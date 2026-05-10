@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wplace.live Timeline Viewer</title>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      background: #111;
+      font-family: sans-serif;
+    }
+    #canvas {
+      display: block;
+      image-rendering: pixelated;
+      cursor: grab;
+    }
+    #canvas:active {
+      cursor: grabbing;
+    }
+    #controls {
+      position: absolute;
+      bottom: 20px;
+      left: 10%;
+      right: 10%;
+      background: rgba(0,0,0,0.7);
+      border-radius: 8px;
+      padding: 10px 20px;
+      color: white;
+      display: flex;
+      align-items: center;
+      gap: 15px;
+    }
+    #slider {
+      flex: 1;
+      height: 8px;
+      -webkit-appearance: none;
+      background: #555;
+      border-radius: 4px;
+      outline: none;
+    }
+    #slider::-webkit-slider-thumb {
+      -webkit-appearance: none;
+      width: 20px;
+      height: 20px;
+      background: white;
+      border-radius: 50%;
+      cursor: pointer;
+    }
+    #timestamp-label {
+      font-size: 1rem;
+      min-width: 150px;
+      text-align: right;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      background: rgba(0,0,0,0.7);
+      padding: 5px 10px;
+      border-radius: 4px;
+      font-size: 0.9rem;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+  <div id="info">Loading snapshots…</div>
+  <div id="controls">
+    <span style="white-space:nowrap;">Timeline</span>
+    <input type="range" id="slider" min="0" max="0" value="0" step="1">
+    <span id="timestamp-label"></span>
+  </div>
+
+  <script>
+    (function() {
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const slider = document.getElementById('slider');
+      const label = document.getElementById('timestamp-label');
+      const info = document.getElementById('info');
+
+      // Disable smoothing for crisp pixels
+      ctx.imageSmoothingEnabled = false;
+
+      let snapshots = [];
+      let currentImage = new Image();
+      let currentIndex = -1;
+
+      // Pan & zoom state
+      let offsetX = 0, offsetY = 0;
+      let scale = 1.0;
+      const MIN_SCALE = 0.1;
+      const MAX_SCALE = 10.0;
+      let dragging = false;
+      let dragStartX = 0, dragStartY = 0;
+      let dragOffsetX = 0, dragOffsetY = 0;
+
+      // Resize canvas to window
+      function resize() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        drawImage();
+      }
+      window.addEventListener('resize', resize);
+
+      // Load snapshot list from JSON
+      fetch('snapshots.json')
+        .then(r => r.json())
+        .then(files => {
+          if (!files.length) {
+            info.textContent = 'No snapshots found.';
+            return;
+          }
+          snapshots = files;
+          slider.max = files.length - 1;
+          slider.value = files.length - 1;
+          info.textContent = `${files.length} snapshots loaded.`;
+          loadSnapshot(files.length - 1);
+        })
+        .catch(e => {
+          info.textContent = 'Failed to load snapshots.json';
+          console.error(e);
+        });
+
+      // Load a snapshot by index
+      function loadSnapshot(index) {
+        if (index === currentIndex || !snapshots[index]) return;
+        currentIndex = index;
+        currentImage.src = snapshots[index];
+        // Update slider and label
+        slider.value = index;
+        const filename = snapshots[index];
+        // Extract timestamp from filename (wdpsnapshot_YYYYMMDD_HHMMSS.png)
+        const match = filename.match(/(\d{8})_(\d{6})/);
+        if (match) {
+          const date = match[1];
+          const time = match[2];
+          label.textContent = `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)} ${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
+        } else {
+          label.textContent = filename;
+        }
+        // Reset pan/zoom to fit screen
+        resetView();
+      }
+
+      currentImage.onload = () => {
+        if (!currentImage.complete) return;
+        drawImage();
+      };
+
+      function resetView() {
+        // Fit image to screen (maintaining aspect ratio)
+        if (!currentImage.width) return;
+        const imgW = currentImage.width;
+        const imgH = currentImage.height;
+        const winW = canvas.width;
+        const winH = canvas.height;
+        scale = Math.min(winW / imgW, winH / imgH);
+        offsetX = (winW - imgW * scale) / 2;
+        offsetY = (winH - imgH * scale) / 2;
+        drawImage();
+      }
+
+      function drawImage() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        if (!currentImage.complete) {
+          ctx.fillStyle = '#222';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          return;
+        }
+        ctx.save();
+        ctx.translate(offsetX, offsetY);
+        ctx.scale(scale, scale);
+        ctx.drawImage(currentImage, 0, 0);
+        ctx.restore();
+      }
+
+      // Mouse panning
+      canvas.addEventListener('mousedown', (e) => {
+        dragging = true;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        dragOffsetX = offsetX;
+        dragOffsetY = offsetY;
+        canvas.style.cursor = 'grabbing';
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const dx = e.clientX - dragStartX;
+        const dy = e.clientY - dragStartY;
+        offsetX = dragOffsetX + dx;
+        offsetY = dragOffsetY + dy;
+        drawImage();
+      });
+
+      window.addEventListener('mouseup', () => {
+        dragging = false;
+        canvas.style.cursor = 'grab';
+      });
+
+      // Zoom with mouse wheel (centered on cursor)
+      canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const zoomFactor = 1.1;
+        const oldScale = scale;
+        if (e.deltaY < 0) {
+          scale *= zoomFactor;
+        } else {
+          scale /= zoomFactor;
+        }
+        scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+
+        // Adjust offset to zoom towards cursor
+        const mouseX = e.clientX;
+        const mouseY = e.clientY;
+        const scaleChange = scale / oldScale;
+        offsetX = mouseX - scaleChange * (mouseX - offsetX);
+        offsetY = mouseY - scaleChange * (mouseY - offsetY);
+        drawImage();
+      });
+
+      // Slider control
+      slider.addEventListener('input', () => {
+        const idx = parseInt(slider.value);
+        loadSnapshot(idx);
+      });
+
+      // Keyboard shortcuts: left/right arrows to step frames
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (currentIndex > 0) loadSnapshot(currentIndex - 1);
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (currentIndex < snapshots.length - 1) loadSnapshot(currentIndex + 1);
+        } else if (e.key === 'r' || e.key === 'R') {
+          resetView();
+        }
+      });
+
+      resize();
+    })();
+  </script>
+</body>
+</html>
