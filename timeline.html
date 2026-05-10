@@ -5,13 +5,17 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
   <title>wplace.live Timeline Viewer</title>
   <style>
+    * { box-sizing: border-box; }
+
     body, html {
       margin: 0;
       padding: 0;
       overflow: hidden;
       background: #000;
       font-family: sans-serif;
+      color: white;
     }
+
     #canvas {
       display: block;
       image-rendering: pixelated;
@@ -22,29 +26,76 @@
     #canvas:active {
       cursor: grabbing;
     }
+
+    /* ---- Top banner: timestamp + download links ---- */
+    #top-bar {
+      position: absolute;
+      top: 0;
+      left: 0;
+      right: 0;
+      background: rgba(0, 0, 0, 0.75);
+      padding: 8px 12px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      z-index: 20;
+      pointer-events: auto;   /* allows clicks on buttons */
+    }
+
+    #timestamp-label-top {
+      font-size: 1rem;
+      font-weight: bold;
+      text-align: center;
+      flex: 1;
+    }
+
+    #download-group {
+      display: flex;
+      gap: 6px;
+    }
+
+    .dl-btn {
+      font-size: 0.8rem;
+      padding: 4px 8px;
+      background: #444;
+      color: white;
+      border: 1px solid #888;
+      border-radius: 4px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    /* ---- Bottom controls: slider + label ---- */
     #controls {
       position: absolute;
       bottom: 20px;
       left: 5%;
       right: 5%;
-      background: rgba(0,0,0,0.75);
+      background: rgba(0, 0, 0, 0.75);
       border-radius: 8px;
       padding: 10px 16px;
-      color: white;
       display: flex;
+      flex-direction: column;
       align-items: center;
-      gap: 10px;
-      box-sizing: border-box;
-      flex-wrap: wrap;
+      gap: 4px;
+      z-index: 20;
     }
+
+    #slider-label {
+      font-size: 0.85rem;
+      opacity: 0.9;
+      pointer-events: none;
+    }
+
     #slider {
-      flex: 1;
+      width: 100%;
       height: 6px;
       -webkit-appearance: none;
       background: #555;
       border-radius: 3px;
       outline: none;
     }
+
     #slider::-webkit-slider-thumb {
       -webkit-appearance: none;
       width: 22px;
@@ -54,43 +105,37 @@
       cursor: pointer;
       border: none;
     }
-    #timestamp-label {
-      font-size: 0.9rem;
-      min-width: 140px;
-      text-align: right;
-      white-space: nowrap;
-    }
-    #download-btn {
-      font-size: 0.9rem;
-      padding: 4px 12px;
-      background: #444;
-      color: white;
-      border: 1px solid #888;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    #info {
-      position: absolute;
-      top: 10px;
-      left: 10px;
-      color: white;
-      background: rgba(0,0,0,0.7);
-      padding: 5px 12px;
-      border-radius: 4px;
-      font-size: 0.8rem;
-      pointer-events: none;
-      z-index: 10;
+
+    /* On very narrow screens, make the top bar even more compact */
+    @media (max-width: 500px) {
+      #top-bar {
+        flex-wrap: wrap;
+        justify-content: center;
+        gap: 6px;
+      }
+      #download-group {
+        order: 1;
+        width: 100%;
+        justify-content: center;
+      }
     }
   </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
-  <div id="info">Loading snapshots…</div>
+
+  <div id="top-bar">
+    <span id="timestamp-label-top">--</span>
+    <div id="download-group">
+      <button class="dl-btn" id="dl-planets">planets</button>
+      <button class="dl-btn" id="dl-main">main</button>
+      <button class="dl-btn" id="dl-far_east">far_east</button>
+    </div>
+  </div>
+
   <div id="controls">
-    <span style="white-space:nowrap; font-size:0.9rem;">Drag to move thru time</span>
+    <span id="slider-label">drag to move thru time</span>
     <input type="range" id="slider" min="0" max="0" value="0" step="1">
-    <span id="timestamp-label"></span>
-    <button id="download-btn">download overlays (x4)</button>
   </div>
 
   <script>
@@ -98,30 +143,56 @@
       const canvas = document.getElementById('canvas');
       const ctx = canvas.getContext('2d');
       const slider = document.getElementById('slider');
-      const label = document.getElementById('timestamp-label');
-      const info = document.getElementById('info');
-      const downloadBtn = document.getElementById('download-btn');
+      const sliderLabel = document.getElementById('slider-label');
+      const timestampLabelTop = document.getElementById('timestamp-label-top');
+
+      // Download buttons
+      const dlPlanets = document.getElementById('dl-planets');
+      const dlMain = document.getElementById('dl-main');
+      const dlFarEast = document.getElementById('dl-far_east');
 
       // ---- High‑DPI setup ----
       const dpr = window.devicePixelRatio || 1;
       ctx.imageSmoothingEnabled = false;
 
-      // ---- Tile range & geographic bounds ----
+      // ---- Tile range & geographic bounds (full stitched image) ----
       const TILE_START_COL = 1225;
       const TILE_START_ROW = 513;
       const TILE_END_COL = 1231;
       const TILE_END_ROW = 518;
       const ZOOM = 11;
+
       function tileX_to_lon(x, z) { return (x / Math.pow(2, z)) * 360 - 180; }
       function tileY_to_lat(y, z) {
         const n = Math.PI * (1 - 2 * y / Math.pow(2, z));
         return Math.atan(Math.sinh(n)) * 180 / Math.PI;
       }
+
       const BOUNDS = {
         north: tileY_to_lat(TILE_START_ROW, ZOOM),
         south: tileY_to_lat(TILE_END_ROW + 1, ZOOM),
         west: tileX_to_lon(TILE_START_COL, ZOOM),
         east: tileX_to_lon(TILE_END_COL + 1, ZOOM)
+      };
+
+      // Image dimensions
+      const IMG_WIDTH = 7000;
+      const IMG_HEIGHT = 6000;
+
+      // Helper: pixel coords -> lat/lon
+      function pxToBounds(x, y, w, h) {
+        const north = BOUNDS.north - (y / IMG_HEIGHT) * (BOUNDS.north - BOUNDS.south);
+        const south = BOUNDS.north - ((y + h) / IMG_HEIGHT) * (BOUNDS.north - BOUNDS.south);
+        const west = BOUNDS.west + (x / IMG_WIDTH) * (BOUNDS.east - BOUNDS.west);
+        const east = BOUNDS.west + ((x + w) / IMG_WIDTH) * (BOUNDS.east - BOUNDS.west);
+        return { north, south, west, east };
+      }
+
+      // Overlay crop definitions
+      const CROPS = {
+        planets: { x: 0, y: 1360, w: 2511, h: 2100 },   // width: 2511, height: 2100
+        main:    { x: 2512, y: 1298, w: 2488, h: 2900 },
+        far_east:{ x: 5000, y: 2000, w: 2000, h: 2000 }
       };
 
       // ---- State ----
@@ -158,17 +229,16 @@
         .then(r => r.json())
         .then(files => {
           if (!files.length) {
-            info.textContent = 'No snapshots found.';
+            timestampLabelTop.textContent = 'No snapshots found.';
             return;
           }
           snapshots = files;
           slider.max = files.length - 1;
           slider.value = files.length - 1;
-          info.textContent = `${files.length} snapshots loaded.`;
           loadSnapshot(files.length - 1);
         })
         .catch(e => {
-          info.textContent = 'Failed to load snapshots.json';
+          timestampLabelTop.textContent = 'Failed to load snapshots.json';
           console.error(e);
         });
 
@@ -178,16 +248,17 @@
         if (index === currentIndex) return;
 
         requestedIndex = index;
-
         slider.value = index;
+
         const filename = snapshots[index];
         const match = filename.match(/(\d{8})_(\d{6})/);
         if (match) {
           const date = match[1];
           const time = match[2];
-          label.textContent = `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)} ${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
+          const formatted = `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)} ${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
+          timestampLabelTop.textContent = formatted;
         } else {
-          label.textContent = filename;
+          timestampLabelTop.textContent = filename;
         }
 
         currentImage.src = snapshots[index];
@@ -232,7 +303,7 @@
         ctx.setTransform(1, 0, 0, 1, 0, 0);
       }
 
-      // ---- Pan & Zoom (mouse / wheel) ----
+      // ---- Pan & Zoom ----
       canvas.addEventListener('mousedown', (e) => {
         e.preventDefault();
         dragging = true;
@@ -255,7 +326,7 @@
         canvas.style.cursor = 'grab';
       });
 
-      // Touch events (pan & pinch)
+      // Touch events
       canvas.addEventListener('touchstart', (e) => {
         e.preventDefault();
         const touches = e.touches;
@@ -329,7 +400,7 @@
         loadSnapshot(parseInt(slider.value, 10));
       });
 
-      // ---- Keyboard ----
+      // Keyboard
       window.addEventListener('keydown', (e) => {
         if (e.key === 'ArrowLeft') {
           e.preventDefault();
@@ -342,104 +413,59 @@
         }
       });
 
-      // ---- Download 4 Quadrant Overlays ----
-      downloadBtn.addEventListener('click', () => {
+      // ---- Download Overlays (custom crops) ----
+      function downloadOverlay(cropKey) {
         if (!currentImage.complete || currentImage.naturalWidth === 0) return;
 
-        const imgW = currentImage.width;
-        const imgH = currentImage.height;
-        const halfW = Math.floor(imgW / 2);   // e.g., 3500
-        const halfH = Math.floor(imgH / 2);   // e.g., 3000
+        const crop = CROPS[cropKey];
+        if (!crop) return;
 
-        // Quadrant definitions: [name, sx, sy, sw, sh, boundsAdjust]
-        const quadrants = [
-          {
-            suffix: 'Q1',      // top‑left
-            sx: 0, sy: 0,
-            sw: halfW, sh: halfH,
-            bounds: {
-              north: BOUNDS.north,
-              south: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
-              west: BOUNDS.west,
-              east: (BOUNDS.west + BOUNDS.east) / 2
-            }
+        // Create a temporary canvas for the cropped region
+        const cropCanvas = document.createElement('canvas');
+        cropCanvas.width = crop.w;
+        cropCanvas.height = crop.h;
+        const cropCtx = cropCanvas.getContext('2d');
+        cropCtx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+
+        const dataUrl = cropCanvas.toDataURL('image/png');
+        const bounds = pxToBounds(crop.x, crop.y, crop.w, crop.h);
+
+        const timestampMatch = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
+        const timestamp = timestampMatch ? timestampMatch[0] : Date.now();
+
+        const overlay = {
+          id: `wdp_${cropKey}_${timestamp}`,
+          schemaVersion: "1",
+          name: `${cropKey}_${timestamp}.png`,
+          opacity: 1,
+          image: {
+            dataUrl: dataUrl,
+            width: crop.w,
+            height: crop.h
           },
-          {
-            suffix: 'Q2',      // top‑right
-            sx: halfW, sy: 0,
-            sw: imgW - halfW, sh: halfH,
-            bounds: {
-              north: BOUNDS.north,
-              south: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
-              west: (BOUNDS.west + BOUNDS.east) / 2,
-              east: BOUNDS.east
-            }
-          },
-          {
-            suffix: 'Q3',      // bottom‑left
-            sx: 0, sy: halfH,
-            sw: halfW, sh: imgH - halfH,
-            bounds: {
-              north: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
-              south: BOUNDS.south,
-              west: BOUNDS.west,
-              east: (BOUNDS.west + BOUNDS.east) / 2
-            }
-          },
-          {
-            suffix: 'Q4',      // bottom‑right
-            sx: halfW, sy: halfH,
-            sw: imgW - halfW, sh: imgH - halfH,
-            bounds: {
-              north: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
-              south: BOUNDS.south,
-              west: (BOUNDS.west + BOUNDS.east) / 2,
-              east: BOUNDS.east
-            }
-          }
-        ];
+          bounds: bounds,
+          colorMetric: "lab",
+          dithering: false,
+          order: 0,
+          locked: false,
+          hasPlaced: true,
+          visible: true
+        };
 
-        const timestamp = (snapshots[currentIndex].match(/(\d{8}_\d{6})/) || ['timestamp'])[0];
+        const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `wdp_${cropKey}_${timestamp}.wplace`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      }
 
-        quadrants.forEach(q => {
-          // Create a temporary canvas for this quadrant
-          const quadCanvas = document.createElement('canvas');
-          quadCanvas.width = q.sw;
-          quadCanvas.height = q.sh;
-          const quadCtx = quadCanvas.getContext('2d');
-          quadCtx.drawImage(currentImage, q.sx, q.sy, q.sw, q.sh, 0, 0, q.sw, q.sh);
-
-          const dataUrl = quadCanvas.toDataURL('image/png');
-          const overlay = {
-            id: `wdp-archiver-${timestamp}-${q.suffix}`,
-            schemaVersion: "1",
-            name: `${timestamp}_${q.suffix}.png`,
-            opacity: 1,
-            image: {
-              dataUrl: dataUrl,
-              width: q.sw,
-              height: q.sh
-            },
-            bounds: q.bounds,
-            colorMetric: "lab",
-            dithering: false,
-            order: 0,
-            locked: false,
-            hasPlaced: true,
-            visible: true
-          };
-
-          const blob = new Blob([JSON.stringify(overlay)], {type: 'application/json'});
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = `${timestamp}_${q.suffix}.wplace`;
-          document.body.appendChild(a);
-          a.click();
-          document.body.removeChild(a);
-          URL.revokeObjectURL(url);
-        });
-      });
+      dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
+      dlMain.addEventListener('click', () => downloadOverlay('main'));
+      dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
 
       resize();
     })();
