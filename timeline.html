@@ -16,7 +16,7 @@
       display: block;
       image-rendering: pixelated;
       image-rendering: crisp-edges;
-      touch-action: none;          /* prevents browser gestures on canvas */
+      touch-action: none;
       cursor: grab;
     }
     #canvas:active {
@@ -35,6 +35,7 @@
       align-items: center;
       gap: 10px;
       box-sizing: border-box;
+      flex-wrap: wrap;
     }
     #slider {
       flex: 1;
@@ -59,6 +60,15 @@
       text-align: right;
       white-space: nowrap;
     }
+    #download-btn {
+      font-size: 0.9rem;
+      padding: 4px 12px;
+      background: #444;
+      color: white;
+      border: 1px solid #888;
+      border-radius: 4px;
+      cursor: pointer;
+    }
     #info {
       position: absolute;
       top: 10px;
@@ -77,134 +87,330 @@
   <canvas id="canvas"></canvas>
   <div id="info">Loading snapshots…</div>
   <div id="controls">
-    <span style="white-space:nowrap; font-size:0.9rem;">drag to move thru time</span>
+    <span style="white-space:nowrap; font-size:0.9rem;">⏱️</span>
     <input type="range" id="slider" min="0" max="0" value="0" step="1">
     <span id="timestamp-label"></span>
+    <button id="download-btn">⬇️ Download Overlay</button>
   </div>
 
-<script>
-  (function() {
-    const canvas = document.getElementById('canvas');
-    const ctx = canvas.getContext('2d');
-    const slider = document.getElementById('slider');
-    const label = document.getElementById('timestamp-label');
-    const info = document.getElementById('info');
+  <script>
+    (function() {
+      const canvas = document.getElementById('canvas');
+      const ctx = canvas.getContext('2d');
+      const slider = document.getElementById('slider');
+      const label = document.getElementById('timestamp-label');
+      const info = document.getElementById('info');
+      const downloadBtn = document.getElementById('download-btn');
 
-    // ---- High-DPI Sharpness ----
-    // Get the device's pixel ratio (1.0 for standard, 2.0 for Retina, etc.)
-    const dpr = window.devicePixelRatio || 1;
-    // Disable any built-in smoothing
-    ctx.imageSmoothingEnabled = false;
+      // ---- High‑DPI & crisp pixel setup ----
+      const dpr = window.devicePixelRatio || 1;
+      ctx.imageSmoothingEnabled = false;
 
-    // ---- State ----
-    let snapshots = [];
-    let currentImage = new Image();
-    let currentIndex = -1;
-    let requestedIndex = -1;
+      // ---- Tile range & geographic bounds (hard‑coded for your 7×6 area) ----
+      const TILE_START_COL = 1225;
+      const TILE_START_ROW = 513;
+      const TILE_END_COL = 1231;
+      const TILE_END_ROW = 518;
+      const ZOOM = 11;   // wplace.live grid is 2048 tiles at zoom 11
 
-    // View transform (in CSS pixels)
-    let offsetX = 0, offsetY = 0;
-    let scale = 1.0;
-    const MIN_SCALE = 0.1;
-    const MAX_SCALE = 10.0;
-
-    // Pan & Pinch state...
-    // (all other state logic remains the same)
-
-    // ---------- Canvas Resize (High-DPI) ----------
-    function resize() {
-      // 1. Set the canvas's internal resolution (the 'drawing' size) to the real screen pixels
-      canvas.width = window.innerWidth * dpr;
-      canvas.height = window.innerHeight * dpr;
-      
-      // 2. Set the canvas's CSS display size to the window's CSS pixel size.
-      // This ensures the canvas is "sized" correctly for the browser, but has the internal resolution to draw sharp pixels.
-      canvas.style.width = window.innerWidth + 'px';
-      canvas.style.height = window.innerHeight + 'px';
-      
-      drawImage();
-    }
-    window.addEventListener('resize', resize);
-
-    // ---------- Image loading ----------
-    function loadSnapshot(index) {
-      if (index < 0 || index >= snapshots.length) return;
-      if (index === currentIndex) return;
-
-      requestedIndex = index;
-
-      // Update UI labels immediately
-      slider.value = index;
-      const filename = snapshots[index];
-      const match = filename.match(/(\d{8})_(\d{6})/);
-      if (match) {
-        const date = match[1];
-        const time = match[2];
-        label.textContent = `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)} ${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
-      } else {
-        label.textContent = filename;
+      // Compute longitude from tile column (Google/OSM tile scheme)
+      function tileX_to_lon(x, z) {
+        return (x / Math.pow(2, z)) * 360 - 180;
       }
 
-      // Start loading the new image (canvas still shows the old one)
-      currentImage.src = snapshots[index];
-    }
+      // Compute latitude from tile row (y = row, 0 = top)
+      function tileY_to_lat(y, z) {
+        const n = Math.PI * (1 - 2 * y / Math.pow(2, z));
+        return Math.atan(Math.sinh(n)) * 180 / Math.PI;
+      }
 
-    currentImage.onload = () => {
-      if (currentIndex !== requestedIndex) {
-        if (currentIndex === -1) {
-          currentIndex = requestedIndex;
-          resetView();   // First load: fit to screen
+      // Overall bounds of the full stitched image
+      const BOUNDS = {
+        north: tileY_to_lat(TILE_START_ROW, ZOOM),
+        south: tileY_to_lat(TILE_END_ROW + 1, ZOOM),
+        west: tileX_to_lon(TILE_START_COL, ZOOM),
+        east: tileX_to_lon(TILE_END_COL + 1, ZOOM)
+      };
+
+      // ---- State ----
+      let snapshots = [];
+      let currentImage = new Image();
+      let currentIndex = -1;
+      let requestedIndex = -1;
+
+      // View transform (CSS pixels)
+      let offsetX = 0, offsetY = 0;
+      let scale = 1.0;
+      const MIN_SCALE = 0.1;
+      const MAX_SCALE = 10.0;
+
+      // Pan & pinch state
+      let dragging = false;
+      let dragStartX = 0, dragStartY = 0;
+      let dragOffsetX = 0, dragOffsetY = 0;
+
+      let initialPinchDistance = 0;
+      let initialScale = 1.0;
+      let initialPinchCenter = { x: 0, y: 0 };
+
+      // ---- Resize ----
+      function resize() {
+        canvas.width = window.innerWidth * dpr;
+        canvas.height = window.innerHeight * dpr;
+        canvas.style.width = window.innerWidth + 'px';
+        canvas.style.height = window.innerHeight + 'px';
+        drawImage();
+      }
+      window.addEventListener('resize', resize);
+
+      // ---- Load snapshot list ----
+      fetch('snapshots.json')
+        .then(r => r.json())
+        .then(files => {
+          if (!files.length) {
+            info.textContent = 'No snapshots found.';
+            return;
+          }
+          snapshots = files;
+          slider.max = files.length - 1;
+          slider.value = files.length - 1;
+          info.textContent = `${files.length} snapshots loaded.`;
+          loadSnapshot(files.length - 1);
+        })
+        .catch(e => {
+          info.textContent = 'Failed to load snapshots.json';
+          console.error(e);
+        });
+
+      // ---- Image loading ----
+      function loadSnapshot(index) {
+        if (index < 0 || index >= snapshots.length) return;
+        if (index === currentIndex) return;
+
+        requestedIndex = index;
+
+        // Update UI
+        slider.value = index;
+        const filename = snapshots[index];
+        const match = filename.match(/(\d{8})_(\d{6})/);
+        if (match) {
+          const date = match[1];
+          const time = match[2];
+          label.textContent = `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)} ${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
         } else {
-          currentIndex = requestedIndex;
-          drawImage();   // Preserve existing pan & zoom
+          label.textContent = filename;
         }
+
+        currentImage.src = snapshots[index];
       }
-    };
 
-    currentImage.onerror = () => {
-      console.error('Failed to load image:', currentImage.src);
-    };
+      currentImage.onload = () => {
+        if (currentIndex !== requestedIndex) {
+          if (currentIndex === -1) {
+            currentIndex = requestedIndex;
+            resetView();
+          } else {
+            currentIndex = requestedIndex;
+            drawImage();
+          }
+        }
+      };
 
-    // ---------- Drawing (The Critical Part) ----------
-    function resetView() {
-      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-      const imgW = currentImage.width;
-      const imgH = currentImage.height;
-      // Fit to window's CSS dimensions
-      const winW = window.innerWidth;
-      const winH = window.innerHeight;
-      scale = Math.min(winW / imgW, winH / imgH);
-      offsetX = (winW - imgW * scale) / 2;
-      offsetY = (winH - imgH * scale) / 2;
-      drawImage();
-    }
+      currentImage.onerror = () => {
+        console.error('Failed to load image:', currentImage.src);
+      };
 
-    function drawImage() {
-      // Clear everything
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // ---- Crisp drawing with grid alignment ----
+      function resetView() {
+        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+        const imgW = currentImage.width;
+        const imgH = currentImage.height;
+        const winW = window.innerWidth;
+        const winH = window.innerHeight;
+        scale = Math.min(winW / imgW, winH / imgH);
+        // Snap initial offset so image stays centred and pixel‑aligned
+        offsetX = Math.round(((winW - imgW * scale) / 2) * dpr) / dpr;
+        offsetY = Math.round(((winH - imgH * scale) / 2) * dpr) / dpr;
+        drawImage();
+      }
 
-      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+      function drawImage() {
+        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
 
-      // *** THE FIX ***
-      // Apply the DPR scale to the entire canvas, so every drawing operation is in the high-resolution space.
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        // 1. Force the physical‑pixel scale to be an integer
+        const physScale = scale * dpr;  // image pixel -> screen pixel
+        const roundedPhysScale = Math.round(physScale) || 1;
+        scale = roundedPhysScale / dpr; // convert back to CSS scale
 
-      // Now apply our pan & zoom (still in CSS pixels, but now mapped to real screen pixels)
-      ctx.translate(offsetX, offsetY);
-      ctx.scale(scale, scale);
-      
-      // Draw the image. Since the canvas and transform handle the DPR, the image will appear crisp.
-      ctx.drawImage(currentImage, 0, 0);
-      
-      // Reset the transform for the next frame (important for clearRect and other operations)
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-    }
+        // 2. Snap offsets to physical pixel grid
+        offsetX = Math.round(offsetX * dpr) / dpr;
+        offsetY = Math.round(offsetY * dpr) / dpr;
 
-    // ---- Mouse & Touch Events ----
-    // ... (all the same pan/zoom/swipe logic you already have)
+        // 3. Clear and draw with transform
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // apply high‑DPI
+        ctx.translate(offsetX, offsetY);
+        ctx.scale(scale, scale);
+        ctx.drawImage(currentImage, 0, 0);
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+      }
 
-    resize();
-  })();
-</script>
+      // ---- Pan & Zoom ----
+      canvas.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        dragging = true;
+        dragStartX = e.clientX;
+        dragStartY = e.clientY;
+        dragOffsetX = offsetX;
+        dragOffsetY = offsetY;
+        canvas.style.cursor = 'grabbing';
+      });
+
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        offsetX = dragOffsetX + (e.clientX - dragStartX);
+        offsetY = dragOffsetY + (e.clientY - dragStartY);
+        drawImage();
+      });
+
+      window.addEventListener('mouseup', () => {
+        dragging = false;
+        canvas.style.cursor = 'grab';
+      });
+
+      // Touch events (pan & pinch)
+      canvas.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        const touches = e.touches;
+        if (touches.length === 1) {
+          dragging = true;
+          dragStartX = touches[0].clientX;
+          dragStartY = touches[0].clientY;
+          dragOffsetX = offsetX;
+          dragOffsetY = offsetY;
+        } else if (touches.length === 2) {
+          dragging = false;
+          const dx = touches[1].clientX - touches[0].clientX;
+          const dy = touches[1].clientY - touches[0].clientY;
+          initialPinchDistance = Math.hypot(dx, dy);
+          initialScale = scale;
+          initialPinchCenter.x = (touches[0].clientX + touches[1].clientX) / 2;
+          initialPinchCenter.y = (touches[0].clientY + touches[1].clientY) / 2;
+        }
+      }, { passive: false });
+
+      canvas.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        const touches = e.touches;
+        if (touches.length === 1 && dragging) {
+          offsetX = dragOffsetX + (touches[0].clientX - dragStartX);
+          offsetY = dragOffsetY + (touches[0].clientY - dragStartY);
+          drawImage();
+        } else if (touches.length === 2) {
+          const dx = touches[1].clientX - touches[0].clientX;
+          const dy = touches[1].clientY - touches[0].clientY;
+          const newDist = Math.hypot(dx, dy);
+          if (initialPinchDistance > 0) {
+            const newScale = initialScale * (newDist / initialPinchDistance);
+            scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, newScale));
+            const centerX = (touches[0].clientX + touches[1].clientX) / 2;
+            const centerY = (touches[0].clientY + touches[1].clientY) / 2;
+            const scaleChange = scale / initialScale;
+            offsetX = centerX - scaleChange * (initialPinchCenter.x - offsetX);
+            offsetY = centerY - scaleChange * (initialPinchCenter.y - offsetY);
+            initialPinchCenter.x = centerX;
+            initialPinchCenter.y = centerY;
+            initialScale = scale;
+            initialPinchDistance = newDist;
+            drawImage();
+          }
+        }
+      }, { passive: false });
+
+      canvas.addEventListener('touchend', () => {
+        dragging = false;
+        initialPinchDistance = 0;
+      });
+
+      canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        const zoomFactor = 1.1;
+        const oldScale = scale;
+        if (e.deltaY < 0) scale *= zoomFactor;
+        else scale /= zoomFactor;
+        scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
+        const mouseX = e.clientX;
+        const mouseY = e.clientY;
+        const scaleChange = scale / oldScale;
+        offsetX = mouseX - scaleChange * (mouseX - offsetX);
+        offsetY = mouseY - scaleChange * (mouseY - offsetY);
+        drawImage();
+      }, { passive: false });
+
+      // ---- Slider ----
+      slider.addEventListener('input', () => {
+        loadSnapshot(parseInt(slider.value, 10));
+      });
+
+      // ---- Keyboard ----
+      window.addEventListener('keydown', (e) => {
+        if (e.key === 'ArrowLeft') {
+          e.preventDefault();
+          if (currentIndex > 0) loadSnapshot(currentIndex - 1);
+        } else if (e.key === 'ArrowRight') {
+          e.preventDefault();
+          if (currentIndex < snapshots.length - 1) loadSnapshot(currentIndex + 1);
+        } else if (e.key === 'r' || e.key === 'R') {
+          resetView();
+        }
+      });
+
+      // ---- Download Overlay ----
+      downloadBtn.addEventListener('click', () => {
+        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+        // Convert the displayed image to a data URL
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = currentImage.width;
+        offCanvas.height = currentImage.height;
+        const offCtx = offCanvas.getContext('2d');
+        offCtx.drawImage(currentImage, 0, 0);
+        const dataUrl = offCanvas.toDataURL('image/png');
+
+        // Build overlay JSON in the required format
+        const timestamp = snapshots[currentIndex].match(/(\d{8}_\d{6})/)?.[1] || Date.now();
+        const overlay = {
+          id: `wdp-archiver-${timestamp}`,
+          schemaVersion: "1",
+          name: snapshots[currentIndex],
+          opacity: 1,
+          image: {
+            dataUrl: dataUrl,
+            width: currentImage.width,
+            height: currentImage.height
+          },
+          bounds: BOUNDS,
+          colorMetric: "lab",
+          dithering: false,
+          order: 0,
+          locked: false,
+          hasPlaced: true,
+          visible: true
+        };
+
+        // Trigger download
+        const blob = new Blob([JSON.stringify(overlay)], {type: 'application/json'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${snapshots[currentIndex].replace('.png','')}.wplace.json`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      });
+
+      resize();
+    })();
+  </script>
 </body>
 </html>
