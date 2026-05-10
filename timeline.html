@@ -87,10 +87,10 @@
   <canvas id="canvas"></canvas>
   <div id="info">Loading snapshots…</div>
   <div id="controls">
-    <span style="white-space:nowrap; font-size:0.9rem;">slide to move thru time</span>
+    <span style="white-space:nowrap; font-size:0.9rem;">⏱️</span>
     <input type="range" id="slider" min="0" max="0" value="0" step="1">
     <span id="timestamp-label"></span>
-    <button id="download-btn">download overlay</button>
+    <button id="download-btn">⬇️ Download 4 Overlays</button>
   </div>
 
   <script>
@@ -102,29 +102,21 @@
       const info = document.getElementById('info');
       const downloadBtn = document.getElementById('download-btn');
 
-      // ---- High‑DPI & crisp pixel setup ----
+      // ---- High‑DPI setup ----
       const dpr = window.devicePixelRatio || 1;
       ctx.imageSmoothingEnabled = false;
 
-      // ---- Tile range & geographic bounds (hard‑coded for your 7×6 area) ----
+      // ---- Tile range & geographic bounds ----
       const TILE_START_COL = 1225;
       const TILE_START_ROW = 513;
       const TILE_END_COL = 1231;
       const TILE_END_ROW = 518;
-      const ZOOM = 11;   // wplace.live grid is 2048 tiles at zoom 11
-
-      // Compute longitude from tile column (Google/OSM tile scheme)
-      function tileX_to_lon(x, z) {
-        return (x / Math.pow(2, z)) * 360 - 180;
-      }
-
-      // Compute latitude from tile row (y = row, 0 = top)
+      const ZOOM = 11;
+      function tileX_to_lon(x, z) { return (x / Math.pow(2, z)) * 360 - 180; }
       function tileY_to_lat(y, z) {
         const n = Math.PI * (1 - 2 * y / Math.pow(2, z));
         return Math.atan(Math.sinh(n)) * 180 / Math.PI;
       }
-
-      // Overall bounds of the full stitched image
       const BOUNDS = {
         north: tileY_to_lat(TILE_START_ROW, ZOOM),
         south: tileY_to_lat(TILE_END_ROW + 1, ZOOM),
@@ -138,13 +130,11 @@
       let currentIndex = -1;
       let requestedIndex = -1;
 
-      // View transform (CSS pixels)
       let offsetX = 0, offsetY = 0;
       let scale = 1.0;
       const MIN_SCALE = 0.1;
       const MAX_SCALE = 10.0;
 
-      // Pan & pinch state
       let dragging = false;
       let dragStartX = 0, dragStartY = 0;
       let dragOffsetX = 0, dragOffsetY = 0;
@@ -189,7 +179,6 @@
 
         requestedIndex = index;
 
-        // Update UI
         slider.value = index;
         const filename = snapshots[index];
         const match = filename.match(/(\d{8})_(\d{6})/);
@@ -220,7 +209,7 @@
         console.error('Failed to load image:', currentImage.src);
       };
 
-      // ---- Crisp drawing with grid alignment ----
+      // ---- Drawing ----
       function resetView() {
         if (!currentImage.complete || currentImage.naturalWidth === 0) return;
         const imgW = currentImage.width;
@@ -228,34 +217,22 @@
         const winW = window.innerWidth;
         const winH = window.innerHeight;
         scale = Math.min(winW / imgW, winH / imgH);
-        // Snap initial offset so image stays centred and pixel‑aligned
-        offsetX = Math.round(((winW - imgW * scale) / 2) * dpr) / dpr;
-        offsetY = Math.round(((winH - imgH * scale) / 2) * dpr) / dpr;
+        offsetX = (winW - imgW * scale) / 2;
+        offsetY = (winH - imgH * scale) / 2;
         drawImage();
       }
 
       function drawImage() {
-        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-
-        // 1. Force the physical‑pixel scale to be an integer
-        const physScale = scale * dpr;  // image pixel -> screen pixel
-        const roundedPhysScale = Math.round(physScale) || 1;
-        scale = roundedPhysScale / dpr; // convert back to CSS scale
-
-        // 2. Snap offsets to physical pixel grid
-        offsetX = Math.round(offsetX * dpr) / dpr;
-        offsetY = Math.round(offsetY * dpr) / dpr;
-
-        // 3. Clear and draw with transform
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0); // apply high‑DPI
+        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         ctx.translate(offsetX, offsetY);
         ctx.scale(scale, scale);
         ctx.drawImage(currentImage, 0, 0);
         ctx.setTransform(1, 0, 0, 1, 0, 0);
       }
 
-      // ---- Pan & Zoom ----
+      // ---- Pan & Zoom (mouse / wheel) ----
       canvas.addEventListener('mousedown', (e) => {
         e.preventDefault();
         dragging = true;
@@ -365,48 +342,103 @@
         }
       });
 
-      // ---- Download Overlay ----
+      // ---- Download 4 Quadrant Overlays ----
       downloadBtn.addEventListener('click', () => {
         if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-        // Convert the displayed image to a data URL
-        const offCanvas = document.createElement('canvas');
-        offCanvas.width = currentImage.width;
-        offCanvas.height = currentImage.height;
-        const offCtx = offCanvas.getContext('2d');
-        offCtx.drawImage(currentImage, 0, 0);
-        const dataUrl = offCanvas.toDataURL('image/png');
 
-        // Build overlay JSON in the required format
-        const timestamp = snapshots[currentIndex].match(/(\d{8}_\d{6})/)?.[1] || Date.now();
-        const overlay = {
-          id: `wdp-archiver-${timestamp}`,
-          schemaVersion: "1",
-          name: snapshots[currentIndex],
-          opacity: 1,
-          image: {
-            dataUrl: dataUrl,
-            width: currentImage.width,
-            height: currentImage.height
+        const imgW = currentImage.width;
+        const imgH = currentImage.height;
+        const halfW = Math.floor(imgW / 2);   // e.g., 3500
+        const halfH = Math.floor(imgH / 2);   // e.g., 3000
+
+        // Quadrant definitions: [name, sx, sy, sw, sh, boundsAdjust]
+        const quadrants = [
+          {
+            suffix: 'Q1',      // top‑left
+            sx: 0, sy: 0,
+            sw: halfW, sh: halfH,
+            bounds: {
+              north: BOUNDS.north,
+              south: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
+              west: BOUNDS.west,
+              east: (BOUNDS.west + BOUNDS.east) / 2
+            }
           },
-          bounds: BOUNDS,
-          colorMetric: "lab",
-          dithering: false,
-          order: 0,
-          locked: false,
-          hasPlaced: true,
-          visible: true
-        };
+          {
+            suffix: 'Q2',      // top‑right
+            sx: halfW, sy: 0,
+            sw: imgW - halfW, sh: halfH,
+            bounds: {
+              north: BOUNDS.north,
+              south: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
+              west: (BOUNDS.west + BOUNDS.east) / 2,
+              east: BOUNDS.east
+            }
+          },
+          {
+            suffix: 'Q3',      // bottom‑left
+            sx: 0, sy: halfH,
+            sw: halfW, sh: imgH - halfH,
+            bounds: {
+              north: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
+              south: BOUNDS.south,
+              west: BOUNDS.west,
+              east: (BOUNDS.west + BOUNDS.east) / 2
+            }
+          },
+          {
+            suffix: 'Q4',      // bottom‑right
+            sx: halfW, sy: halfH,
+            sw: imgW - halfW, sh: imgH - halfH,
+            bounds: {
+              north: tileY_to_lat(TILE_START_ROW + (TILE_END_ROW - TILE_START_ROW + 1) / 2, ZOOM),
+              south: BOUNDS.south,
+              west: (BOUNDS.west + BOUNDS.east) / 2,
+              east: BOUNDS.east
+            }
+          }
+        ];
 
-        // Trigger download
-        const blob = new Blob([JSON.stringify(overlay)], {type: 'application/json'});
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `${snapshots[currentIndex].replace('.png','')}.wplace.json`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
+        const timestamp = (snapshots[currentIndex].match(/(\d{8}_\d{6})/) || ['timestamp'])[0];
+
+        quadrants.forEach(q => {
+          // Create a temporary canvas for this quadrant
+          const quadCanvas = document.createElement('canvas');
+          quadCanvas.width = q.sw;
+          quadCanvas.height = q.sh;
+          const quadCtx = quadCanvas.getContext('2d');
+          quadCtx.drawImage(currentImage, q.sx, q.sy, q.sw, q.sh, 0, 0, q.sw, q.sh);
+
+          const dataUrl = quadCanvas.toDataURL('image/png');
+          const overlay = {
+            id: `wdp-archiver-${timestamp}-${q.suffix}`,
+            schemaVersion: "1",
+            name: `${timestamp}_${q.suffix}.png`,
+            opacity: 1,
+            image: {
+              dataUrl: dataUrl,
+              width: q.sw,
+              height: q.sh
+            },
+            bounds: q.bounds,
+            colorMetric: "lab",
+            dithering: false,
+            order: 0,
+            locked: false,
+            hasPlaced: true,
+            visible: true
+          };
+
+          const blob = new Blob([JSON.stringify(overlay)], {type: 'application/json'});
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${timestamp}_${q.suffix}.wplace`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        });
       });
 
       resize();
