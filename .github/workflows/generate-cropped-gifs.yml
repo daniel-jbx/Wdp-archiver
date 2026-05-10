@@ -24,7 +24,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          # Add all .gif files that might have been created/updated
           git add *.gif
           if ! git diff --cached --quiet; then
             git commit -m "Update cropped GIFs (${GITHUB_RUN_NUMBER})"
