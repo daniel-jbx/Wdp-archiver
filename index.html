@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>wplace.live Timelapses</title>
+  <style>
+    body {
+      background: #111;
+      color: #eee;
+      font-family: sans-serif;
+      text-align: center;
+      margin: 2rem;
+    }
+    .gallery {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 1.5rem;
+      margin-top: 2rem;
+    }
+    .gallery a {
+      display: block;
+      text-decoration: none;
+      color: white;
+    }
+    .gallery img {
+      width: 200px;
+      height: auto;
+      image-rendering: pixelated;
+      border: 2px solid #444;
+      border-radius: 6px;
+    }
+    .gallery .label {
+      margin-top: 0.5rem;
+      font-size: 1rem;
+    }
+
+    /* Full‑screen overlay */
+    #fullscreen-overlay {
+      display: none;
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background: #000;
+      z-index: 1000;
+      cursor: pointer;
+    }
+    #fullscreen-overlay img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      image-rendering: pixelated;
+    }
+    #close-btn {
+      position: absolute;
+      top: 10px; right: 20px;
+      font-size: 2.5rem;
+      color: white;
+      opacity: 0.8;
+      cursor: pointer;
+      z-index: 1001;
+    }
+  </style>
+</head>
+<body>
+  <h1>wplace.live Timelapse GIFs</h1>
+  <div class="gallery" id="gallery"></div>
+
+  <div id="fullscreen-overlay" onclick="closeFullscreen()">
+    <span id="close-btn">&times;</span>
+    <img id="fullscreen-img" src="" alt="Fullscreen view">
+  </div>
+
+  <script>
+    // ============================================
+    // LIST YOUR GIF FILES HERE (update as needed)
+    // ============================================
+    const gifs = [
+      { name: 'Mars', file: 'mars.gif' },
+      { name: 'Main', file: 'main.gif' }
+      // Add more entries if you add crops:
+      // { name: 'Ocean', file: 'ocean.gif' }
+    ];
+
+    const gallery = document.getElementById('gallery');
+    gifs.forEach(gif => {
+      const container = document.createElement('div');
+      const link = document.createElement('a');
+      link.href = '#';
+      link.onclick = (e) => {
+        e.preventDefault();
+        openFullscreen(gif.file);
+      };
+      const img = document.createElement('img');
+      img.src = gif.file;          // relative path, works from assets root
+      img.alt = gif.name;
+      img.title = 'Click to view fullscreen';
+      link.appendChild(img);
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = gif.name;
+      container.appendChild(link);
+      container.appendChild(label);
+      gallery.appendChild(container);
+    });
+
+    function openFullscreen(filename) {
+      document.getElementById('fullscreen-img').src = filename;
+      document.getElementById('fullscreen-overlay').style.display = 'block';
+    }
+
+    function closeFullscreen() {
+      document.getElementById('fullscreen-overlay').style.display = 'none';
+    }
+
+    // Option: allow pressing Escape to close
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeFullscreen();
+    });
+  </script>
+</body>
+</html>
