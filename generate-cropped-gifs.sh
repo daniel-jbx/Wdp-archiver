@@ -8,14 +8,46 @@ if [ ! -f "$CROPS_FILE" ]; then
   exit 1
 fi
 
-# Collect snapshots (matches any .png with "snapshot" in the name)
-SNAPSHOTS=( *snapshot*.png )
-if [ ${#SNAPSHOTS[@]} -eq 0 ]; then
-  echo "No snapshot files found."
+# Collect all potential snapshots (any .png with "snapshot" in the name)
+ALL_SNAPS=( *snapshot*.png )
+if [ ${#ALL_SNAPS[@]} -eq 0 ]; then
+  echo "No snapshot files found at all."
   exit 1
 fi
 
-echo "Found ${#SNAPSHOTS[@]} snapshots."
+# Current time in seconds since epoch
+NOW_EPOCH=$(date +%s)
+
+# Filter to only snapshots from the last 24 hours
+SNAPSHOTS=()
+for s in "${ALL_SNAPS[@]}"; do
+  # Extract timestamp part from filename, e.g., wdpsnapshot_20260509_223954.png -> 20260509_223954
+  ts_part="${s#*snapshot_}"   # remove everything up to and including "snapshot_"
+  ts_part="${ts_part%_crop}"  # safety if cropped frame sneaks in (not needed but harmless)
+  ts_part="${ts_part%.png}"   # remove extension
+
+  # Reformat to YYYY-MM-DD HH:MM:SS (needed for date command)
+  ts_fmt="${ts_part:0:4}-${ts_part:4:2}-${ts_part:6:2} ${ts_part:9:2}:${ts_part:11:2}:${ts_part:13:2}"
+
+  # Convert to epoch (ignoring timezone, UTC is fine)
+  file_epoch=$(date -d "$ts_fmt" +%s 2>/dev/null || echo "0")
+  if [ "$file_epoch" -eq 0 ]; then
+    echo "  Skipping $s (could not parse date)" >&2
+    continue
+  fi
+
+  # Include if less than 24 hours old (86400 seconds)
+  if [ $(( NOW_EPOCH - file_epoch )) -le 86400 ]; then
+    SNAPSHOTS+=("$s")
+  fi
+done
+
+if [ ${#SNAPSHOTS[@]} -eq 0 ]; then
+  echo "No snapshots from the last 24 hours found. Nothing to do."
+  exit 0
+fi
+
+echo "Using ${#SNAPSHOTS[@]} snapshots from the last 24 hours."
 
 # Normal delay between frames (1/100 sec)
 NORMAL_DELAY=20
@@ -31,23 +63,25 @@ while read -r name x y w h outfile; do
   tmpdir="tmp_${name}"
   mkdir -p "$tmpdir"
 
-  # We'll create annotated cropped frames
+  # Determine font size proportional to crop height (minimum 10px)
+  FONT_SIZE=$(( h / 20 ))
+  [ "$FONT_SIZE" -lt 10 ] && FONT_SIZE=10
+
   i=0
   for snap in "${SNAPSHOTS[@]}"; do
-    # Extract timestamp from filename (e.g., wdpsnapshot_20260509_223954.png -> 2026-05-09 22:39:54)
-    ts_raw="${snap##*snapshot_}"       # remove everything before 'snapshot_'
-    ts_raw="${ts_raw%.png}"            # strip extension
-    # Reformat to a human-readable date (YYYY-MM-DD HH:MM:SS)
-    ts_fmt="${ts_raw:0:4}-${ts_raw:4:2}-${ts_raw:6:2} ${ts_raw:9:2}:${ts_raw:11:2}:${ts_raw:13:2}"
+    # Extract timestamp for the overlay
+    ts_part="${snap#*snapshot_}"
+    ts_part="${ts_part%.png}"
+    ts_fmt="${ts_part:0:4}-${ts_part:4:2}-${ts_part:6:2} ${ts_part:9:2}:${ts_part:11:2}:${ts_part:13:2}"
 
     outframe="${tmpdir}/frame_$(printf "%04d" $i).png"
     echo "  cropping & annotating $snap (${x},${y} ${w}x${h}) – $ts_fmt"
 
-    # Crop the full snapshot, then overlay the timestamp in the bottom-right corner
+    # Crop and overlay timestamp with dynamic font size
     convert "$snap" \
       -crop "${w}x${h}+${x}+${y}" +repage \
       -gravity SouthEast \
-      -pointsize 24 \
+      -pointsize "$FONT_SIZE" \
       -fill white \
       -undercolor '#00000080' \
       -annotate +10+10 "$ts_fmt" \
@@ -55,14 +89,11 @@ while read -r name x y w h outfile; do
     i=$((i+1))
   done
 
-  # Build the GIF: all frames with normal delay, then copy last frame with a longer delay
-  # Use a list of files with -delay options
+  # Build GIF with end pause
   frame_files=("${tmpdir}"/*.png)
   last_frame="${tmpdir}/last_hold.png"
   cp "${frame_files[-1]}" "$last_frame"
 
-  # Construct convert command
-  # Syntax: convert -delay NORMAL file1 ... -delay END file_hold -loop 0 output.gif
   convert \
     -delay $NORMAL_DELAY "${frame_files[@]}" \
     -delay $END_DELAY "$last_frame" \
@@ -71,7 +102,6 @@ while read -r name x y w h outfile; do
 
   echo "  GIF saved: $outfile (${#frame_files[@]} frames + end pause)"
 
-  # Clean up
   rm -rf "$tmpdir"
 done < "$CROPS_FILE"
 
