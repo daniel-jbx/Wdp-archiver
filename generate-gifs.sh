@@ -74,18 +74,30 @@ while read -r name x y w h outfile; do
     ts_part="${ts_part%.png}"
     ts_fmt="${ts_part:0:4}-${ts_part:4:2}-${ts_part:6:2} ${ts_part:9:2}:${ts_part:11:2}:${ts_part:13:2}"
 
-    outframe="${tmpdir}/frame_$(printf "%04d" $i).png"
+     outframe="${tmpdir}/frame_$(printf "%04d" $i).png"
     echo "  cropping & annotating $snap (${x},${y} ${w}x${h}) – $ts_fmt"
 
-    # Crop and overlay timestamp with dynamic font size
-    convert "$snap" \
-      -crop "${w}x${h}+${x}+${y}" +repage \
-      -gravity SouthEast \
+    # Banner dimensions: height = font size * 2 + 10px padding
+    BANNER_HEIGHT=$((FONT_SIZE * 2 + 10))
+
+    # Step 1: Crop the snapshot to the region of interest
+    CROPPED="${tmpdir}/temp_cropped_${i}.png"
+    convert "$snap" -crop "${w}x${h}+${x}+${y}" +repage "$CROPPED"
+
+    # Step 2: Create a black banner with the timestamp centred
+    BANNER="${tmpdir}/temp_banner_${i}.png"
+    convert -size "${w}x${BANNER_HEIGHT}" xc:black \
+      -gravity Center \
       -pointsize "$FONT_SIZE" \
       -fill white \
-      -undercolor '#00000080' \
-      -annotate +10+10 "$ts_fmt" \
-      "$outframe"
+      -annotate +0+0 "$ts_fmt" \
+      "$BANNER"
+
+    # Step 3: Stack banner on top of cropped image
+    convert "$CROPPED" "$BANNER" -append +repage "$outframe"
+
+    # Clean up temp files
+    rm "$CROPPED" "$BANNER"
     i=$((i+1))
   done
 
