@@ -40,3 +40,15 @@ jobs:
           else
             echo "No changes to commit"
           fi
+      - name: Generate cropped GIFs (last 24h)
+        run: bash generate-cropped-gifs.sh
+
+      - name: Commit updated GIFs
+        run: |
+          git add *.gif
+          if ! git diff --cached --quiet; then
+            git commit -m "Auto-update cropped GIFs (24h)"
+            git push origin assets
+          else
+            echo "No GIF changes"
+          fi
