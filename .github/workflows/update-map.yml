@@ -40,15 +40,21 @@ jobs:
           else
             echo "No changes to commit"
           fi
-      - name: Generate cropped GIFs (last 24h)
+          
+      - name: Generate GIFs (last 24h)
         run: bash generate-gifs.sh
 
-      - name: Commit updated GIFs
+      - name: Commit updated GIFs and snapshot list (always)
         run: |
-          git add *.gif
-          if ! git diff --cached --quiet; then
-            git commit -m "Auto-update cropped GIFs (24h)"
-            git push origin assets
-          else
-            echo "No GIF changes"
-          fi
+          git add *.gif snapshots.json
+          git commit --allow-empty -m "Auto-update cropped GIFs and snapshot list (24h)"
+          git push origin assets
+          
+      - name: Update snapshot list JSON
+        run: |
+          python3 -c "
+          import glob, json
+          files = sorted(glob.glob('wdpsnapshot_*.png'))
+          with open('snapshots.json','w') as f:
+              json.dump(files, f)
+          "
