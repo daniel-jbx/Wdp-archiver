@@ -50,7 +50,7 @@ montage $FILELIST \
 # ---- Apply the wplace palette ----
 if [ -f palette.png ]; then
   echo "Mapping to wplace palette..."
-  convert "$input" -remap palette.png -type Palette PNG8:"$output"
+  convert "$FULL_OUTPUT" -remap palette.png -type Palette PNG8:"$OUTPUT"
   rm "$FULL_OUTPUT"   # keep only the indexed version
 else
   echo "Warning: palette.png not found, keeping full RGBA snapshot."
