@@ -1,0 +1,43 @@
+name: Sandbox - Test Indexed Conversion
+
+on:
+  workflow_dispatch:   # manual trigger only
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout assets branch
+        uses: actions/checkout@v4
+        with:
+          ref: assets
+
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
+
+      - name: Create indexed test copy of the latest snapshot
+        run: |
+          LATEST=$(ls -1 wdpsnapshot_*.png | tail -n 1)
+          echo "Using: $LATEST"
+          cp "$LATEST" "TEST_indexed_${LATEST}"
+          # Quantise to 64 colours, preserving full alpha
+          convert "TEST_indexed_${LATEST}" \
+                  -colors 64 \
+                  -alpha set \
+                  -type Palette \
+                  PNG8:"TEST_indexed_${LATEST}"
+          echo "Test file created: TEST_indexed_${LATEST}"
+
+      - name: Commit test file
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add TEST_indexed_*.png
+          if ! git diff --cached --quiet; then
+            git commit -m "Add sandbox indexed test snapshot"
+            git push origin assets
+          else
+            echo "No changes"
+          fi
