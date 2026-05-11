@@ -424,67 +424,81 @@
     // ---- Filtering by interval (with optional anchor) ----
     let currentInterval = 180; // minutes (3 hrs)
 
-    function buildFilteredList(anchorEpoch = null) {
-      const intervalSec = currentInterval * 60;
-      const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
-      candidates.sort((a, b) => a.epoch - b.epoch);
+   function buildFilteredList(anchorName = null) {
+  const intervalSec = currentInterval * 60;
+  // Convert to array of { name, epoch } sorted old→new
+  const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
+  candidates.sort((a, b) => a.epoch - b.epoch);
 
-      let selected = [];
-      if (anchorEpoch !== null) {
-        // Expand outward from anchor, preserving interval spacing
-        const forward = [];
-        let lastEpoch = anchorEpoch;
-        for (let i = candidates.length - 1; i >= 0; i--) {
-          if (candidates[i].epoch <= anchorEpoch) continue;
-          if (candidates[i].epoch - lastEpoch >= intervalSec) {
-            forward.unshift(candidates[i]);
-            lastEpoch = candidates[i].epoch;
-          }
-        }
-        const backward = [];
-        lastEpoch = anchorEpoch;
-        for (let i = 0; i < candidates.length; i++) {
-          if (candidates[i].epoch >= anchorEpoch) continue;
-          if (lastEpoch - candidates[i].epoch >= intervalSec) {
-            backward.push(candidates[i]);
-            lastEpoch = candidates[i].epoch;
-          }
-        }
-        selected = backward.concat(candidates.find(c => c.epoch === anchorEpoch)).concat(forward);
-      } else {
-        // Default: newest first, walk backward keeping interval
-        for (let i = candidates.length - 1; i >= 0; i--) {
-          if (selected.length === 0) {
-            selected.unshift(candidates[i]);
-          } else {
-            const lastEpoch = selected[0].epoch;
-            if (lastEpoch - candidates[i].epoch >= intervalSec) {
-              selected.unshift(candidates[i]);
-            }
-          }
+  let selected = [];
+  if (anchorName !== null) {
+    // Find anchor candidate by name (exact match)
+    const anchorIdx = candidates.findIndex(c => c.name === anchorName);
+    if (anchorIdx === -1) {
+      // Anchor not found – fall back to default (newest)
+      anchorName = null;
+    } else {
+      const anchor = candidates[anchorIdx];
+      const anchorEpoch = anchor.epoch;
+
+      // Forward direction (newer than anchor, stepping ≥ interval)
+      const forward = [];
+      let lastEpoch = anchorEpoch;
+      for (let i = anchorIdx + 1; i < candidates.length; i++) {
+        if (candidates[i].epoch - lastEpoch >= intervalSec) {
+          forward.push(candidates[i]);   // will be in chronological order (already sorted)
+          lastEpoch = candidates[i].epoch;
         }
       }
 
-      filteredSnapshots = selected.map(c => c.name);
-      sliderValueToName = {};
-      filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
-      slider.max = filteredSnapshots.length - 1;
-
-      if (filteredSnapshots.length === 0) {
-        timestampLabelTop.textContent = 'No snapshots match interval.';
-        return;
-      }
-
-      let targetIdx = filteredSnapshots.length - 1; // newest
-      if (anchorEpoch !== null) {
-        const anchorName = candidates.find(c => c.epoch === anchorEpoch)?.name;
-        if (anchorName) {
-          const idx = filteredSnapshots.indexOf(anchorName);
-          if (idx !== -1) targetIdx = idx;
+      // Backward direction (older than anchor, stepping ≥ interval)
+      const backward = [];
+      lastEpoch = anchorEpoch;
+      for (let i = anchorIdx - 1; i >= 0; i--) {
+        if (lastEpoch - candidates[i].epoch >= intervalSec) {
+          backward.unshift(candidates[i]); // unshift to keep oldest first
+          lastEpoch = candidates[i].epoch;
         }
       }
-      loadFilteredSnapshot(targetIdx);
+
+      // Combine: older → anchor → newer
+      selected = backward.concat(anchor).concat(forward);
     }
+  }
+
+  if (!anchorName) {
+    // Default: start from newest and walk backward keeping interval
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      if (selected.length === 0) {
+        selected.unshift(candidates[i]);
+      } else {
+        const lastEpoch = selected[0].epoch; // newest kept so far
+        if (lastEpoch - candidates[i].epoch >= intervalSec) {
+          selected.unshift(candidates[i]);
+        }
+      }
+    }
+  }
+
+  // Build final lists
+  filteredSnapshots = selected.map(c => c.name);
+  sliderValueToName = {};
+  filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+  slider.max = filteredSnapshots.length - 1;
+
+  if (filteredSnapshots.length === 0) {
+    timestampLabelTop.textContent = 'No snapshots match interval.';
+    return;
+  }
+
+  // Determine which index to show
+  let targetIdx = filteredSnapshots.length - 1; // newest
+  if (anchorName) {
+    const idx = filteredSnapshots.indexOf(anchorName);
+    if (idx !== -1) targetIdx = idx;
+  }
+  loadFilteredSnapshot(targetIdx);
+}
 
     function loadFilteredSnapshot(idx) {
       if (idx < 0 || idx >= filteredSnapshots.length) return;
@@ -541,13 +555,12 @@
     });
 
     // ---- Snapshot jump dropdown ----
-    snapshotSelect.addEventListener('change', () => {
-      const selectedFilename = snapshotSelect.value;
-      if (!selectedFilename) return;
-      const anchorEpoch = getEpoch(selectedFilename);
-      // Keep current interval; just center around chosen snapshot
-      buildFilteredList(anchorEpoch);
-    });
+snapshotSelect.addEventListener('change', () => {
+  const selectedFilename = snapshotSelect.value;
+  if (!selectedFilename) return;
+  // Pass the filename directly – interval stays unchanged
+  buildFilteredList(selectedFilename);
+});
 
     // ---- Slider input (new) ----
     slider.addEventListener('input', () => {
