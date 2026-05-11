@@ -128,7 +128,7 @@
     <div id="download-group">
       <button class="dl-btn" id="dl-planets">planets</button>
       <button class="dl-btn" id="dl-main">main</button>
-      <button class="dl-btn" id="dl-far_east">far east</button>
+      <button class="dl-btn" id="dl-far_east">far_east</button>
     </div>
   </div>
 
@@ -278,28 +278,28 @@ function downloadOverlay(cropKey) {
   const crop = CROPS[cropKey];
   if (!crop) return;
 
-  // ---- Canvas with cropped image ----
+  // ---- Canvas with cropped image (transparent) ----
   const tmp = document.createElement('canvas');
   tmp.width = crop.w;
   tmp.height = crop.h;
   const tctx = tmp.getContext('2d');
-  // Force transparent background
   tctx.clearRect(0, 0, crop.w, crop.h);
   tctx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
 
-  // ---- Generate PNG data URL (may contain transparency) ----
+  // ---- Data‑URL for the overlay JSON ----
   const dataUrl = tmp.toDataURL('image/png');
 
-  // ---- Download the raw PNG for visual inspection ----
-  const pngBlob = new Blob([dataUrl], { type: 'image/png' });
-  const pngUrl = URL.createObjectURL(pngBlob);
-  const aPng = document.createElement('a');
-  aPng.href = pngUrl;
-  aPng.download = `${cropKey}_test.png`;
-  document.body.appendChild(aPng);
-  aPng.click();
-  document.body.removeChild(aPng);
-  URL.revokeObjectURL(pngUrl);
+  // ---- Download a valid PNG for visual inspection (test only) ----
+  tmp.toBlob(function(blob) {
+    const url = URL.createObjectURL(blob);
+    const aPng = document.createElement('a');
+    aPng.href = url;
+    aPng.download = `${cropKey}_test.png`;
+    document.body.appendChild(aPng);
+    aPng.click();
+    document.body.removeChild(aPng);
+    URL.revokeObjectURL(url);
+  }, 'image/png');
 
   // ---- Build overlay JSON ----
   const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);
@@ -321,7 +321,6 @@ function downloadOverlay(cropKey) {
     visible: true
   };
 
-  // ---- Download the .wplace file ----
   const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -332,7 +331,6 @@ function downloadOverlay(cropKey) {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-
     dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
     dlMain.addEventListener('click', () => downloadOverlay('main'));
     dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
