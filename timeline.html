@@ -15,7 +15,11 @@
       touch-action: none; cursor: grab;
     }
     #canvas:active { cursor: grabbing; }
-
+    #interval-select, #snapshot-select {
+      background: #333; color: white; border: 1px solid #888;
+      border-radius: 4px; padding: 2px 4px; font-size: 0.8rem;
+      max-width: 110px;
+    }
     #top-bar {
       position: absolute; top: 0; left: 0; right: 0;
       background: rgba(0,0,0,0.75); padding: 8px 12px;
@@ -58,6 +62,21 @@
   <canvas id="canvas"></canvas>
 
   <div id="top-bar">
+    <div id="interval-group">
+      <label for="interval-select" style="font-size:0.8rem;">Interval:</label>
+      <select id="interval-select">
+        <option value="1440">1 day</option>
+        <option value="360">6 hrs</option>
+        <option value="180" selected>3 hrs</option>
+        <option value="60">1 hr</option>
+        <option value="30">30 min</option>
+        <option value="15">15 min</option>
+        <option value="0">all</option>
+      </select>
+    </div>
+    <select id="snapshot-select">
+      <option value="">Jump to…</option>
+    </select>
     <span id="timestamp-label-top">--</span>
     <div id="download-group">
       <button class="dl-btn" id="dl-planets">planets</button>
@@ -79,6 +98,8 @@
     const dlPlanets = document.getElementById('dl-planets');
     const dlMain = document.getElementById('dl-main');
     const dlFarEast = document.getElementById('dl-far_east');
+    const intervalSelect = document.getElementById('interval-select');
+    const snapshotSelect = document.getElementById('snapshot-select');
 
     // ---- WebGL context ----
     const gl = canvas.getContext('webgl', { antialias: false }) ||
@@ -184,9 +205,12 @@
     };
 
     // ---- State ----
-    let snapshots = [];
+    let allSnapshots = [];            // original sorted filenames (oldest first)
+    let filteredSnapshots = [];       // after applying interval (oldest first)
+    let sliderValueToName = {};       // maps slider index → filename (for fast lookup)
     let currentImage = new Image();
-    let currentIndex = -1, requestedIndex = -1;
+    let currentFilteredIndex = -1;
+    let requestedFilteredIndex = -1;
     let offsetX = 0, offsetY = 0, scale = 1.0;
     const MIN_SCALE = 0.1, MAX_SCALE = 10.0;
 
@@ -197,7 +221,7 @@
     const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     console.log('Max texture size:', MAX_TEX);
     const IMG_WIDTH = 7000, IMG_HEIGHT = 6000;
-    const SINGLE_TEXTURE = MAX_TEX >= IMG_WIDTH && MAX_TEX >= IMG_HEIGHT; // use one texture if supported
+    let SINGLE_TEXTURE = MAX_TEX >= IMG_WIDTH && MAX_TEX >= IMG_HEIGHT; // use let so we can disable on fallback
 
     let tileTextures = [];   // { tex, x, y, w, h } if tiling; if single, we use one entry
     let singleTextureInfo = null; // { tex, w, h }
@@ -237,7 +261,7 @@
         if (gl.getError() !== gl.NO_ERROR) {
           console.error('Failed to upload single texture, falling back to tiling.');
           gl.deleteTexture(tex);
-          SINGLE_TEXTURE = false; // fallback
+          SINGLE_TEXTURE = false; // fallback (now allowed because it's let)
         } else {
           singleTextureInfo = { tex, w: IMG_WIDTH, h: IMG_HEIGHT };
           console.log('Using single texture');
@@ -374,44 +398,174 @@
       drawScene();
     }
 
-    // ---- Snapshot loading ----
-    fetch('snapshots.json')
-      .then(r => r.json())
-      .then(files => {
-        if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
-        snapshots = files;
-        slider.max = files.length - 1;
-        slider.value = files.length - 1;
-        loadSnapshot(files.length - 1);
-      })
-      .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
+    // ---- Parse timestamp from filename (epoch seconds) ----
+    function getEpoch(filename) {
+      const m = filename.match(/(\d{8})_(\d{6})/);
+      if (!m) return 0;
+      const ds = m[1], ts = m[2];
+      return Date.UTC(
+        parseInt(ds.slice(0,4)), parseInt(ds.slice(4,6))-1, parseInt(ds.slice(6,8)),
+        parseInt(ts.slice(0,2)), parseInt(ts.slice(2,4)), parseInt(ts.slice(4,6))
+      ) / 1000;
+    }
 
-    function loadSnapshot(index) {
-      if (index < 0 || index >= snapshots.length) return;
-      if (index === currentIndex) return;
-      requestedIndex = index;
-      slider.value = index;
-      const filename = snapshots[index];
+    // Human‑readable relative time
+    function timeAgo(epochSec) {
+      const now = Date.now() / 1000;
+      let diff = Math.max(0, Math.round(now - epochSec));
+      const d = Math.floor(diff / 86400); diff -= d*86400;
+      const h = Math.floor(diff / 3600); diff -= h*3600;
+      const m = Math.floor(diff / 60);
+      if (d > 0) return `${d}d ${h}h ${m}m ago`;
+      if (h > 0) return `${h}h ${m}m ago`;
+      return `${m}m ago`;
+    }
+
+    // ---- Filtering by interval (with optional anchor) ----
+    let currentInterval = 180; // minutes (3 hrs)
+
+    function buildFilteredList(anchorEpoch = null) {
+      const intervalSec = currentInterval * 60;
+      const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
+      candidates.sort((a, b) => a.epoch - b.epoch);
+
+      let selected = [];
+      if (anchorEpoch !== null) {
+        // Expand outward from anchor, preserving interval spacing
+        const forward = [];
+        let lastEpoch = anchorEpoch;
+        for (let i = candidates.length - 1; i >= 0; i--) {
+          if (candidates[i].epoch <= anchorEpoch) continue;
+          if (candidates[i].epoch - lastEpoch >= intervalSec) {
+            forward.unshift(candidates[i]);
+            lastEpoch = candidates[i].epoch;
+          }
+        }
+        const backward = [];
+        lastEpoch = anchorEpoch;
+        for (let i = 0; i < candidates.length; i++) {
+          if (candidates[i].epoch >= anchorEpoch) continue;
+          if (lastEpoch - candidates[i].epoch >= intervalSec) {
+            backward.push(candidates[i]);
+            lastEpoch = candidates[i].epoch;
+          }
+        }
+        selected = backward.concat(candidates.find(c => c.epoch === anchorEpoch)).concat(forward);
+      } else {
+        // Default: newest first, walk backward keeping interval
+        for (let i = candidates.length - 1; i >= 0; i--) {
+          if (selected.length === 0) {
+            selected.unshift(candidates[i]);
+          } else {
+            const lastEpoch = selected[0].epoch;
+            if (lastEpoch - candidates[i].epoch >= intervalSec) {
+              selected.unshift(candidates[i]);
+            }
+          }
+        }
+      }
+
+      filteredSnapshots = selected.map(c => c.name);
+      sliderValueToName = {};
+      filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+      slider.max = filteredSnapshots.length - 1;
+
+      if (filteredSnapshots.length === 0) {
+        timestampLabelTop.textContent = 'No snapshots match interval.';
+        return;
+      }
+
+      let targetIdx = filteredSnapshots.length - 1; // newest
+      if (anchorEpoch !== null) {
+        const anchorName = candidates.find(c => c.epoch === anchorEpoch)?.name;
+        if (anchorName) {
+          const idx = filteredSnapshots.indexOf(anchorName);
+          if (idx !== -1) targetIdx = idx;
+        }
+      }
+      loadFilteredSnapshot(targetIdx);
+    }
+
+    function loadFilteredSnapshot(idx) {
+      if (idx < 0 || idx >= filteredSnapshots.length) return;
+      const filename = sliderValueToName[idx];
+      if (!filename) return;
+      requestedFilteredIndex = idx;
+      slider.value = idx;
       const m = filename.match(/(\d{8})_(\d{6})/);
       timestampLabelTop.textContent = m
         ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}`
         : filename;
-      currentImage.src = snapshots[index];
+      currentImage.src = filename;
     }
 
+    // ---- Image load handler (uses filtered indices) ----
     currentImage.onload = () => {
-      if (currentIndex !== requestedIndex) {
+      if (currentFilteredIndex !== requestedFilteredIndex) {
         createTextures(currentImage);
-        if (currentIndex === -1) {
-          currentIndex = requestedIndex;
+        if (currentFilteredIndex === -1) {
+          currentFilteredIndex = requestedFilteredIndex;
           resetView();
         } else {
-          currentIndex = requestedIndex;
+          currentFilteredIndex = requestedFilteredIndex;
           drawScene();
         }
       }
     };
     currentImage.onerror = () => console.error('Image failed:', currentImage.src);
+
+    // ---- Initial snapshot loading ----
+    fetch('snapshots.json')
+      .then(r => r.json())
+      .then(files => {
+        if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
+        allSnapshots = files; // already sorted by name (oldest first)
+        // Populate the jump dropdown (most recent first)
+        snapshotSelect.innerHTML = '<option value="">Jump to…</option>';
+        for (let i = allSnapshots.length - 1; i >= 0; i--) {
+          const ts = getEpoch(allSnapshots[i]);
+          const opt = document.createElement('option');
+          opt.value = allSnapshots[i]; // store the filename
+          opt.textContent = timeAgo(ts);
+          snapshotSelect.appendChild(opt);
+        }
+        // Build filtered list with default interval (no anchor)
+        buildFilteredList(null);
+      })
+      .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
+
+    // ---- Interval dropdown change ----
+    intervalSelect.addEventListener('change', () => {
+      currentInterval = parseInt(intervalSelect.value);
+      buildFilteredList(null);
+    });
+
+    // ---- Snapshot jump dropdown ----
+    snapshotSelect.addEventListener('change', () => {
+      const selectedFilename = snapshotSelect.value;
+      if (!selectedFilename) return;
+      const anchorEpoch = getEpoch(selectedFilename);
+      // Keep current interval; just center around chosen snapshot
+      buildFilteredList(anchorEpoch);
+    });
+
+    // ---- Slider input (new) ----
+    slider.addEventListener('input', () => {
+      loadFilteredSnapshot(parseInt(slider.value, 10));
+    });
+
+    // ---- Keyboard shortcuts (new) ----
+    window.addEventListener('keydown', e => {
+      if(e.key==='ArrowLeft'){
+        e.preventDefault();
+        if(currentFilteredIndex > 0) loadFilteredSnapshot(currentFilteredIndex - 1);
+      }
+      else if(e.key==='ArrowRight'){
+        e.preventDefault();
+        if(currentFilteredIndex < filteredSnapshots.length - 1) loadFilteredSnapshot(currentFilteredIndex + 1);
+      }
+      else if(e.key==='r'||e.key==='R') resetView();
+    });
 
     // ---- Pan & Zoom events (unchanged) ----
     canvas.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
@@ -421,13 +575,6 @@
     canvas.addEventListener('touchmove', e => { e.preventDefault(); const t=e.touches; if (t.length===1 && dragging) { offsetX=dragOffsetX+(t[0].clientX-dragStartX); offsetY=dragOffsetY+(t[0].clientY-dragStartY); drawScene(); } else if (t.length===2) { const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; const nd=Math.hypot(dx,dy); if(initialPinchDistance>0){ const ns=initialScale*(nd/initialPinchDistance); scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,ns)); const cx=(t[0].clientX+t[1].clientX)/2, cy=(t[0].clientY+t[1].clientY)/2; const sc=scale/initialScale; offsetX=cx-sc*(initialPinchCenter.x-offsetX); offsetY=cy-sc*(initialPinchCenter.y-offsetY); initialPinchCenter={x:cx,y:cy}; initialScale=scale; initialPinchDistance=nd; drawScene(); } } }, {passive:false});
     canvas.addEventListener('touchend', () => { dragging=false; initialPinchDistance=0; });
     canvas.addEventListener('wheel', e => { e.preventDefault(); const zf=1.1, old=scale; if(e.deltaY<0) scale*=zf; else scale/=zf; scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,scale)); const sc=scale/old; offsetX=e.clientX-sc*(e.clientX-offsetX); offsetY=e.clientY-sc*(e.clientY-offsetY); drawScene(); }, {passive:false});
-
-    slider.addEventListener('input', () => loadSnapshot(parseInt(slider.value,10)));
-    window.addEventListener('keydown', e => {
-      if(e.key==='ArrowLeft'){ e.preventDefault(); if(currentIndex>0) loadSnapshot(currentIndex-1); }
-      else if(e.key==='ArrowRight'){ e.preventDefault(); if(currentIndex<snapshots.length-1) loadSnapshot(currentIndex+1); }
-      else if(e.key==='r'||e.key==='R') resetView();
-    });
 
     // ---- Overlay download (transparent, reusing a single offscreen canvas) ----
     let exportCanvas = null; // reusable canvas
@@ -446,7 +593,9 @@
 
       const dataUrl = exportCanvas.toDataURL('image/png');
       const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);
-      const m = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
+      // Use filtered snapshots and current filtered index
+      const currentFilename = filteredSnapshots[currentFilteredIndex];
+      const m = currentFilename ? currentFilename.match(/(\d{8}_\d{6})/) : null;
       const ts = m ? m[0] : 'unknown';
       const overlay = {
         id: `wdp_${cropKey}_${ts}`,
