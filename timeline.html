@@ -62,7 +62,7 @@
     <div id="download-group">
       <button class="dl-btn" id="dl-planets">planets</button>
       <button class="dl-btn" id="dl-main">main</button>
-      <button class="dl-btn" id="dl-far_east">far east</button>
+      <button class="dl-btn" id="dl-far_east">far_east</button>
     </div>
   </div>
 
@@ -73,7 +73,6 @@
 
 <script>
   (function() {
-    // ---- DOM elements ----
     const canvas = document.getElementById('canvas');
     const slider = document.getElementById('slider');
     const timestampLabelTop = document.getElementById('timestamp-label-top');
@@ -88,7 +87,6 @@
       return;
     }
 
-    // Simple shaders: just draw a texture
     const vertexSrc = `
       attribute vec2 a_position;
       attribute vec2 a_texCoord;
@@ -131,23 +129,20 @@
     }
     gl.useProgram(program);
 
-    // Determine attribute/uniform locations
     const aPosLoc = gl.getAttribLocation(program, 'a_position');
     const aTexLoc = gl.getAttribLocation(program, 'a_texCoord');
     const uMatrixLoc = gl.getUniformLocation(program, 'u_matrix');
 
-    // ---- Geometry (two triangles covering [0,1]x[0,1] - we'll scale as needed) ----
+    // Full‑screen quad (unit square 0‑1, repeated to 6 verts)
     const quadVertices = new Float32Array([
-      0, 0,  0, 1,
-      1, 0,  1, 1,
-      0, 1,  0, 0,
-      1, 0,  1, 1,
-      0, 1,  0, 0,
-      1, 1,  1, 0
+      0, 0, 0, 1,
+      1, 0, 1, 1,
+      0, 1, 0, 0,
+      1, 0, 1, 1,
+      0, 1, 0, 0,
+      1, 1, 1, 0
     ]);
 
-    const vao = gl.createVertexArray();
-    gl.bindVertexArray(vao);
     const vbo = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
     gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
@@ -156,12 +151,11 @@
     gl.enableVertexAttribArray(aTexLoc);
     gl.vertexAttribPointer(aTexLoc, 2, gl.FLOAT, false, 16, 8);
 
-    // Create a texture (will be updated with the current snapshot)
     const texture = gl.createTexture();
     gl.bindTexture(gl.TEXTURE_2D, texture);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    // THE MAGIC: NEAREST filtering = blocky pixels
+    // NEAREST = crisp pixels
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
@@ -228,86 +222,6 @@
       drawScene();
     }
 
-    // Build the transformation matrix and render the quad
-    function drawScene() {
-      gl.clearColor(0.627, 0.741, 1.0, 1.0);  // water blue #A0BDFF
-      gl.clear(gl.COLOR_BUFFER_BIT);
-
-      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-
-      // Upload image to texture (only if image changed)
-      // We'll re-upload each time a new snapshot loads; for pan/zoom just redraw.
-      // For efficiency, we only call texImage2D when image is new (handled in onload).
-
-      // Matrix: map from object space [0, w] x [0, h] to clip space [-1,1]
-      const imgW = currentImage.width;
-      const imgH = currentImage.height;
-      // We want to draw a quad from (0,0) to (imgW, imgH) transformed by pan/zoom,
-      // and then project to clip space (canvas coordinates).
-      // The canvas physical size is canvas.width x canvas.height, which is display* dpr.
-      const cw = canvas.width;   // physical pixels
-      const ch = canvas.height;
-      const dpr = window.devicePixelRatio || 1;
-      const cssW = window.innerWidth;
-      const cssH = window.innerHeight;
-
-      // Basic projection: CSS pixel space to clip space
-      // 2/cssW, 0, -1, 0, 2/cssH, -1, 0, 0, 1
-      // Then apply pan: translate(offX, offY)
-      // Then apply zoom: scale(scale, scale)
-      // The image itself ranges (0,imgW) in x and (0,imgH) in y.
-      // So final matrix = projection * pan * zoom
-
-      const proj = new Float32Array([
-        2/cssW, 0, 0,
-        0, -2/cssH, 0,
-        -1, 1, 1
-      ]);
-      // pan
-      const pan = new Float32Array([
-        1, 0, 0,
-        0, 1, 0,
-        offsetX, offsetY, 1
-      ]);
-      // zoom
-      const zoom = new Float32Array([
-        scale, 0, 0,
-        0, scale, 0,
-        0, 0, 1
-      ]);
-      // Multiply: proj * pan * zoom
-      const tmp = new Float32Array(9);
-      matrixMultiply3(pan, zoom, tmp);
-      matrixMultiply3(proj, tmp, tmp);
-
-      // Since WebGL coordinates have Y flipped (0 at bottom), we already flipped in proj (negative 2/cssH).
-      // The image Y=0 is top, but our quad Y=0 is top? We'll adjust in texcoords.
-      // The quad vertices are [0,0] top-left, [1,0] top-right, [0,1] bottom-left, [1,1] bottom-right.
-      // But in image coordinates, top-left is (0,0) and bottom-right is (imgW,imgH).
-      // We'll set the attribute positions accordingly.
-
-      // Actually, we'll just redo the quad more directly:
-      // Positions: x and y of the quad corners in image pixels, but after pan/zoom they are in CSS pixels.
-      // We'll pass the image width/height as uniforms to scale the quad to [0,w] range.
-      // Simpler: create a uniform that holds the image size, and the matrix will handle transformation.
-
-      // Let's just use the approach of drawing a quad from (0,0) to (imgW, imgH) using the same shader but with a modified projection.
-      // Our current quad vertices are in unit square. We'll scale them by imgW, imgH using the matrix.
-
-      const scaleMat = new Float32Array([
-        imgW, 0, 0,
-        0, imgH, 0,
-        0, 0, 1
-      ]);
-      const combined = new Float32Array(9);
-      matrixMultiply3(tmp, scaleMat, combined);
-
-      gl.uniformMatrix3fv(uMatrixLoc, false, combined);
-
-      // Draw
-      gl.drawArrays(gl.TRIANGLES, 0, 6);
-    }
-
     function matrixMultiply3(a, b, out) {
       for (let i = 0; i < 3; i++) {
         for (let j = 0; j < 3; j++) {
@@ -318,6 +232,52 @@
           out[i*3 + j] = sum;
         }
       }
+    }
+
+    function drawScene() {
+      gl.clearColor(0.627, 0.741, 1.0, 1.0);  // water blue #A0BDFF
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+
+      const imgW = currentImage.width;
+      const imgH = currentImage.height;
+      const cssW = window.innerWidth;
+      const cssH = window.innerHeight;
+
+      // Projection: CSS pixel space → clip space
+      const proj = new Float32Array([
+        2/cssW, 0, 0,
+        0, -2/cssH, 0,
+        -1, 1, 1
+      ]);
+      // Pan
+      const pan = new Float32Array([
+        1, 0, 0,
+        0, 1, 0,
+        offsetX, offsetY, 1
+      ]);
+      // Zoom
+      const zoom = new Float32Array([
+        scale, 0, 0,
+        0, scale, 0,
+        0, 0, 1
+      ]);
+      // Scale to image dimensions
+      const imgScale = new Float32Array([
+        imgW, 0, 0,
+        0, imgH, 0,
+        0, 0, 1
+      ]);
+
+      // Multiply: proj * pan * zoom * imgScale
+      const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
+      matrixMultiply3(pan, zoom, tmp1);
+      matrixMultiply3(proj, tmp1, tmp2);
+      matrixMultiply3(tmp2, imgScale, combined);
+
+      gl.uniformMatrix3fv(uMatrixLoc, false, combined);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
     }
 
     // ---- Snapshot loading ----
@@ -350,7 +310,6 @@
         // Upload image to WebGL texture
         gl.bindTexture(gl.TEXTURE_2D, texture);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, currentImage);
-        // Set texture size (not strictly necessary if we use texImage2D with image element)
 
         if (currentIndex === -1) {
           currentIndex = requestedIndex;
@@ -363,7 +322,7 @@
     };
     currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-    // ---- Pan & Zoom ----
+    // ---- Pan & Zoom events ----
     canvas.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
     window.addEventListener('mousemove', e => { if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawScene(); });
     window.addEventListener('mouseup', () => { dragging = false; canvas.style.cursor = 'grab'; });
@@ -420,7 +379,6 @@
     dlMain.addEventListener('click', () => downloadOverlay('main'));
     dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
 
-    // Initial resize
     resize();
   })();
 </script>
