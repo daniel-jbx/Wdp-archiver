@@ -128,7 +128,7 @@
     <div id="download-group">
       <button class="dl-btn" id="dl-planets">planets</button>
       <button class="dl-btn" id="dl-main">main</button>
-      <button class="dl-btn" id="dl-far_east">far_east</button>
+      <button class="dl-btn" id="dl-far_east">far east</button>
     </div>
   </div>
 
@@ -137,320 +137,177 @@
     <input type="range" id="slider" min="0" max="0" value="0" step="1">
   </div>
 
-  <script>
-    (function() {
-      const canvas = document.getElementById('canvas');
-      const ctx = canvas.getContext('2d');
-      const slider = document.getElementById('slider');
-      const sliderLabel = document.getElementById('slider-label');
-      const timestampLabelTop = document.getElementById('timestamp-label-top');
+<script>
+  (function() {
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const slider = document.getElementById('slider');
+    const timestampLabelTop = document.getElementById('timestamp-label-top');
+    const dlPlanets = document.getElementById('dl-planets');
+    const dlMain = document.getElementById('dl-main');
+    const dlFarEast = document.getElementById('dl-far_east');
 
-      const dlPlanets = document.getElementById('dl-planets');
-      const dlMain = document.getElementById('dl-main');
-      const dlFarEast = document.getElementById('dl-far_east');
+    const dpr = window.devicePixelRatio || 1;
+    ctx.imageSmoothingEnabled = false;
 
-      const dpr = window.devicePixelRatio || 1;
-      ctx.imageSmoothingEnabled = false;
+    // ---- Map / tile constants ----
+    const ZOOM = 11;
+    const TILE_SIZE = 1000;
+    const TOTAL_TILES = Math.pow(2, ZOOM);        // 2048
+    const WORLD_SIZE = TOTAL_TILES * TILE_SIZE;   // 2,048,000 px
+    const START_COL = 1225, START_ROW = 513;      // our stitched area
 
-      const TILE_START_COL = 1225;
-      const TILE_START_ROW = 513;
-      const TILE_END_COL = 1231;
-      const TILE_END_ROW = 518;
-      const ZOOM = 11;
+    function worldYToLat(yPx) {
+      const mercatorY = 1 - 2 * yPx / WORLD_SIZE;
+      return (2 * Math.atan(Math.exp(Math.PI * mercatorY)) - Math.PI / 2) * 180 / Math.PI;
+    }
+    function worldXToLon(xPx) {
+      return (xPx / WORLD_SIZE) * 360 - 180;
+    }
+    function pixelToLatLon(px, py) {
+      const globalX = START_COL * TILE_SIZE + px;
+      const globalY = START_ROW * TILE_SIZE + py;
+      return { lat: worldYToLat(globalY), lon: worldXToLon(globalX) };
+    }
+    function cropToBounds(x, y, w, h) {
+      const nw = pixelToLatLon(x, y);
+      const se = pixelToLatLon(x + w, y + h);
+      return { north: nw.lat, south: se.lat, west: nw.lon, east: se.lon };
+    }
 
-      function tileX_to_lon(x, z) { return (x / Math.pow(2, z)) * 360 - 180; }
-      function tileY_to_lat(y, z) {
-        const n = Math.PI * (1 - 2 * y / Math.pow(2, z));
-        return Math.atan(Math.sinh(n)) * 180 / Math.PI;
+    // Crops (unchanged)
+    const CROPS = {
+      planets:  { x: 0,     y: 1360, w: 2511, h: 2100 },
+      main:     { x: 2512,  y: 1298, w: 2488, h: 2900 },
+      far_east: { x: 5000,  y: 2000, w: 2000, h: 2000 }
+    };
+
+    let snapshots = [];
+    let currentImage = new Image();
+    let currentIndex = -1, requestedIndex = -1;
+    let offsetX = 0, offsetY = 0, scale = 1.0;
+    const MIN_SCALE = 0.1, MAX_SCALE = 10.0;
+    let dragging = false, dragStartX = 0, dragStartY = 0, dragOffsetX = 0, dragOffsetY = 0;
+    let initialPinchDistance = 0, initialScale = 1.0, initialPinchCenter = { x: 0, y: 0 };
+
+    function resize() {
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      canvas.style.width = window.innerWidth + 'px';
+      canvas.style.height = window.innerHeight + 'px';
+      drawImage();
+    }
+    window.addEventListener('resize', resize);
+
+    fetch('snapshots.json')
+      .then(r => r.json())
+      .then(files => {
+        if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
+        snapshots = files;
+        slider.max = files.length - 1;
+        slider.value = files.length - 1;
+        loadSnapshot(files.length - 1);
+      })
+      .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
+
+    function loadSnapshot(index) {
+      if (index < 0 || index >= snapshots.length) return;
+      if (index === currentIndex) return;
+      requestedIndex = index;
+      slider.value = index;
+      const filename = snapshots[index];
+      const m = filename.match(/(\d{8})_(\d{6})/);
+      timestampLabelTop.textContent = m
+        ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}`
+        : filename;
+      currentImage.src = snapshots[index];
+    }
+
+    currentImage.onload = () => {
+      if (currentIndex !== requestedIndex) {
+        if (currentIndex === -1) { currentIndex = requestedIndex; resetView(); }
+        else { currentIndex = requestedIndex; drawImage(); }
       }
+    };
+    currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-      const BOUNDS = {
-        north: tileY_to_lat(TILE_START_ROW, ZOOM),
-        south: tileY_to_lat(TILE_END_ROW + 1, ZOOM),
-        west: tileX_to_lon(TILE_START_COL, ZOOM),
-        east: tileX_to_lon(TILE_END_COL + 1, ZOOM)
+    function resetView() {
+      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+      const w = currentImage.width, h = currentImage.height;
+      const ww = window.innerWidth, wh = window.innerHeight;
+      scale = Math.min(ww / w, wh / h);
+      offsetX = (ww - w * scale) / 2;
+      offsetY = (wh - h * scale) / 2;
+      drawImage();
+    }
+
+    function drawImage() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.translate(offsetX, offsetY);
+      ctx.scale(scale, scale);
+      ctx.drawImage(currentImage, 0, 0);
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+    }
+
+    // Pan & zoom events (unchanged)...
+    canvas.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
+    window.addEventListener('mousemove', e => { if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawImage(); });
+    window.addEventListener('mouseup', () => { dragging = false; canvas.style.cursor = 'grab'; });
+    canvas.addEventListener('touchstart', e => { e.preventDefault(); const t = e.touches; if (t.length===1) { dragging=true; dragStartX=t[0].clientX; dragStartY=t[0].clientY; dragOffsetX=offsetX; dragOffsetY=offsetY; } else if (t.length===2) { dragging=false; const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; initialPinchDistance=Math.hypot(dx,dy); initialScale=scale; initialPinchCenter={x:(t[0].clientX+t[1].clientX)/2, y:(t[0].clientY+t[1].clientY)/2}; } }, {passive:false});
+    canvas.addEventListener('touchmove', e => { e.preventDefault(); const t=e.touches; if (t.length===1 && dragging) { offsetX=dragOffsetX+(t[0].clientX-dragStartX); offsetY=dragOffsetY+(t[0].clientY-dragStartY); drawImage(); } else if (t.length===2) { const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; const nd=Math.hypot(dx,dy); if(initialPinchDistance>0){ const ns=initialScale*(nd/initialPinchDistance); scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,ns)); const cx=(t[0].clientX+t[1].clientX)/2, cy=(t[0].clientY+t[1].clientY)/2; const sc=scale/initialScale; offsetX=cx-sc*(initialPinchCenter.x-offsetX); offsetY=cy-sc*(initialPinchCenter.y-offsetY); initialPinchCenter={x:cx,y:cy}; initialScale=scale; initialPinchDistance=nd; drawImage(); } } }, {passive:false});
+    canvas.addEventListener('touchend', () => { dragging=false; initialPinchDistance=0; });
+    canvas.addEventListener('wheel', e => { e.preventDefault(); const zf=1.1, old=scale; if(e.deltaY<0) scale*=zf; else scale/=zf; scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,scale)); const sc=scale/old; offsetX=e.clientX-sc*(e.clientX-offsetX); offsetY=e.clientY-sc*(e.clientY-offsetY); drawImage(); }, {passive:false});
+
+    slider.addEventListener('input', () => loadSnapshot(parseInt(slider.value,10)));
+    window.addEventListener('keydown', e => {
+      if(e.key==='ArrowLeft'){ e.preventDefault(); if(currentIndex>0) loadSnapshot(currentIndex-1); }
+      else if(e.key==='ArrowRight'){ e.preventDefault(); if(currentIndex<snapshots.length-1) loadSnapshot(currentIndex+1); }
+      else if(e.key==='r'||e.key==='R') resetView();
+    });
+
+    function downloadOverlay(cropKey) {
+      if(!currentImage.complete || currentImage.naturalWidth===0) return;
+      const crop = CROPS[cropKey];
+      if(!crop) return;
+      const tmp = document.createElement('canvas');
+      tmp.width = crop.w; tmp.height = crop.h;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+      const dataUrl = tmp.toDataURL('image/png');
+      const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);   // exact Mercator bounds
+      const m = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
+      const ts = m ? m[0] : Date.now();
+      const overlay = {
+        id: `wdp_${cropKey}_${ts}`,
+        schemaVersion: "1",
+        name: `${cropKey}_${ts}.png`,
+        opacity: 1,
+        image: { dataUrl, width: crop.w, height: crop.h },
+        bounds,
+        colorMetric: "lab",
+        dithering: false,
+        order: 0,
+        locked: false,
+        hasPlaced: true,
+        visible: true
       };
+      const blob = new Blob([JSON.stringify(overlay)], {type:'application/json'});
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `wdp_${cropKey}_${ts}.wplace`;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
 
-      const IMG_WIDTH = 7000;
-      const IMG_HEIGHT = 6000;
+    dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
+    dlMain.addEventListener('click', () => downloadOverlay('main'));
+    dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
 
-      function pxToBounds(x, y, w, h) {
-        const north = BOUNDS.north - (y / IMG_HEIGHT) * (BOUNDS.north - BOUNDS.south);
-        const south = BOUNDS.north - ((y + h) / IMG_HEIGHT) * (BOUNDS.north - BOUNDS.south);
-        const west = BOUNDS.west + (x / IMG_WIDTH) * (BOUNDS.east - BOUNDS.west);
-        const east = BOUNDS.west + ((x + w) / IMG_WIDTH) * (BOUNDS.east - BOUNDS.west);
-        return { north, south, west, east };
-      }
-
-      // Overlay crop definitions (y adjusted -11 px to compensate for southward offset)
-      const CROPS = {
-        planets: { x: 0, y: 1360 , w: 2511, h: 2100 },
-        main:    { x: 2512, y: 1298, w: 2488, h: 2900 },
-        far_east:{ x: 5000, y: 2000, w: 2000, h: 2000 }
-      };
-
-      let snapshots = [];
-      let currentImage = new Image();
-      let currentIndex = -1;
-      let requestedIndex = -1;
-
-      let offsetX = 0, offsetY = 0;
-      let scale = 1.0;
-      const MIN_SCALE = 0.1;
-      const MAX_SCALE = 10.0;
-
-      let dragging = false;
-      let dragStartX = 0, dragStartY = 0;
-      let dragOffsetX = 0, dragOffsetY = 0;
-
-      let initialPinchDistance = 0;
-      let initialScale = 1.0;
-      let initialPinchCenter = { x: 0, y: 0 };
-
-      function resize() {
-        canvas.width = window.innerWidth * dpr;
-        canvas.height = window.innerHeight * dpr;
-        canvas.style.width = window.innerWidth + 'px';
-        canvas.style.height = window.innerHeight + 'px';
-        drawImage();
-      }
-      window.addEventListener('resize', resize);
-
-      fetch('snapshots.json')
-        .then(r => r.json())
-        .then(files => {
-          if (!files.length) {
-            timestampLabelTop.textContent = 'No snapshots found.';
-            return;
-          }
-          snapshots = files;
-          slider.max = files.length - 1;
-          slider.value = files.length - 1;
-          loadSnapshot(files.length - 1);
-        })
-        .catch(e => {
-          timestampLabelTop.textContent = 'Failed to load snapshots.json';
-          console.error(e);
-        });
-
-      function loadSnapshot(index) {
-        if (index < 0 || index >= snapshots.length) return;
-        if (index === currentIndex) return;
-
-        requestedIndex = index;
-        slider.value = index;
-
-        const filename = snapshots[index];
-        const match = filename.match(/(\d{8})_(\d{6})/);
-        if (match) {
-          const date = match[1];
-          const time = match[2];
-          timestampLabelTop.textContent = `${date.slice(0,4)}-${date.slice(4,6)}-${date.slice(6,8)} ${time.slice(0,2)}:${time.slice(2,4)}:${time.slice(4,6)}`;
-        } else {
-          timestampLabelTop.textContent = filename;
-        }
-
-        currentImage.src = snapshots[index];
-      }
-
-      currentImage.onload = () => {
-        if (currentIndex !== requestedIndex) {
-          if (currentIndex === -1) {
-            currentIndex = requestedIndex;
-            resetView();
-          } else {
-            currentIndex = requestedIndex;
-            drawImage();
-          }
-        }
-      };
-
-      currentImage.onerror = () => {
-        console.error('Failed to load image:', currentImage.src);
-      };
-
-      function resetView() {
-        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-        const imgW = currentImage.width;
-        const imgH = currentImage.height;
-        const winW = window.innerWidth;
-        const winH = window.innerHeight;
-        scale = Math.min(winW / imgW, winH / imgH);
-        offsetX = (winW - imgW * scale) / 2;
-        offsetY = (winH - imgH * scale) / 2;
-        drawImage();
-      }
-
-      function drawImage() {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-        ctx.translate(offsetX, offsetY);
-        ctx.scale(scale, scale);
-        ctx.drawImage(currentImage, 0, 0);
-        ctx.setTransform(1, 0, 0, 1, 0, 0);
-      }
-
-      canvas.addEventListener('mousedown', (e) => {
-        e.preventDefault();
-        dragging = true;
-        dragStartX = e.clientX;
-        dragStartY = e.clientY;
-        dragOffsetX = offsetX;
-        dragOffsetY = offsetY;
-        canvas.style.cursor = 'grabbing';
-      });
-
-      window.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
-        offsetX = dragOffsetX + (e.clientX - dragStartX);
-        offsetY = dragOffsetY + (e.clientY - dragStartY);
-        drawImage();
-      });
-
-      window.addEventListener('mouseup', () => {
-        dragging = false;
-        canvas.style.cursor = 'grab';
-      });
-
-      canvas.addEventListener('touchstart', (e) => {
-        e.preventDefault();
-        const touches = e.touches;
-        if (touches.length === 1) {
-          dragging = true;
-          dragStartX = touches[0].clientX;
-          dragStartY = touches[0].clientY;
-          dragOffsetX = offsetX;
-          dragOffsetY = offsetY;
-        } else if (touches.length === 2) {
-          dragging = false;
-          const dx = touches[1].clientX - touches[0].clientX;
-          const dy = touches[1].clientY - touches[0].clientY;
-          initialPinchDistance = Math.hypot(dx, dy);
-          initialScale = scale;
-          initialPinchCenter.x = (touches[0].clientX + touches[1].clientX) / 2;
-          initialPinchCenter.y = (touches[0].clientY + touches[1].clientY) / 2;
-        }
-      }, { passive: false });
-
-      canvas.addEventListener('touchmove', (e) => {
-        e.preventDefault();
-        const touches = e.touches;
-        if (touches.length === 1 && dragging) {
-          offsetX = dragOffsetX + (touches[0].clientX - dragStartX);
-          offsetY = dragOffsetY + (touches[0].clientY - dragStartY);
-          drawImage();
-        } else if (touches.length === 2) {
-          const dx = touches[1].clientX - touches[0].clientX;
-          const dy = touches[1].clientY - touches[0].clientY;
-          const newDist = Math.hypot(dx, dy);
-          if (initialPinchDistance > 0) {
-            const newScale = initialScale * (newDist / initialPinchDistance);
-            scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, newScale));
-            const centerX = (touches[0].clientX + touches[1].clientX) / 2;
-            const centerY = (touches[0].clientY + touches[1].clientY) / 2;
-            const scaleChange = scale / initialScale;
-            offsetX = centerX - scaleChange * (initialPinchCenter.x - offsetX);
-            offsetY = centerY - scaleChange * (initialPinchCenter.y - offsetY);
-            initialPinchCenter.x = centerX;
-            initialPinchCenter.y = centerY;
-            initialScale = scale;
-            initialPinchDistance = newDist;
-            drawImage();
-          }
-        }
-      }, { passive: false });
-
-      canvas.addEventListener('touchend', () => {
-        dragging = false;
-        initialPinchDistance = 0;
-      });
-
-      canvas.addEventListener('wheel', (e) => {
-        e.preventDefault();
-        const zoomFactor = 1.1;
-        const oldScale = scale;
-        if (e.deltaY < 0) scale *= zoomFactor;
-        else scale /= zoomFactor;
-        scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale));
-        const mouseX = e.clientX;
-        const mouseY = e.clientY;
-        const scaleChange = scale / oldScale;
-        offsetX = mouseX - scaleChange * (mouseX - offsetX);
-        offsetY = mouseY - scaleChange * (mouseY - offsetY);
-        drawImage();
-      }, { passive: false });
-
-      slider.addEventListener('input', () => {
-        loadSnapshot(parseInt(slider.value, 10));
-      });
-
-      window.addEventListener('keydown', (e) => {
-        if (e.key === 'ArrowLeft') {
-          e.preventDefault();
-          if (currentIndex > 0) loadSnapshot(currentIndex - 1);
-        } else if (e.key === 'ArrowRight') {
-          e.preventDefault();
-          if (currentIndex < snapshots.length - 1) loadSnapshot(currentIndex + 1);
-        } else if (e.key === 'r' || e.key === 'R') {
-          resetView();
-        }
-      });
-
-      function downloadOverlay(cropKey) {
-        if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-
-        const crop = CROPS[cropKey];
-        if (!crop) return;
-
-        const cropCanvas = document.createElement('canvas');
-        cropCanvas.width = crop.w;
-        cropCanvas.height = crop.h;
-        const cropCtx = cropCanvas.getContext('2d');
-        cropCtx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
-
-        const dataUrl = cropCanvas.toDataURL('image/png');
-        const bounds = pxToBounds(crop.x, crop.y - 11, crop.w, crop.h);
-
-        const timestampMatch = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
-        const timestamp = timestampMatch ? timestampMatch[0] : Date.now();
-
-        const overlay = {
-          id: `wdp_${cropKey}_${timestamp}`,
-          schemaVersion: "1",
-          name: `${cropKey}_${timestamp}.png`,
-          opacity: 1,
-          image: {
-            dataUrl: dataUrl,
-            width: crop.w,
-            height: crop.h
-          },
-          bounds: bounds,
-          colorMetric: "lab",
-          dithering: false,
-          order: 0,
-          locked: false,
-          hasPlaced: true,
-          visible: true
-        };
-
-        const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `wdp_${cropKey}_${timestamp}.wplace`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      }
-
-      dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
-      dlMain.addEventListener('click', () => downloadOverlay('main'));
-      dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
-
-      resize();
-    })();
-  </script>
+    resize();
+  })();
+</script>
 </body>
 </html>
