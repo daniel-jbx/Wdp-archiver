@@ -242,14 +242,20 @@
     }
 
     function drawImage() {
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.translate(offsetX, offsetY);
-      ctx.scale(scale, scale);
-      ctx.drawImage(currentImage, 0, 0);
-      ctx.setTransform(1, 0, 0, 1, 0, 0);
-    }
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Fill with wplace water color for transparent areas
+  ctx.fillStyle = '#A0BDFF';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.translate(offsetX, offsetY);
+  ctx.scale(scale, scale);
+  ctx.drawImage(currentImage, 0, 0);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+}
 
     // Pan & zoom events (unchanged)...
     canvas.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
