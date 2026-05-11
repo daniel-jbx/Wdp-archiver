@@ -128,7 +128,7 @@
     <div id="download-group">
       <button class="dl-btn" id="dl-planets">planets</button>
       <button class="dl-btn" id="dl-main">main</button>
-      <button class="dl-btn" id="dl-far_east">far_east</button>
+      <button class="dl-btn" id="dl-far_east">far east</button>
     </div>
   </div>
 
@@ -410,7 +410,7 @@
         cropCtx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
 
         const dataUrl = cropCanvas.toDataURL('image/png');
-        const bounds = pxToBounds(crop.x, crop.y - 11, crop.w, crop.h);
+        const bounds = pxToBounds(crop.x, crop.y - 12, crop.w, crop.h);
 
         const timestampMatch = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
         const timestamp = timestampMatch ? timestampMatch[0] : Date.now();
