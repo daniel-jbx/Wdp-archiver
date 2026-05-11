@@ -273,42 +273,65 @@
       else if(e.key==='r'||e.key==='R') resetView();
     });
 
-    function downloadOverlay(cropKey) {
-      if(!currentImage.complete || currentImage.naturalWidth===0) return;
-      const crop = CROPS[cropKey];
-      if(!crop) return;
-      const tmp = document.createElement('canvas');
-      tmp.width = crop.w; tmp.height = crop.h;
-      const tctx = tmp.getContext('2d');
-      tctx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
-      const dataUrl = tmp.toDataURL('image/png');
-      // Just for testing – open the cropped overlay image in a new tab
-      window.open(dataUrl, '_blank');
-      const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);   // exact Mercator bounds
-      const m = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
-      const ts = m ? m[0] : Date.now();
-      const overlay = {
-        id: `wdp_${cropKey}_${ts}`,
-        schemaVersion: "1",
-        name: `${cropKey}_${ts}.png`,
-        opacity: 1,
-        image: { dataUrl, width: crop.w, height: crop.h },
-        bounds,
-        colorMetric: "lab",
-        dithering: false,
-        order: 0,
-        locked: false,
-        hasPlaced: true,
-        visible: true
-      };
-      const blob = new Blob([JSON.stringify(overlay)], {type:'application/json'});
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `wdp_${cropKey}_${ts}.wplace`;
-      document.body.appendChild(a); a.click(); document.body.removeChild(a);
-      URL.revokeObjectURL(url);
-    }
+function downloadOverlay(cropKey) {
+  if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+  const crop = CROPS[cropKey];
+  if (!crop) return;
+
+  // ---- Canvas with cropped image ----
+  const tmp = document.createElement('canvas');
+  tmp.width = crop.w;
+  tmp.height = crop.h;
+  const tctx = tmp.getContext('2d');
+  // Force transparent background
+  tctx.clearRect(0, 0, crop.w, crop.h);
+  tctx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+
+  // ---- Generate PNG data URL (may contain transparency) ----
+  const dataUrl = tmp.toDataURL('image/png');
+
+  // ---- Download the raw PNG for visual inspection ----
+  const pngBlob = new Blob([dataUrl], { type: 'image/png' });
+  const pngUrl = URL.createObjectURL(pngBlob);
+  const aPng = document.createElement('a');
+  aPng.href = pngUrl;
+  aPng.download = `${cropKey}_test.png`;
+  document.body.appendChild(aPng);
+  aPng.click();
+  document.body.removeChild(aPng);
+  URL.revokeObjectURL(pngUrl);
+
+  // ---- Build overlay JSON ----
+  const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);
+  const m = snapshots[currentIndex].match(/(\d{8}_\d{6})/);
+  const ts = m ? m[0] : Date.now();
+
+  const overlay = {
+    id: `wdp_${cropKey}_${ts}`,
+    schemaVersion: "1",
+    name: `${cropKey}_${ts}.png`,
+    opacity: 1,
+    image: { dataUrl, width: crop.w, height: crop.h },
+    bounds,
+    colorMetric: "lab",
+    dithering: false,
+    order: 0,
+    locked: false,
+    hasPlaced: true,
+    visible: true
+  };
+
+  // ---- Download the .wplace file ----
+  const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `wdp_${cropKey}_${ts}.wplace`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
 
     dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
     dlMain.addEventListener('click', () => downloadOverlay('main'));
