@@ -11,7 +11,7 @@ END_ROW=518     # bottommost row (Y)
 BASE_URL="https://backend.wplace.live/files/s0/tiles"
 TILE_DIR="tiles"
 OUTPUT="output.png"
-FULL_OUTPUT="output_full.png"   # temporary full‑RGBA stitched image
+FULL_OUTPUT="output_full.png"   # temporary RGBA stitched image
 
 mkdir -p "$TILE_DIR"
 
@@ -23,7 +23,7 @@ for (( col=START_COL; col<=END_COL; col++ )); do
     filename="${TILE_DIR}/${col}_${row}.png"
     echo "  -> $url"
     if ! curl -sSf --retry 2 "$url" -o "$filename"; then
-      # Create a fully transparent placeholder (original tiles are transparent where unplaced)
+      # Create a fully transparent placeholder
       echo "  Tile $url does not exist, using transparent placeholder"
       convert -size 1000x1000 xc:none "$filename"
     fi
@@ -47,14 +47,9 @@ montage $FILELIST \
   -tile $((END_COL-START_COL+1))x$((END_ROW-START_ROW+1)) \
   PNG32:"$FULL_OUTPUT"
 
-# ---- Apply the wplace palette ----
-if [ -f palette.png ]; then
-  echo "Mapping to wplace palette..."
-  convert "$FULL_OUTPUT" -remap palette.png -type Palette PNG8:"$OUTPUT"
-  rm "$FULL_OUTPUT"   # keep only the indexed version
-else
-  echo "Warning: palette.png not found, keeping full RGBA snapshot."
-  mv "$FULL_OUTPUT" "$OUTPUT"
-fi
+# ---- Quantise to 64 colours with transparency ----
+echo "Quantising to 64 colours..."
+convert "$FULL_OUTPUT" -colors 64 -alpha set -type Palette PNG8:"$OUTPUT"
+rm "$FULL_OUTPUT"
 
 echo "Stitching complete: $OUTPUT"
