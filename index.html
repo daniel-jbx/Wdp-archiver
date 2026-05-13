@@ -217,7 +217,9 @@
 
     let dragging = false, dragStartX = 0, dragStartY = 0, dragOffsetX = 0, dragOffsetY = 0;
     let initialPinchDistance = 0, initialScale = 1.0, initialPinchCenter = { x: 0, y: 0 };
-
+    let touchStartTapX = 0, touchStartTapY = 0;
+    let wasDragged = false;
+    
     // ---- Texture management ----
     const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
     console.log('Max texture size:', MAX_TEX);
@@ -585,9 +587,36 @@ snapshotSelect.addEventListener('change', () => {
     canvas.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
     window.addEventListener('mousemove', e => { if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawScene(); });
     window.addEventListener('mouseup', () => { dragging = false; canvas.style.cursor = 'grab'; });
-    canvas.addEventListener('touchstart', e => { e.preventDefault(); const t = e.touches; if (t.length===1) { dragging=true; dragStartX=t[0].clientX; dragStartY=t[0].clientY; dragOffsetX=offsetX; dragOffsetY=offsetY; } else if (t.length===2) { dragging=false; const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; initialPinchDistance=Math.hypot(dx,dy); initialScale=scale; initialPinchCenter={x:(t[0].clientX+t[1].clientX)/2, y:(t[0].clientY+t[1].clientY)/2}; } }, {passive:false});
-    canvas.addEventListener('touchmove', e => { e.preventDefault(); const t=e.touches; if (t.length===1 && dragging) { offsetX=dragOffsetX+(t[0].clientX-dragStartX); offsetY=dragOffsetY+(t[0].clientY-dragStartY); drawScene(); } else if (t.length===2) { const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; const nd=Math.hypot(dx,dy); if(initialPinchDistance>0){ const ns=initialScale*(nd/initialPinchDistance); scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,ns)); const cx=(t[0].clientX+t[1].clientX)/2, cy=(t[0].clientY+t[1].clientY)/2; const sc=scale/initialScale; offsetX=cx-sc*(initialPinchCenter.x-offsetX); offsetY=cy-sc*(initialPinchCenter.y-offsetY); initialPinchCenter={x:cx,y:cy}; initialScale=scale; initialPinchDistance=nd; drawScene(); } } }, {passive:false});
-    canvas.addEventListener('touchend', () => { dragging=false; initialPinchDistance=0; });
+    canvas.addEventListener('touchstart', e => { e.preventDefault(); const t = e.touches; if (t.length===1) {
+  dragging=true;
+  dragStartX=t[0].clientX;
+  dragStartY=t[0].clientY;
+  dragOffsetX=offsetX;
+  dragOffsetY=offsetY;
+  wasDragged = false;
+  touchStartTapX = t[0].clientX;
+  touchStartTapY = t[0].clientY;
+} else if (t.length===2) { dragging=false; const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; initialPinchDistance=Math.hypot(dx,dy); initialScale=scale; initialPinchCenter={x:(t[0].clientX+t[1].clientX)/2, y:(t[0].clientY+t[1].clientY)/2}; } }, {passive:false});
+    canvas.addEventListener('touchmove', e => { e.preventDefault(); const t=e.touches; if (t.length===1 && dragging) {
+  offsetX = dragOffsetX + (t[0].clientX - dragStartX);
+  offsetY = dragOffsetY + (t[0].clientY - dragStartY);
+  if (Math.hypot(t[0].clientX - touchStartTapX, t[0].clientY - touchStartTapY) > 5) {
+    wasDragged = true;
+  }
+  drawScene();
+} else if (t.length===2) { const dx=t[1].clientX-t[0].clientX, dy=t[1].clientY-t[0].clientY; const nd=Math.hypot(dx,dy); if(initialPinchDistance>0){ const ns=initialScale*(nd/initialPinchDistance); scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,ns)); const cx=(t[0].clientX+t[1].clientX)/2, cy=(t[0].clientY+t[1].clientY)/2; const sc=scale/initialScale; offsetX=cx-sc*(initialPinchCenter.x-offsetX); offsetY=cy-sc*(initialPinchCenter.y-offsetY); initialPinchCenter={x:cx,y:cy}; initialScale=scale; initialPinchDistance=nd; drawScene(); } } }, {passive:false});
+    canvas.addEventListener('touchend', e => {
+  dragging = false;
+  initialPinchDistance = 0;
+  if (!wasDragged && e.changedTouches.length === 1) {
+    const x = e.changedTouches[0].clientX;
+    if (x < window.innerWidth / 2) {
+      if (currentFilteredIndex > 0) loadFilteredSnapshot(currentFilteredIndex - 1);
+    } else {
+      if (currentFilteredIndex < filteredSnapshots.length - 1) loadFilteredSnapshot(currentFilteredIndex + 1);
+    }
+  }
+});
     canvas.addEventListener('wheel', e => { e.preventDefault(); const zf=1.1, old=scale; if(e.deltaY<0) scale*=zf; else scale/=zf; scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,scale)); const sc=scale/old; offsetX=e.clientX-sc*(e.clientX-offsetX); offsetY=e.clientY-sc*(e.clientY-offsetY); drawScene(); }, {passive:false});
 
     // ---- Overlay download (transparent, reusing a single offscreen canvas) ----
