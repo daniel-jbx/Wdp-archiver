@@ -79,6 +79,7 @@
     </select>
     <span id="timestamp-label-top">--</span>
     <div id="download-group">
+      <button class="dl-btn" id="dl-snapshot">snapshot png</button>
       <button class="dl-btn" id="dl-planets">planets</button>
       <button class="dl-btn" id="dl-main">main</button>
       <button class="dl-btn" id="dl-far_east">far_east</button>
@@ -638,7 +639,17 @@ snapshotSelect.addEventListener('change', () => {
     dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
     dlMain.addEventListener('click', () => downloadOverlay('main'));
     dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
-
+    const dlSnapshot = document.getElementById('dl-snapshot');
+dlSnapshot.addEventListener('click', () => {
+  if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
+  const filename = filteredSnapshots[currentFilteredIndex];
+  const a = document.createElement('a');
+  a.href = filename;          // relative path to the PNG on the same server
+  a.download = filename;      // forces download, file name same as original
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
     // Initial resize (water background shown)
     resize();
     // On startup, set default background
