@@ -1,4 +1,7 @@
 name: Generate GIFs
+concurrency:
+  group: generate-gifs
+  cancel-in-progress: false
 
 on:
   workflow_dispatch:   # manual trigger
@@ -19,6 +22,12 @@ jobs:
 
       - name: Run GIF generation
         run: bash generate-gifs.sh
+
+      - name: Sync with remote before push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin assets
 
       - name: Commit updated GIFs to assets
         run: |
