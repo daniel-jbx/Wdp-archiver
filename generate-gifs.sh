@@ -68,27 +68,76 @@ while read -r name x y w h outfile time_min interval_min delay; do
     continue
   fi
 
-  # Apply interval subsampling (only if interval > 0)
+  # Apply interval subsampling (target‑based selection)
   if [ "$INTERVAL_SEC" -gt 0 ]; then
-    # Sort by epoch descending (newest first)
-    sorted=$(for s in "${CROP_SNAPS[@]}"; do
-               printf "%s\t%s\n" "$(get_epoch "$s")" "$s"
-             done | sort -rn)
-    SUBSAMPLED=()
-    last_epoch=""
-    while IFS=$'\t' read -r ep snap; do
-      if [ -z "$last_epoch" ] || [ $(( last_epoch - ep )) -ge "$INTERVAL_SEC" ]; then
-        SUBSAMPLED+=("$snap")
-        last_epoch="$ep"
+    # Create arrays with epoch and filename, sorted by epoch ascending
+    # We'll use awk to sort because bash sorting can be tricky
+    tmpfile=$(mktemp)
+    for s in "${CROP_SNAPS[@]}"; do
+      echo "$(get_epoch "$s") $s"
+    done | sort -n > "$tmpfile"
+
+    # Read into arrays
+    CROP_EPOCHS=()
+    CROP_NAMES=()
+    while read -r ep name; do
+      CROP_EPOCHS+=("$ep")
+      CROP_NAMES+=("$name")
+    done < "$tmpfile"
+    rm "$tmpfile"
+
+    # Determine target epochs: start from the first multiple of INTERVAL_SEC
+    # that is <= the earliest snapshot epoch
+    min_epoch=${CROP_EPOCHS[0]}
+    max_epoch=${CROP_EPOCHS[-1]}
+    ref_epoch=$(( min_epoch - (min_epoch % INTERVAL_SEC) ))
+    if [ $ref_epoch -gt $min_epoch ]; then
+      ref_epoch=$(( ref_epoch - INTERVAL_SEC ))  # ensure it's <= min_epoch
+    fi
+
+    # Build list of chosen snapshots (oldest first)
+    CHOSEN=()
+    target=$ref_epoch
+    while [ $target -le $max_epoch ]; do
+      # Find snapshot with smallest absolute difference to target
+      best_diff=-1
+      best_name=""
+      for idx in "${!CROP_EPOCHS[@]}"; do
+        ep=${CROP_EPOCHS[$idx]}
+        diff=$(( ep - target ))
+        [ $diff -lt 0 ] && diff=$(( -diff ))
+        if [ $best_diff -eq -1 ] || [ $diff -lt $best_diff ]; then
+          best_diff=$diff
+          best_name="${CROP_NAMES[$idx]}"
+        fi
+      done
+      if [ -n "$best_name" ]; then
+        CHOSEN+=("$best_name")
       fi
-    done <<< "$sorted"
-    # Reverse to chronological order (oldest first)
-    tmp=()
-    for (( idx=${#SUBSAMPLED[@]}-1; idx>=0; idx-- )); do
-      tmp+=("${SUBSAMPLED[idx]}")
+      target=$(( target + INTERVAL_SEC ))
     done
-    CROP_SNAPS=("${tmp[@]}")
-    echo "  Subsampled to ${#CROP_SNAPS[@]} snapshots (interval ${interval_min} min)"
+
+    # Remove duplicates (if same snapshot chosen for two targets)
+    # We'll use awk to print unique lines, preserving order
+    CHOSEN_UNIQ=()
+    while IFS= read -r line; do
+      CHOSEN_UNIQ+=("$line")
+    done < <(printf "%s\n" "${CHOSEN[@]}" | awk '!seen[$0]++')
+
+    CROP_SNAPS=("${CHOSEN_UNIQ[@]}")
+    echo "  Subsampled to ${#CROP_SNAPS[@]} snapshots (target interval ${interval_min} min, from $(date -d @$ref_epoch -u))"
+  else
+    # No interval: sort chronologically (they may already be sorted, but ensure)
+    # We'll sort by epoch
+    tmpfile=$(mktemp)
+    for s in "${CROP_SNAPS[@]}"; do
+      echo "$(get_epoch "$s") $s"
+    done | sort -n > "$tmpfile"
+    CROP_SNAPS=()
+    while read -r ep name; do
+      CROP_SNAPS+=("$name")
+    done < "$tmpfile"
+    rm "$tmpfile"
   fi
 
   if [ ${#CROP_SNAPS[@]} -eq 0 ]; then
@@ -104,7 +153,7 @@ while read -r name x y w h outfile time_min interval_min delay; do
   FONT_SIZE=$(( h / 20 ))
   [ "$FONT_SIZE" -lt 10 ] && FONT_SIZE=10
 
-  # Banner height: font size * 1.2 (using bc for floating point, fallback to integer)
+  # Banner height: font size * 1.2 (with integer fallback)
   BANNER_HEIGHT=$(echo "$FONT_SIZE * 1.2" | bc | cut -d'.' -f1 2>/dev/null || echo "$(( (FONT_SIZE * 12) / 10 ))")
   if [ "$BANNER_HEIGHT" -lt "$((FONT_SIZE + 4))" ]; then
     BANNER_HEIGHT=$((FONT_SIZE + 4))
