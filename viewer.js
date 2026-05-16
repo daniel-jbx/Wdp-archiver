@@ -771,13 +771,16 @@
     }
   });
 
-  dlSelectCancel.addEventListener('click', () => {
-    if (!selectionMode) return;
-    selStartImg = selEndImg = null;
-    dragHandle = null;
-    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-    setSelectionButtonsVisible(false);
-  });
+dlSelectCancel.addEventListener('click', () => {
+  if (!selectionMode) return;
+  selectionMode = false;
+  dlSelectToggle.textContent = 'select area';
+  selCanvas.style.pointerEvents = 'none';
+  selStartImg = selEndImg = null;
+  dragHandle = null;
+  selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+  setSelectionButtonsVisible(false);
+});
 
   // ---- Override mouse events for selection mode ----
   selCanvas.addEventListener('mousedown', e => {
