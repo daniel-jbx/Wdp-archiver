@@ -80,9 +80,6 @@
     <span id="timestamp-label-top">--</span>
     <div id="download-group">
       <button class="dl-btn" id="dl-snapshot">snapshot png</button>
-      <button class="dl-btn" id="dl-planets">planets</button>
-      <button class="dl-btn" id="dl-main">main</button>
-      <button class="dl-btn" id="dl-far_east">far_east</button>
     </div>
   </div>
 
@@ -198,12 +195,6 @@
       const nw = pixelToLatLon(x, y), se = pixelToLatLon(x + w, y + h);
       return { north: nw.lat, south: se.lat, west: nw.lon, east: se.lon };
     }
-
-    const CROPS = {
-      planets:  { x: 0,     y: 1360, w: 2511, h: 2100 },
-      main:     { x: 2512,  y: 1298, w: 2488, h: 2900 },
-      far_east: { x: 5000,  y: 2000, w: 2000, h: 2000 }
-    };
 
     // ---- State ----
     let allSnapshots = [];            // original sorted filenames (oldest first)
@@ -531,7 +522,39 @@
       }
     };
     currentImage.onerror = () => console.error('Image failed:', currentImage.src);
+    // ---- Load overlay definitions from overlays.txt ----
+let CROPS = {};                     // will be populated
+const downloadGroup = document.getElementById('download-group');
 
+fetch('overlays.txt')
+  .then(r => r.text())
+  .then(txt => {
+    const lines = txt.split('\n');
+    lines.forEach(line => {
+      line = line.trim();
+      if (line === '' || line.startsWith('#')) return;
+      const parts = line.split('\t');
+      if (parts.length !== 5) return;   // name x1 y1 x2 y2
+      const [name, x1, y1, x2, y2] = parts.map(s => s.trim());
+      const crop = {
+        x: parseInt(x1),
+        y: parseInt(y1),
+        w: parseInt(x2) - parseInt(x1),
+        h: parseInt(y2) - parseInt(y1)
+      };
+      CROPS[name] = crop;
+
+      // Build a button for this overlay
+      const btn = document.createElement('button');
+      btn.className = 'dl-btn';
+      btn.textContent = name;
+      btn.addEventListener('click', () => downloadOverlay(name));
+      downloadGroup.appendChild(btn);
+    });
+    console.log('Overlays loaded:', Object.keys(CROPS));
+  })
+  .catch(e => console.error('Failed to load overlays.txt', e));
+    
     // ---- Initial snapshot loading ----
     fetch('snapshots.json')
       .then(r => r.json())
@@ -715,10 +738,7 @@ canvas.addEventListener('touchend', e => {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
     }
-
-    dlPlanets.addEventListener('click', () => downloadOverlay('planets'));
-    dlMain.addEventListener('click', () => downloadOverlay('main'));
-    dlFarEast.addEventListener('click', () => downloadOverlay('far_east'));
+    
     const dlSnapshot = document.getElementById('dl-snapshot');
 dlSnapshot.addEventListener('click', () => {
   if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
