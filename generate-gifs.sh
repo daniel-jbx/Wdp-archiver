@@ -34,31 +34,29 @@ while read -r name x y w h outfile time_min interval_min delay; do
   [[ -z "$name" || "$name" == \#* ]] && continue
 
   # Set defaults if columns are missing
-  time_min="${time_min:-1440}"      # 24 hours in minutes
+  time_min="${time_min:-1440}"
   interval_min="${interval_min:-0}"
-  normal_delay="${delay:-10}"       # in 1/100 s
+  normal_delay="${delay:-10}"
 
   # Compute time window and interval in seconds
-  local TIME_WINDOW_SEC=$(( time_min * 60 ))
-  local INTERVAL_SEC=$(( interval_min * 60 ))
+  TIME_WINDOW_SEC=$(( time_min * 60 ))
+  INTERVAL_SEC=$(( interval_min * 60 ))
 
-  # End delay = max(100, 2 * normal_delay)
-  local END_DELAY=$(( 2 * normal_delay ))
+  # End delay: 1 second or twice normal delay, whichever is larger
+  END_DELAY=$(( 2 * normal_delay ))
   [ "$END_DELAY" -lt 100 ] && END_DELAY=100
 
   echo "--- Processing crop: $name -> $outfile ---"
   echo "  time window: ${time_min} min, interval: ${interval_min} min, delay: ${normal_delay}, end delay: ${END_DELAY}"
 
-  # Determine which snapshots to use
-  local CROP_SNAPS=()
+  # Determine which snapshots to use for this crop
+  CROP_SNAPS=()
   if [ "${FULL_REGEN:-false}" = "true" ]; then
-    # Use all snapshots (ignore time window but still apply interval if >0)
     echo "  Full regeneration mode – using all snapshots"
     CROP_SNAPS=("${ALL_SNAPS[@]}")
   else
-    # Filter by time window
     for s in "${ALL_SNAPS[@]}"; do
-      local epoch=$(get_epoch "$s")
+      epoch=$(get_epoch "$s")
       if [ "$epoch" -ne 0 ] && [ $(( NOW_EPOCH - epoch )) -le "$TIME_WINDOW_SEC" ]; then
         CROP_SNAPS+=("$s")
       fi
@@ -70,15 +68,14 @@ while read -r name x y w h outfile time_min interval_min delay; do
     continue
   fi
 
-  # If interval > 0, subsample the snapshots (walk from newest to oldest)
+  # Apply interval subsampling (only if interval > 0)
   if [ "$INTERVAL_SEC" -gt 0 ]; then
-    local SUBSAMPLED=()
-    # sort by epoch descending (newest first)
-    local sorted
+    # Sort by epoch descending (newest first)
     sorted=$(for s in "${CROP_SNAPS[@]}"; do
                printf "%s\t%s\n" "$(get_epoch "$s")" "$s"
              done | sort -rn)
-    local last_epoch=""
+    SUBSAMPLED=()
+    last_epoch=""
     while IFS=$'\t' read -r ep snap; do
       if [ -z "$last_epoch" ] || [ $(( last_epoch - ep )) -ge "$INTERVAL_SEC" ]; then
         SUBSAMPLED+=("$snap")
@@ -86,7 +83,7 @@ while read -r name x y w h outfile time_min interval_min delay; do
       fi
     done <<< "$sorted"
     # Reverse to chronological order (oldest first)
-    local tmp=()
+    tmp=()
     for (( idx=${#SUBSAMPLED[@]}-1; idx>=0; idx-- )); do
       tmp+=("${SUBSAMPLED[idx]}")
     done
@@ -100,26 +97,26 @@ while read -r name x y w h outfile time_min interval_min delay; do
   fi
 
   # Create temporary directory for frames
-  local tmpdir="tmp_${name}"
+  tmpdir="tmp_${name}"
   mkdir -p "$tmpdir"
 
   # Determine font size proportional to crop height (minimum 10px)
   FONT_SIZE=$(( h / 20 ))
   [ "$FONT_SIZE" -lt 10 ] && FONT_SIZE=10
 
-  # Banner height: font size * 1.2, using bc for floating-point
-  BANNER_HEIGHT=$(echo "$FONT_SIZE * 1.2" | bc | cut -d'.' -f1)
+  # Banner height: font size * 1.2 (using bc for floating point, fallback to integer)
+  BANNER_HEIGHT=$(echo "$FONT_SIZE * 1.2" | bc | cut -d'.' -f1 2>/dev/null || echo "$(( (FONT_SIZE * 12) / 10 ))")
   if [ "$BANNER_HEIGHT" -lt "$((FONT_SIZE + 4))" ]; then
     BANNER_HEIGHT=$((FONT_SIZE + 4))
   fi
 
-  local i=0
+  i=0
   for snap in "${CROP_SNAPS[@]}"; do
     ts_part="${snap#*snapshot_}"
     ts_part="${ts_part%.png}"
     ts_fmt="${ts_part:0:4}-${ts_part:4:2}-${ts_part:6:2} ${ts_part:9:2}:${ts_part:11:2}:${ts_part:13:2}"
 
-    local outframe="${tmpdir}/frame_$(printf "%04d" $i).png"
+    outframe="${tmpdir}/frame_$(printf "%04d" $i).png"
     echo "  frame $i: $snap (${x},${y} ${w}x${h}) – $ts_fmt"
 
     CROPPED="${tmpdir}/temp_cropped_${i}.png"
@@ -141,8 +138,8 @@ while read -r name x y w h outfile time_min interval_min delay; do
   done
 
   # Build GIF with end pause
-  local frame_files=("${tmpdir}"/*.png)
-  local last_frame="${tmpdir}/last_hold.png"
+  frame_files=("${tmpdir}"/*.png)
+  last_frame="${tmpdir}/last_hold.png"
   cp "${frame_files[-1]}" "$last_frame"
 
   convert \
