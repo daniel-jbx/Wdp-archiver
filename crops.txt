@@ -1,3 +1,3 @@
 #name	x	y	w	h	outfile	[time period in min]	[interval in min]	[delay in cs]
-na	2588	2163	415	308	na.gif	720	15	.05
-mars	1982	2104	560	494	mars.gif	360	0	.05
+na	2588	2163	415	308	na.gif	720	15	5
+mars	1982	2104	560	494	mars.gif	360	0	5
