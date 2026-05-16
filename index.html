@@ -1,0 +1,761 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>WDP timeline viewer</title>
+  <style>
+    * { box-sizing: border-box; }
+    body, html {
+      margin: 0; padding: 0; overflow: hidden;
+      background: #000; font-family: sans-serif; color: white;
+    }
+    #canvas {
+      display: block; image-rendering: pixelated; image-rendering: crisp-edges;
+      touch-action: none; cursor: grab;
+    }
+    #canvas:active { cursor: grabbing; }
+    #interval-select, #snapshot-select {
+      background: #333; color: white; border: 1px solid #888;
+      border-radius: 4px; padding: 2px 4px; font-size: 0.8rem;
+      max-width: 110px;
+    }
+    #top-bar {
+      position: absolute; top: 0; left: 0; right: 0;
+      background: rgba(0,0,0,0.75); padding: 8px 12px;
+      display: flex; align-items: center; justify-content: space-between;
+      z-index: 20; pointer-events: auto;
+    }
+    #timestamp-label-top {
+      font-size: 1rem; font-weight: bold; text-align: center; flex: 1;
+    }
+    #download-group { display: flex; gap: 6px; }
+    .dl-btn {
+      font-size: 0.8rem; padding: 4px 8px;
+      background: #444; color: white; border: 1px solid #888;
+      border-radius: 4px; cursor: pointer; white-space: nowrap;
+    }
+
+    #controls {
+      position: absolute; bottom: 20px; left: 5%; right: 5%;
+      background: rgba(0,0,0,0.75); border-radius: 8px;
+      padding: 10px 16px; display: flex; flex-direction: column;
+      align-items: center; gap: 4px; z-index: 20;
+    }
+    #slider-label { font-size: 0.85rem; opacity: 0.9; pointer-events: none; }
+    #slider {
+      width: 100%; height: 6px; -webkit-appearance: none;
+      background: #555; border-radius: 3px; outline: none;
+    }
+    #slider::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 22px; height: 22px;
+      background: white; border-radius: 50%; cursor: pointer; border: none;
+    }
+
+    @media (max-width: 500px) {
+      #top-bar { flex-wrap: wrap; justify-content: center; gap: 6px; }
+      #download-group { order: 1; width: 100%; justify-content: center; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div id="top-bar">
+    <div id="interval-group">
+      <label for="interval-select" style="font-size:0.8rem;">Interval:</label>
+      <select id="interval-select">
+        <option value="1440">1 day</option>
+        <option value="360">6 hrs</option>
+        <option value="180" selected>3 hrs</option>
+        <option value="60">1 hr</option>
+        <option value="30">30 min</option>
+        <option value="15">15 min</option>
+        <option value="0">all</option>
+      </select>
+    </div>
+    <select id="snapshot-select">
+      <option value="">Jump to…</option>
+    </select>
+    <span id="timestamp-label-top">--</span>
+    <div id="download-group">
+      <button class="dl-btn" id="dl-snapshot">snapshot png</button>
+    </div>
+  </div>
+
+  <div id="controls">
+    <span id="slider-label">drag to move thru time</span>
+    <input type="range" id="slider" min="0" max="0" value="0" step="1">
+  </div>
+
+<script>
+  (function() {
+    const canvas = document.getElementById('canvas');
+    const slider = document.getElementById('slider');
+    const timestampLabelTop = document.getElementById('timestamp-label-top');
+    const dlPlanets = document.getElementById('dl-planets');
+    const dlMain = document.getElementById('dl-main');
+    const dlFarEast = document.getElementById('dl-far_east');
+    const intervalSelect = document.getElementById('interval-select');
+    const snapshotSelect = document.getElementById('snapshot-select');
+
+    // ---- WebGL context ----
+    const gl = canvas.getContext('webgl', { antialias: false }) ||
+               canvas.getContext('experimental-webgl', { antialias: false });
+    if (!gl) {
+      document.body.innerHTML = 'WebGL not supported – please use a modern browser.';
+      return;
+    }
+
+    // ---- Shaders ----
+    const vertexSrc = `
+      attribute vec2 a_position;
+      attribute vec2 a_texCoord;
+      varying vec2 v_texCoord;
+      uniform mat3 u_matrix;
+      void main() {
+        vec3 pos = u_matrix * vec3(a_position, 1.0);
+        gl_Position = vec4(pos.xy, 0.0, 1.0);
+        v_texCoord = a_texCoord;
+      }
+    `;
+    const fragmentSrc = `
+      precision mediump float;
+      varying vec2 v_texCoord;
+      uniform sampler2D u_texture;
+      void main() {
+        gl_FragColor = texture2D(u_texture, v_texCoord);
+      }
+    `;
+
+    function compileShader(type, src) {
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, src);
+      gl.compileShader(shader);
+      if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+        console.error('Shader compile error:', gl.getShaderInfoLog(shader));
+        gl.deleteShader(shader);
+        return null;
+      }
+      return shader;
+    }
+
+    const program = gl.createProgram();
+    gl.attachShader(program, compileShader(gl.VERTEX_SHADER, vertexSrc));
+    gl.attachShader(program, compileShader(gl.FRAGMENT_SHADER, fragmentSrc));
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error('Program link error:', gl.getProgramInfoLog(program));
+      return;
+    }
+    gl.useProgram(program);
+
+    // ---- Alpha blending for transparency ----
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    const aPosLoc = gl.getAttribLocation(program, 'a_position');
+    const aTexLoc = gl.getAttribLocation(program, 'a_texCoord');
+    const uMatrixLoc = gl.getUniformLocation(program, 'u_matrix');
+    const uTextureLoc = gl.getUniformLocation(program, 'u_texture');
+
+    // ---- Quad geometry with flipped texture Y (prevents upside-down image without UNPACK_FLIP_Y_WEBGL) ----
+    const quadVertices = new Float32Array([
+      // position (x,y), texCoord (u, v_flipped)
+      0, 0, 0, 0,   // bottom-left  -> tex (0,0)
+      1, 0, 1, 0,   // bottom-right -> tex (1,0)
+      0, 1, 0, 1,   // top-left     -> tex (0,1)
+      1, 0, 1, 0,   // bottom-right -> tex (1,0)
+      0, 1, 0, 1,   // top-left     -> tex (0,1)
+      1, 1, 1, 1    // top-right    -> tex (1,1)
+    ]);
+    const quadBuffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.bufferData(gl.ARRAY_BUFFER, quadVertices, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(aPosLoc);
+    gl.vertexAttribPointer(aPosLoc, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(aTexLoc);
+    gl.vertexAttribPointer(aTexLoc, 2, gl.FLOAT, false, 16, 8);
+
+    // ---- Map constants ----
+    const ZOOM = 11, TILE_SIZE = 1000;
+    const TOTAL_TILES = Math.pow(2, ZOOM), WORLD_SIZE = TOTAL_TILES * TILE_SIZE;
+    const START_COL = 1225, START_ROW = 513;
+
+    function worldYToLat(yPx) {
+      const mcY = 1 - 2 * yPx / WORLD_SIZE;
+      return (2 * Math.atan(Math.exp(Math.PI * mcY)) - Math.PI / 2) * 180 / Math.PI;
+    }
+    function worldXToLon(xPx) { return (xPx / WORLD_SIZE) * 360 - 180; }
+    function pixelToLatLon(px, py) {
+      const gx = START_COL * TILE_SIZE + px, gy = START_ROW * TILE_SIZE + py;
+      return { lat: worldYToLat(gy), lon: worldXToLon(gx) };
+    }
+    function cropToBounds(x, y, w, h) {
+      const nw = pixelToLatLon(x, y), se = pixelToLatLon(x + w, y + h);
+      return { north: nw.lat, south: se.lat, west: nw.lon, east: se.lon };
+    }
+
+    // ---- State ----
+    let allSnapshots = [];            // original sorted filenames (oldest first)
+    let filteredSnapshots = [];       // after applying interval (oldest first)
+    let sliderValueToName = {};       // maps slider index → filename (for fast lookup)
+    let currentImage = new Image();
+    let currentFilteredIndex = -1;
+    let requestedFilteredIndex = -1;
+    let offsetX = 0, offsetY = 0, scale = 1.0;
+    const MIN_SCALE = 0.1, MAX_SCALE = 10.0;
+
+    let dragging = false, dragStartX = 0, dragStartY = 0, dragOffsetX = 0, dragOffsetY = 0;
+    let initialPinchDistance = 0, initialScale = 1.0, initialPinchCenter = { x: 0, y: 0 };
+    let touchStartTapX = 0, touchStartTapY = 0;
+    let wasDragged = false;
+    let isPinching = false;
+    
+    // ---- Texture management ----
+    const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    console.log('Max texture size:', MAX_TEX);
+    const IMG_WIDTH = 7000, IMG_HEIGHT = 6000;
+    let SINGLE_TEXTURE = MAX_TEX >= IMG_WIDTH && MAX_TEX >= IMG_HEIGHT; // use let so we can disable on fallback
+
+    let tileTextures = [];   // { tex, x, y, w, h } if tiling; if single, we use one entry
+    let singleTextureInfo = null; // { tex, w, h }
+
+    // Matrix multiplication (column‑major)
+    function mat3mul(a, b, out) {
+      for (let col = 0; col < 3; col++) {
+        const b0 = b[col*3];
+        const b1 = b[col*3+1];
+        const b2 = b[col*3+2];
+        for (let row = 0; row < 3; row++) {
+          out[col*3 + row] = a[row]    * b0 +
+                             a[3 + row] * b1 +
+                             a[6 + row] * b2;
+        }
+      }
+    }
+
+    function createTextures(image) {
+      // Clean up old textures
+      tileTextures.forEach(t => gl.deleteTexture(t.tex));
+      tileTextures = [];
+      if (singleTextureInfo) {
+        gl.deleteTexture(singleTextureInfo.tex);
+        singleTextureInfo = null;
+      }
+
+      if (SINGLE_TEXTURE) {
+        // Single texture approach
+        const tex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, tex);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+        if (gl.getError() !== gl.NO_ERROR) {
+          console.error('Failed to upload single texture, falling back to tiling.');
+          gl.deleteTexture(tex);
+          SINGLE_TEXTURE = false; // fallback (now allowed because it's let)
+        } else {
+          singleTextureInfo = { tex, w: IMG_WIDTH, h: IMG_HEIGHT };
+          console.log('Using single texture');
+          return;
+        }
+      }
+
+      // Tiling fallback
+      const tileSize = Math.min(MAX_TEX, 2048); // safe internal limit
+      console.log('Tiling with size', tileSize);
+      const offCanvas = document.createElement('canvas');
+      const offCtx = offCanvas.getContext('2d');
+
+      for (let y = 0; y < IMG_HEIGHT; y += tileSize) {
+        for (let x = 0; x < IMG_WIDTH; x += tileSize) {
+          const w = Math.min(tileSize, IMG_WIDTH - x);
+          const h = Math.min(tileSize, IMG_HEIGHT - y);
+          offCanvas.width = w;
+          offCanvas.height = h;
+          offCtx.clearRect(0, 0, w, h);
+          offCtx.drawImage(image, x, y, w, h, 0, 0, w, h);
+
+          const tex = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, tex);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, offCanvas);
+          if (gl.getError() !== gl.NO_ERROR) {
+            console.error('WebGL error uploading tile at', x, y);
+            gl.deleteTexture(tex);
+            continue;
+          }
+          tileTextures.push({ tex, x, y, w, h });
+        }
+      }
+      console.log('Created', tileTextures.length, 'tiles.');
+    }
+
+    // ---- Drawing ----
+    function drawScene() {
+      gl.clearColor(0.627, 0.741, 1.0, 1.0); // water blue #A0BDFF
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      const cssW = window.innerWidth, cssH = window.innerHeight;
+      if (SINGLE_TEXTURE && singleTextureInfo) {
+        // Draw single texture
+        gl.bindTexture(gl.TEXTURE_2D, singleTextureInfo.tex);
+        const proj = new Float32Array([
+          2/cssW, 0, 0,
+          0, -2/cssH, 0,
+          -1, 1, 1
+        ]);
+        const pan = new Float32Array([
+          1, 0, 0,
+          0, 1, 0,
+          offsetX, offsetY, 1
+        ]);
+        const zoom = new Float32Array([
+          scale, 0, 0,
+          0, scale, 0,
+          0, 0, 1
+        ]);
+        const imgScale = new Float32Array([
+          IMG_WIDTH, 0, 0,
+          0, IMG_HEIGHT, 0,
+          0, 0, 1
+        ]);
+        const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
+        mat3mul(pan, zoom, tmp1);
+        mat3mul(proj, tmp1, tmp2);
+        mat3mul(tmp2, imgScale, combined);
+        gl.uniformMatrix3fv(uMatrixLoc, false, combined);
+        gl.uniform1i(uTextureLoc, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      } else if (tileTextures.length > 0) {
+        // Draw tiled
+        const proj = new Float32Array([
+          2/cssW, 0, 0,
+          0, -2/cssH, 0,
+          -1, 1, 1
+        ]);
+        const pan = new Float32Array([
+          1, 0, 0,
+          0, 1, 0,
+          offsetX, offsetY, 1
+        ]);
+        const zoom = new Float32Array([
+          scale, 0, 0,
+          0, scale, 0,
+          0, 0, 1
+        ]);
+        const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
+        mat3mul(pan, zoom, tmp1);
+        mat3mul(proj, tmp1, tmp2);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+        for (const tile of tileTextures) {
+          gl.bindTexture(gl.TEXTURE_2D, tile.tex);
+          const tileScale = new Float32Array([
+            tile.w, 0, 0,
+            0, tile.h, 0,
+            tile.x, tile.y, 1
+          ]);
+          mat3mul(tmp2, tileScale, combined);
+          gl.uniformMatrix3fv(uMatrixLoc, false, combined);
+          gl.uniform1i(uTextureLoc, 0);
+          gl.drawArrays(gl.TRIANGLES, 0, 6);
+        }
+      }
+    }
+
+    // ---- Resize ----
+    function resize() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      canvas.style.width = window.innerWidth + 'px';
+      canvas.style.height = window.innerHeight + 'px';
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      drawScene();
+    }
+    window.addEventListener('resize', resize);
+
+    function resetView() {
+      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+      const w = currentImage.width, h = currentImage.height;
+      const ww = window.innerWidth, wh = window.innerHeight;
+      scale = Math.min(ww / w, wh / h);
+      offsetX = (ww - w * scale) / 2;
+      offsetY = (wh - h * scale) / 2;
+      drawScene();
+    }
+
+    // ---- Parse timestamp from filename (epoch seconds) ----
+    function getEpoch(filename) {
+      const m = filename.match(/(\d{8})_(\d{6})/);
+      if (!m) return 0;
+      const ds = m[1], ts = m[2];
+      return Date.UTC(
+        parseInt(ds.slice(0,4)), parseInt(ds.slice(4,6))-1, parseInt(ds.slice(6,8)),
+        parseInt(ts.slice(0,2)), parseInt(ts.slice(2,4)), parseInt(ts.slice(4,6))
+      ) / 1000;
+    }
+
+    // Human‑readable relative time
+    function timeAgo(epochSec) {
+      const now = Date.now() / 1000;
+      let diff = Math.max(0, Math.round(now - epochSec));
+      const d = Math.floor(diff / 86400); diff -= d*86400;
+      const h = Math.floor(diff / 3600); diff -= h*3600;
+      const m = Math.floor(diff / 60);
+      if (d > 0) return `${d}d ${h}h ${m}m ago`;
+      if (h > 0) return `${h}h ${m}m ago`;
+      return `${m}m ago`;
+    }
+
+    // ---- Filtering by interval (with optional anchor) ----
+    let currentInterval = 180; // minutes (3 hrs)
+
+   function buildFilteredList(anchorName = null) {
+  const intervalSec = currentInterval * 60;
+  // Convert to array of { name, epoch } sorted old→new
+  const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
+  candidates.sort((a, b) => a.epoch - b.epoch);
+
+  let selected = [];
+  if (anchorName !== null) {
+    // Find anchor candidate by name (exact match)
+    const anchorIdx = candidates.findIndex(c => c.name === anchorName);
+    if (anchorIdx === -1) {
+      // Anchor not found – fall back to default (newest)
+      anchorName = null;
+    } else {
+      const anchor = candidates[anchorIdx];
+      const anchorEpoch = anchor.epoch;
+
+      // Forward direction (newer than anchor, stepping ≥ interval)
+      const forward = [];
+      let lastEpoch = anchorEpoch;
+      for (let i = anchorIdx + 1; i < candidates.length; i++) {
+        if (candidates[i].epoch - lastEpoch >= intervalSec) {
+          forward.push(candidates[i]);   // will be in chronological order (already sorted)
+          lastEpoch = candidates[i].epoch;
+        }
+      }
+
+      // Backward direction (older than anchor, stepping ≥ interval)
+      const backward = [];
+      lastEpoch = anchorEpoch;
+      for (let i = anchorIdx - 1; i >= 0; i--) {
+        if (lastEpoch - candidates[i].epoch >= intervalSec) {
+          backward.unshift(candidates[i]); // unshift to keep oldest first
+          lastEpoch = candidates[i].epoch;
+        }
+      }
+
+      // Combine: older → anchor → newer
+      selected = backward.concat(anchor).concat(forward);
+    }
+  }
+
+  if (!anchorName) {
+    // Default: start from newest and walk backward keeping interval
+    for (let i = candidates.length - 1; i >= 0; i--) {
+      if (selected.length === 0) {
+        selected.unshift(candidates[i]);
+      } else {
+        const lastEpoch = selected[0].epoch; // newest kept so far
+        if (lastEpoch - candidates[i].epoch >= intervalSec) {
+          selected.unshift(candidates[i]);
+        }
+      }
+    }
+  }
+
+  // Build final lists
+  filteredSnapshots = selected.map(c => c.name);
+  sliderValueToName = {};
+  filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+  slider.max = filteredSnapshots.length - 1;
+
+  if (filteredSnapshots.length === 0) {
+    timestampLabelTop.textContent = 'No snapshots match interval.';
+    return;
+  }
+
+  // Determine which index to show
+  let targetIdx = filteredSnapshots.length - 1; // newest
+  if (anchorName) {
+    const idx = filteredSnapshots.indexOf(anchorName);
+    if (idx !== -1) targetIdx = idx;
+  }
+  loadFilteredSnapshot(targetIdx);
+}
+
+    function loadFilteredSnapshot(idx) {
+      if (idx < 0 || idx >= filteredSnapshots.length) return;
+      const filename = sliderValueToName[idx];
+      if (!filename) return;
+      requestedFilteredIndex = idx;
+      slider.value = idx;
+      const m = filename.match(/(\d{8})_(\d{6})/);
+      timestampLabelTop.textContent = m
+        ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}`
+        : filename;
+      currentImage.src = filename;
+    }
+
+    // ---- Image load handler (uses filtered indices) ----
+    currentImage.onload = () => {
+      if (currentFilteredIndex !== requestedFilteredIndex) {
+        createTextures(currentImage);
+        if (currentFilteredIndex === -1) {
+          currentFilteredIndex = requestedFilteredIndex;
+          resetView();
+        } else {
+          currentFilteredIndex = requestedFilteredIndex;
+          drawScene();
+        }
+      }
+    };
+    currentImage.onerror = () => console.error('Image failed:', currentImage.src);
+    // ---- Load overlay definitions from overlays.txt ----
+let CROPS = {};                     // will be populated
+const downloadGroup = document.getElementById('download-group');
+
+fetch('overlays.txt')
+  .then(r => r.text())
+  .then(txt => {
+    const lines = txt.split('\n');
+    lines.forEach(line => {
+      line = line.trim();
+      if (line === '' || line.startsWith('#')) return;
+      const parts = line.split('\t');
+      if (parts.length !== 5) return;   // name x1 y1 x2 y2
+      const [name, x1, y1, x2, y2] = parts.map(s => s.trim());
+      const crop = {
+        x: parseInt(x1),
+        y: parseInt(y1),
+        w: parseInt(x2) - parseInt(x1),
+        h: parseInt(y2) - parseInt(y1)
+      };
+      CROPS[name] = crop;
+
+      // Build a button for this overlay
+      const btn = document.createElement('button');
+      btn.className = 'dl-btn';
+      btn.textContent = name;
+      btn.addEventListener('click', () => downloadOverlay(name));
+      downloadGroup.appendChild(btn);
+    });
+    console.log('Overlays loaded:', Object.keys(CROPS));
+  })
+  .catch(e => console.error('Failed to load overlays.txt', e));
+    
+    // ---- Initial snapshot loading ----
+    fetch('snapshots.json')
+      .then(r => r.json())
+      .then(files => {
+        if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
+        allSnapshots = files; // already sorted by name (oldest first)
+        // Populate the jump dropdown (most recent first)
+        snapshotSelect.innerHTML = '<option value="">Jump to…</option>';
+        for (let i = allSnapshots.length - 1; i >= 0; i--) {
+          const ts = getEpoch(allSnapshots[i]);
+          const opt = document.createElement('option');
+          opt.value = allSnapshots[i]; // store the filename
+          opt.textContent = timeAgo(ts);
+          snapshotSelect.appendChild(opt);
+        }
+        // Build filtered list with default interval (no anchor)
+        buildFilteredList(null);
+      })
+      .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
+
+    // ---- Interval dropdown change ----
+    intervalSelect.addEventListener('change', () => {
+      currentInterval = parseInt(intervalSelect.value);
+      buildFilteredList(null);
+    });
+
+    // ---- Snapshot jump dropdown ----
+snapshotSelect.addEventListener('change', () => {
+  const selectedFilename = snapshotSelect.value;
+  if (!selectedFilename) return;
+  // Pass the filename directly – interval stays unchanged
+  buildFilteredList(selectedFilename);
+});
+
+    // ---- Slider input (new) ----
+    slider.addEventListener('input', () => {
+      loadFilteredSnapshot(parseInt(slider.value, 10));
+    });
+
+    // ---- Keyboard shortcuts (new) ----
+    window.addEventListener('keydown', e => {
+      if(e.key==='ArrowLeft'){
+        e.preventDefault();
+        if(currentFilteredIndex > 0) loadFilteredSnapshot(currentFilteredIndex - 1);
+      }
+      else if(e.key==='ArrowRight'){
+        e.preventDefault();
+        if(currentFilteredIndex < filteredSnapshots.length - 1) loadFilteredSnapshot(currentFilteredIndex + 1);
+      }
+      else if(e.key==='r'||e.key==='R') resetView();
+    });
+
+    // ---- Pan & Zoom events (unchanged) ----
+    canvas.addEventListener('mousedown', e => { e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
+    window.addEventListener('mousemove', e => { if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawScene(); });
+    window.addEventListener('mouseup', () => { dragging = false; canvas.style.cursor = 'grab'; });
+
+// ---- 1. touchstart ----
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.touches;
+  if (t.length === 1) {
+    dragging = true;
+    dragStartX = t[0].clientX;
+    dragStartY = t[0].clientY;
+    dragOffsetX = offsetX;
+    dragOffsetY = offsetY;
+    wasDragged = false;
+    touchStartTapX = t[0].clientX;
+    touchStartTapY = t[0].clientY;
+  } else if (t.length === 2) {
+    dragging = false;
+    isPinching = true;
+    const dx = t[1].clientX - t[0].clientX;
+    const dy = t[1].clientY - t[0].clientY;
+    initialPinchDistance = Math.hypot(dx, dy);
+    initialScale = scale;
+    initialPinchCenter = {
+      x: (t[0].clientX + t[1].clientX) / 2,
+      y: (t[0].clientY + t[1].clientY) / 2
+    };
+  }
+}, { passive: false });
+
+// ---- 2. touchmove ----
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.touches;
+  if (t.length === 1 && dragging) {
+    offsetX = dragOffsetX + (t[0].clientX - dragStartX);
+    offsetY = dragOffsetY + (t[0].clientY - dragStartY);
+    if (Math.hypot(t[0].clientX - touchStartTapX, t[0].clientY - touchStartTapY) > 5) {
+      wasDragged = true;
+    }
+    drawScene();
+  } else if (t.length === 2) {
+    const dx = t[1].clientX - t[0].clientX;
+    const dy = t[1].clientY - t[0].clientY;
+    const nd = Math.hypot(dx, dy);
+    if (initialPinchDistance > 0) {
+      const ns = initialScale * (nd / initialPinchDistance);
+      scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, ns));
+      const cx = (t[0].clientX + t[1].clientX) / 2;
+      const cy = (t[0].clientY + t[1].clientY) / 2;
+      const sc = scale / initialScale;
+      offsetX = cx - sc * (initialPinchCenter.x - offsetX);
+      offsetY = cy - sc * (initialPinchCenter.y - offsetY);
+      initialPinchCenter = { x: cx, y: cy };
+      initialScale = scale;
+      initialPinchDistance = nd;
+      drawScene();
+    }
+  }
+}, { passive: false });
+
+// ---- 3. touchend ----
+canvas.addEventListener('touchend', e => {
+  dragging = false;
+  initialPinchDistance = 0;
+
+  // Tap to skip – only if no drag and no pinch happened
+  if (!wasDragged && !isPinching && e.changedTouches.length === 1) {
+    const x = e.changedTouches[0].clientX;
+    if (x < window.innerWidth / 2) {
+      if (currentFilteredIndex > 0) loadFilteredSnapshot(currentFilteredIndex - 1);
+    } else {
+      if (currentFilteredIndex < filteredSnapshots.length - 1) loadFilteredSnapshot(currentFilteredIndex + 1);
+    }
+  }
+
+  // Reset flags when all fingers leave the screen
+  if (e.touches.length === 0) {
+    isPinching = false;
+    wasDragged = false;
+  }
+});
+    canvas.addEventListener('wheel', e => { e.preventDefault(); const zf=1.1, old=scale; if(e.deltaY<0) scale*=zf; else scale/=zf; scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,scale)); const sc=scale/old; offsetX=e.clientX-sc*(e.clientX-offsetX); offsetY=e.clientY-sc*(e.clientY-offsetY); drawScene(); }, {passive:false});
+
+    // ---- Overlay download (transparent, reusing a single offscreen canvas) ----
+    let exportCanvas = null; // reusable canvas
+
+    function downloadOverlay(cropKey) {
+      if (!currentImage.complete || currentImage.naturalWidth === 0) return;
+      const crop = CROPS[cropKey];
+      if (!crop) return;
+
+      if (!exportCanvas) exportCanvas = document.createElement('canvas');
+      exportCanvas.width = crop.w;
+      exportCanvas.height = crop.h;
+      const tctx = exportCanvas.getContext('2d');
+      tctx.clearRect(0, 0, crop.w, crop.h);
+      tctx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+
+      const dataUrl = exportCanvas.toDataURL('image/png');
+      const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);
+      // Use filtered snapshots and current filtered index
+      const currentFilename = filteredSnapshots[currentFilteredIndex];
+      const m = currentFilename ? currentFilename.match(/(\d{8}_\d{6})/) : null;
+      const ts = m ? m[0] : 'unknown';
+      const overlay = {
+        id: `wdp_${cropKey}_${ts}`,
+        schemaVersion: "1",
+        name: `${cropKey}_${ts}.png`,
+        opacity: 1,
+        image: { dataUrl, width: crop.w, height: crop.h },
+        bounds,
+        colorMetric: "lab",
+        dithering: false,
+        order: 0,
+        locked: false,
+        hasPlaced: true,
+        visible: true
+      };
+      const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `wdp_${cropKey}_${ts}.wplace`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }
+    
+    const dlSnapshot = document.getElementById('dl-snapshot');
+dlSnapshot.addEventListener('click', () => {
+  if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
+  const filename = filteredSnapshots[currentFilteredIndex];
+  const a = document.createElement('a');
+  a.href = filename;          // relative path to the PNG on the same server
+  a.download = filename;      // forces download, file name same as original
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+});
+    // Initial resize (water background shown)
+    resize();
+    // On startup, set default background
+    gl.clearColor(0.627, 0.741, 1.0, 1.0);
+    gl.clear(gl.COLOR_BUFFER_BIT);
+  })();
+</script>
+</body>
+</html>
