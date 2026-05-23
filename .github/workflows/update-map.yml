@@ -15,11 +15,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout assets branch
+      - name: Checkout assets branch (sparse – ignore old snapshots)
         uses: actions/checkout@v4
         with:
           ref: assets
           fetch-depth: 0
+          sparse-checkout: |
+            *
+            !wdpsnapshot_*.png
 
       - name: Configure git credentials
         run: |
