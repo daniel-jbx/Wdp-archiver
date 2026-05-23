@@ -5,6 +5,8 @@ concurrency:
   cancel-in-progress: false
 
 on:
+  schedule:
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -24,15 +26,6 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config --global credential.helper "!f() { echo \"username=x-access-token\"; echo \"password=${{ secrets.GITHUB_TOKEN }}\"; }; f"
-
-      - name: Sync with remote assets
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin assets
-
-      - name: Install ImageMagick
-        run: sudo apt-get update && sudo apt-get install -y imagemagick
 
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
@@ -66,6 +59,6 @@ jobs:
       - name: Commit updated snapshot list
         run: |
           git add snapshots.json
-          git pull --rebase origin assets
           git commit --allow-empty -m "Update snapshot list"
+          git pull --rebase origin assets
           git push origin assets
