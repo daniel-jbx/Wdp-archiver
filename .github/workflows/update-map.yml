@@ -20,9 +20,7 @@ jobs:
         with:
           ref: assets
           fetch-depth: 0
-          sparse-checkout: |
-            *
-            !wdpsnapshot_*.png
+          sparse-checkout: ['*', '!wdpsnapshot_*.png']
 
       - name: Configure git credentials
         run: |
