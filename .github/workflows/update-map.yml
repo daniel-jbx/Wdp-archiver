@@ -19,6 +19,12 @@ jobs:
           ref: assets
           fetch-depth: 0
 
+      - name: Configure git credentials
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config --global credential.helper "!f() { echo \"username=x-access-token\"; echo \"password=${{ secrets.GITHUB_TOKEN }}\"; }; f"
+
       - name: Sync with remote assets
         run: |
           git config user.name "github-actions[bot]"
@@ -39,12 +45,11 @@ jobs:
 
       - name: Commit new snapshot to assets
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add wdpsnapshot_*.png
           if ! git diff --cached --quiet; then
             git commit -m "Snapshot ${TIMESTAMP} UTC"
-            git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/daniel-jbx/Wdp-archiver.git assets
+            git pull --rebase origin assets
+            git push origin assets
           else
             echo "No changes to commit"
           fi
@@ -58,8 +63,9 @@ jobs:
               json.dump(files, f)
           EOF
 
-      - name: Commit snapshot list
+      - name: Commit updated snapshot list
         run: |
           git add snapshots.json
-          git commit --allow-empty -m "Update snapshot list (24h)"
-          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/daniel-jbx/Wdp-archiver.git assets
+          git pull --rebase origin assets
+          git commit --allow-empty -m "Update snapshot list"
+          git push origin assets
