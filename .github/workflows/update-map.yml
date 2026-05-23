@@ -53,14 +53,13 @@ jobs:
             echo "No changes to commit"
           fi
 
-      - name: Update snapshot list JSON
+      - name: Update snapshot list JSON (uses git to see all snapshots)
         run: |
-          python3 << 'EOF'
-          import glob, json
-          files = sorted(glob.glob('wdpsnapshot_*.png'))
-          with open('snapshots.json', 'w') as f:
-              json.dump(files, f)
-          EOF
+          git ls-files 'wdpsnapshot_*.png' | sort | python3 -c "
+import sys, json
+files = [line.strip() for line in sys.stdin]
+json.dump(files, sys.stdout)
+" > snapshots.json
 
       - name: Commit updated snapshot list
         run: |
