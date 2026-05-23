@@ -44,7 +44,7 @@ jobs:
           git add wdpsnapshot_*.png
           if ! git diff --cached --quiet; then
             git commit -m "Snapshot ${TIMESTAMP} UTC"
-            git push origin assets
+            git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/daniel-jbx/Wdp-archiver.git assets
           else
             echo "No changes to commit"
           fi
@@ -62,4 +62,4 @@ jobs:
         run: |
           git add snapshots.json
           git commit --allow-empty -m "Update snapshot list (24h)"
-          git push origin assets
+          git push https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/daniel-jbx/Wdp-archiver.git assets
