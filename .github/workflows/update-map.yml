@@ -53,11 +53,12 @@ jobs:
 
       - name: Update snapshot list JSON (uses git to see all snapshots)
         run: |
-          git ls-files 'wdpsnapshot_*.png' | sort | python3 -c "
-import sys, json
-files = [line.strip() for line in sys.stdin]
-json.dump(files, sys.stdout)
-" > snapshots.json
+          git ls-files 'wdpsnapshot_*.png' | sort | python3 << 'PYEOF'
+          import sys, json
+          files = [line.strip() for line in sys.stdin]
+          json.dump(files, sys.stdout)
+          PYEOF
+          mv snapshots.json
 
       - name: Commit updated snapshot list
         run: |
