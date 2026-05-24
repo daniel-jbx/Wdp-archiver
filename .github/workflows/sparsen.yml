@@ -1,0 +1,19 @@
+name: Sparsen Old Snapshots
+on:
+  schedule:
+    - cron: '0 6 * * *'   # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sparsen:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: assets
+      - name: Run sparsening
+        run: bash sparsen-snapshots.sh
+      - name: Push changes
+        run: git push origin assets
