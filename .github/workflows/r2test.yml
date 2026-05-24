@@ -13,6 +13,14 @@ jobs:
           sudo dpkg -i rclone-current-linux-amd64.deb
           rm rclone-current-linux-amd64.deb
 
+      - name: Debug endpoint (check length)
+        run: |
+          echo "Endpoint length (number of characters): ${#R2_ENDPOINT}"
+          # Print first few characters; GitHub will mask if it matches a secret
+          echo "First 10 chars (masked if secret): ${R2_ENDPOINT:0:10}"
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+
       - name: Test R2 connection
         run: |
           rclone lsd ":s3,provider=Cloudflare,access_key_id=$R2_ACCESS_KEY_ID,secret_access_key=$R2_SECRET_ACCESS_KEY,endpoint=$R2_ENDPOINT:" \
