@@ -5,8 +5,6 @@ concurrency:
   cancel-in-progress: false
 
 on:
-  schedule:
-    - cron: '3 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -15,18 +13,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout assets branch (sparse – ignore old snapshots)
+      - name: Checkout assets branch
         uses: actions/checkout@v4
         with:
           ref: assets
           fetch-depth: 0
-          sparse-checkout: ['*', '!wdpsnapshot_*.png']
 
-      - name: Configure git credentials
+      - name: Sync with remote assets
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git config --global credential.helper "!f() { echo \"username=x-access-token\"; echo \"password=${{ secrets.GITHUB_TOKEN }}\"; }; f"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git pull --rebase origin assets
 
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
@@ -42,27 +39,27 @@ jobs:
 
       - name: Commit new snapshot to assets
         run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add wdpsnapshot_*.png
           if ! git diff --cached --quiet; then
             git commit -m "Snapshot ${TIMESTAMP} UTC"
-            git pull --rebase origin assets
             git push origin assets
           else
             echo "No changes to commit"
           fi
 
-      - name: Update snapshot list JSON (uses git to see all snapshots)
+      - name: Update snapshot list JSON
         run: |
-          git ls-files 'wdpsnapshot_*.png' | sort | python3 << 'PYEOF'
-          import sys, json
-          files = [line.strip() for line in sys.stdin]
-          json.dump(files, sys.stdout)
-          PYEOF
-          mv snapshots.json
+          python3 << 'EOF'
+          import glob, json
+          files = sorted(glob.glob('wdpsnapshot_*.png'))
+          with open('snapshots.json', 'w') as f:
+              json.dump(files, f)
+          EOF
 
-      - name: Commit updated snapshot list
+      - name: Commit snapshot list
         run: |
           git add snapshots.json
-          git commit --allow-empty -m "Update snapshot list"
-          git pull --rebase origin assets
+          git commit --allow-empty -m "Update snapshot list (24h)"
           git push origin assets
