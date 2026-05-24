@@ -1,7 +1,7 @@
 name: Purge Assets History
 
 on:
-  workflow_dispatch:   # you trigger it manually from the Actions tab
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,13 +14,16 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: assets
-          fetch-depth: 0   # need full history to rewrite it
+          fetch-depth: 0
 
       - name: Purge snapshots and rewrite history
         run: |
           set -euo pipefail
 
-          # --- Purge logic (same as before) ---
+          # Set Git identity (required for commits)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           mapfile -t ALL < <(ls -1 wdpsnapshot_*.png 2>/dev/null | sort)
           NOW_EPOCH=$(date +%s)
 
@@ -70,11 +73,9 @@ jobs:
               done
           done
 
-          # Update snapshots.json
           printf '%s\n' "${KEPT[@]}" | jq -R . | jq -s . > snapshots.json
           git add snapshots.json
 
-          # Remove _deprecated if present
           if [ -d "_deprecated" ]; then
               git rm -r _deprecated
               echo "Removed _deprecated folder"
@@ -82,14 +83,11 @@ jobs:
 
           git commit -m "Purge old snapshots" || echo "No changes to commit"
 
-          # --- Rewrite history: create orphan branch ---
           git checkout --orphan assets-slim
           git add -A
           git commit -m "Slimmed assets branch"
 
-          # Replace old assets with slim one
           git branch -D assets
           git branch -m assets
 
-          # Force push
           git push origin --force assets
