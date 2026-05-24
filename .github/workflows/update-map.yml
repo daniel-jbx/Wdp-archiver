@@ -1,15 +1,12 @@
 name: Update Map Snapshot
 
 concurrency:
-  # Use a shared group if your daily sparsening workflow also uses this name
-  # so that only one of them runs at a time.
   group: assets-branch-update
-  cancel-in-progress: false   # queue instead of cancel
+  cancel-in-progress: false
 
 on:
   workflow_dispatch:
-  # schedule:   # uncomment when ready
-  #   - cron: '*/5 * * * *'
+  # schedule: (add your cron when ready)
 
 jobs:
   update:
@@ -26,13 +23,19 @@ jobs:
             download-and-stitch.sh
           sparse-checkout-cone-mode: false
 
-      - name: Install ImageMagick
-        run: sudo apt-get update && sudo apt-get install -y imagemagick
+      - name: Install ImageMagick and rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick
+          # Install rclone (no config file needed)
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
 
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
 
-      - name: Commit new snapshot and update list
+      - name: Commit new snapshot, update list, and upload to R2
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
           mv output.png "wdpsnapshot_${TIMESTAMP}.png"
@@ -40,14 +43,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # 1. Stage and commit the new snapshot (temporary commit)
+          # Stage and commit the new snapshot (temporary commit)
           git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
           git commit -m "Snapshot ${TIMESTAMP} UTC (pre-rebase)"
 
-          # 2. Pull latest remote changes and rebase our commit on top
+          # Pull latest remote changes and rebase our commit on top
           git pull --rebase origin assets
 
-          # 3. Rebuild snapshots.json from the current index
+          # Rebuild snapshots.json from the current index
           python3 << 'EOF'
           import subprocess, json
           files = sorted(
@@ -62,30 +65,23 @@ jobs:
 
           git add --sparse snapshots.json
 
-          # 4. Amend the commit to include the updated JSON and final message
+          # Amend the commit to include the updated JSON and final message
           git commit --amend -m "Snapshot ${TIMESTAMP} UTC" --no-edit
 
-          # 5. Push
+          # Push to repo (as before)
           git push origin assets
 
-      - name: Upload snapshot to R2 (non-critical)
-        if: always()   # run even if previous step failed (though it shouldn't)
-        run: |
-          TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
-          FILENAME="wdpsnapshot_${TIMESTAMP}.png"
-          if [ -f "$FILENAME" ]; then
-            echo "Uploading $FILENAME to R2..."
-            rclone copyto "$FILENAME" ":s3:${R2_BUCKET}/${FILENAME}" \
-              --s3-provider="Cloudflare" \
-              --s3-endpoint="$R2_ENDPOINT" \
-              --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-              --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-              --s3-no-check-bucket \
-              --verbose
-            echo "Upload complete."
-          else
-            echo "File $FILENAME not found; skipping upload."
-          fi
+          # --- NEW: Upload the same file to R2 (non-critical) ---
+          echo "Uploading wdpsnapshot_${TIMESTAMP}.png to R2..."
+          rclone copyto "wdpsnapshot_${TIMESTAMP}.png" \
+            ":s3:${R2_BUCKET}/wdpsnapshot_${TIMESTAMP}.png" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket \
+            --verbose
+          echo "Upload complete."
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
