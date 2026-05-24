@@ -15,5 +15,9 @@ jobs:
           ref: assets
       - name: Run sparsening
         run: bash sparsen-snapshots.sh
-      - name: Push changes
-        run: git push origin assets
+      - name: Pull latest and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git pull --rebase origin assets
+          git push origin assets
