@@ -2,7 +2,7 @@ name: Update Map Snapshot
 
 concurrency:
   group: update-map-snapshot
-  cancel-in-progress: false
+  cancel-in-progress: false   # queue, don't cancel – exactly what you need for 5-minute cron
 
 on:
   workflow_dispatch:
@@ -13,17 +13,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout assets branch
+      - name: Checkout assets (sparse – only the script)
         uses: actions/checkout@v4
         with:
           ref: assets
-          fetch-depth: 0
-
-      - name: Sync with remote assets
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git pull --rebase origin assets
+          fetch-depth: 1
+          sparse-checkout: |
+            download-and-stitch.sh
 
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
@@ -31,35 +27,30 @@ jobs:
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
 
-      - name: Rename with timestamp
+      - name: Commit new snapshot and update list
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
           mv output.png "wdpsnapshot_${TIMESTAMP}.png"
-          echo "TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
 
-      - name: Commit new snapshot to assets
-        run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add wdpsnapshot_*.png
-          if ! git diff --cached --quiet; then
-            git commit -m "Snapshot ${TIMESTAMP} UTC"
-            git push origin assets
-          else
-            echo "No changes to commit"
-          fi
 
-      - name: Update snapshot list JSON
-        run: |
-          python3 << 'EOF'
-          import glob, json
-          files = sorted(glob.glob('wdpsnapshot_*.png'))
+          # Stage the new PNG – this adds it to Git's index without downloading old blobs
+          git add "wdpsnapshot_${TIMESTAMP}.png"
+
+          # Build the complete JSON list from the Git index (not the filesystem)
+          python3 -c "
+          import subprocess, json
+          files = sorted(
+              subprocess.check_output(
+                  ['git', 'ls-files', 'wdpsnapshot_*.png'],
+                  text=True
+              ).strip().split('\n')
+          )
           with open('snapshots.json', 'w') as f:
               json.dump(files, f)
-          EOF
+          "
 
-      - name: Commit snapshot list
-        run: |
           git add snapshots.json
-          git commit --allow-empty -m "Update snapshot list (24h)"
+          git commit -m "Snapshot ${TIMESTAMP} UTC" || echo "No changes"
           git push origin assets
