@@ -1,4 +1,4 @@
-name: Purge Assets History
+name: Purge Assets (safe push)
 
 on:
   workflow_dispatch:
@@ -10,17 +10,16 @@ jobs:
   purge:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout assets branch with full history
+      - name: Checkout assets branch
         uses: actions/checkout@v4
         with:
           ref: assets
-          fetch-depth: 0
+          fetch-depth: 1   # we only need the latest commit
 
-      - name: Purge snapshots and rewrite history
+      - name: Purge deprecated snapshots and force push
         run: |
           set -euo pipefail
 
-          # Set Git identity (required for commits)
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -73,22 +72,18 @@ jobs:
               done
           done
 
+          # Update snapshots.json
           printf '%s\n' "${KEPT[@]}" | jq -R . | jq -s . > snapshots.json
           git add snapshots.json
 
+          # Remove _deprecated if present
           if [ -d "_deprecated" ]; then
               git rm -r _deprecated
               echo "Removed _deprecated folder"
           fi
 
-          git commit -m "Purge old snapshots" || echo "No changes to commit"
+          # Commit the removals
+          git commit -m "Purge old snapshots: keep 4/hr after 72h, 1/hr after 7d" || echo "Nothing to commit"
 
-          git checkout --orphan assets-slim
-          git add -A
-          git commit -m "Slimmed assets branch"
-
-          git branch -D assets
-          git branch -m assets
-          
-          git config http.postBuffer 524288000
+          # Force push – this will be tiny because blobs are already on server
           git push origin --force assets
