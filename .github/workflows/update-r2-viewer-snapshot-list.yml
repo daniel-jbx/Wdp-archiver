@@ -1,0 +1,49 @@
+name: Update R2 Viewer Snapshot List
+
+on:
+  workflow_dispatch:   # manual trigger
+
+permissions:
+  contents: write
+
+jobs:
+  update-list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout r2-viewer branch
+        uses: actions/checkout@v4
+        with:
+          ref: r2-viewer
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Generate snapshots.json from R2
+        run: |
+          rclone lsf ":s3:${R2_BUCKET}" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket | \
+            grep 'wdpsnapshot_.*\.png' | sort | jq -R . | jq -s . > snapshots.json
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      - name: Commit and push to r2-viewer
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "actions@github.com"
+          git add snapshots.json
+          if git diff --cached --quiet; then
+            echo "No changes to snapshots.json"
+          else
+            git commit -m "Update snapshot list from R2"
+            git push origin r2-viewer
+          fi
