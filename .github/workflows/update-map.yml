@@ -40,14 +40,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stage the new snapshot
+          # 1. Stage and commit the new snapshot (temporary commit)
           git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
+          git commit -m "Snapshot ${TIMESTAMP} UTC (pre-rebase)"
 
-          # Pull in any remote changes (e.g., daily sparsening) and rebase
+          # 2. Pull latest remote changes and rebase our commit on top
           git pull --rebase origin assets
 
-          # Rebuild snapshots.json from the current index (includes new snapshot
-          # and excludes any files that were deleted by the sparsening)
+          # 3. Rebuild snapshots.json from the current index
           python3 << 'EOF'
           import subprocess, json
           files = sorted(
@@ -61,5 +61,9 @@ jobs:
           EOF
 
           git add --sparse snapshots.json
-          git commit -m "Snapshot ${TIMESTAMP} UTC" || echo "No changes"
+
+          # 4. Amend the commit to include the updated JSON and final message
+          git commit --amend -m "Snapshot ${TIMESTAMP} UTC" --no-edit
+
+          # 5. Push
           git push origin assets
