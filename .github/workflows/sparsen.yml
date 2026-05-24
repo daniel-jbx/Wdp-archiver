@@ -89,5 +89,6 @@ jobs:
 
           git branch -D assets
           git branch -m assets
-
+          
+          git config http.postBuffer 524288000
           git push origin --force assets
