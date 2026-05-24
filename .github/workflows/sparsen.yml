@@ -1,28 +1,31 @@
-name: Purge Assets (safe push)
+name: Daily Sparsen Snapshots
 
 on:
-  workflow_dispatch:
+  schedule:
+    - cron: '0 12 * * *' 
+  workflow_dispatch:       # allows manual trigger
 
 permissions:
   contents: write
 
 jobs:
-  purge:
+  sparsen:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout assets branch
         uses: actions/checkout@v4
         with:
           ref: assets
-          fetch-depth: 1   # we only need the latest commit
+          fetch-depth: 1
 
-      - name: Purge deprecated snapshots and force push
+      - name: Sparsen and push
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # ---- Determine which snapshots to delete ----
           mapfile -t ALL < <(ls -1 wdpsnapshot_*.png 2>/dev/null | sort)
           NOW_EPOCH=$(date +%s)
 
@@ -42,7 +45,8 @@ jobs:
               HOUR_GROUPS["$hour_key"]+="$f "
           done
 
-          KEPT=()
+          # Files to delete (we'll mark them for removal)
+          TO_DELETE=()
 
           for hour in "${!HOUR_GROUPS[@]}"; do
               snaps=($(echo ${HOUR_GROUPS[$hour]} | tr ' ' '\n' | sort))
@@ -60,30 +64,32 @@ jobs:
               fi
 
               if [ ${#snaps[@]} -gt $keep ]; then
-                  delete=("${snaps[@]:0:$((${#snaps[@]} - keep))}")
-                  for f in "${delete[@]}"; do
-                      git rm "$f"
-                      echo "Deleted $f"
+                  # delete oldest
+                  for ((i=0; i < ${#snaps[@]} - keep; i++)); do
+                      TO_DELETE+=("${snaps[$i]}")
                   done
               fi
-
-              for ((i=$((${#snaps[@]} - keep)); i<${#snaps[@]}; i++)); do
-                  KEPT+=("${snaps[$i]}")
-              done
           done
 
-          # Update snapshots.json
-          printf '%s\n' "${KEPT[@]}" | jq -R . | jq -s . > snapshots.json
-          git add snapshots.json
-
-          # Remove _deprecated if present
-          if [ -d "_deprecated" ]; then
-              git rm -r _deprecated
-              echo "Removed _deprecated folder"
+          if [ ${#TO_DELETE[@]} -gt 0 ]; then
+              git rm "${TO_DELETE[@]}"
+              echo "Deleted ${#TO_DELETE[@]} snapshots"
+          else
+              echo "No snapshots to delete"
           fi
 
-          # Commit the removals
-          git commit -m "Purge old snapshots: keep 4/hr after 72h, 1/hr after 7d" || echo "Nothing to commit"
+          # ---- Pull the latest remote changes (e.g., new snapshots from update-map) ----
+          git pull --rebase origin assets
 
-          # Force push – this will be tiny because blobs are already on server
-          git push origin --force assets
+          # ---- Rebuild snapshots.json to reflect current kept files ----
+          # (this automatically includes any new snapshots that were just pulled)
+          ls -1 wdpsnapshot_*.png 2>/dev/null | jq -R . | jq -s . > snapshots.json
+          git add snapshots.json
+
+          # ---- Commit and push ----
+          if git diff --cached --quiet; then
+              echo "No changes to commit"
+          else
+              git commit -m "Daily sparsen: remove old snapshots, update index"
+              git push origin assets
+          fi
