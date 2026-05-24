@@ -2,10 +2,11 @@ name: Update Map Snapshot
 
 concurrency:
   group: update-map-snapshot
-  cancel-in-progress: false   # queue, don't cancel – exactly what you need for 5-minute cron
+  cancel-in-progress: false   # queue, don't cancel
 
 on:
   workflow_dispatch:
+  # schedule: (your cron)
 
 jobs:
   update:
@@ -13,13 +14,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout assets (sparse – only the script)
+      - name: Checkout assets (sparse – only script)
         uses: actions/checkout@v4
         with:
           ref: assets
           fetch-depth: 1
           sparse-checkout: |
             download-and-stitch.sh
+          sparse-checkout-cone-mode: false    # allow file patterns
 
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
@@ -35,10 +37,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stage the new PNG – this adds it to Git's index without downloading old blobs
           git add "wdpsnapshot_${TIMESTAMP}.png"
 
-          # Build the complete JSON list from the Git index (not the filesystem)
           python3 -c "
           import subprocess, json
           files = sorted(
