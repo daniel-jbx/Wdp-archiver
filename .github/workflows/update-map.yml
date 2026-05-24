@@ -32,25 +32,25 @@ jobs:
       - name: Commit new snapshot and update list
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
-            mv output.png "wdpsnapshot_${TIMESTAMP}.png"
+          mv output.png "wdpsnapshot_${TIMESTAMP}.png"
 
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-            git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
+          git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
 
-            python3 -c "
-            import subprocess, json
-            files = sorted(
-                subprocess.check_output(
-                    ['git', 'ls-files', 'wdpsnapshot_*.png'],
-                    text=True
-                ).strip().split('\n')
-            )
-            with open('snapshots.json', 'w') as f:
-                json.dump(files, f)
-            "
+          python3 << 'EOF'
+          import subprocess, json
+          files = sorted(
+              subprocess.check_output(
+                  ['git', 'ls-files', 'wdpsnapshot_*.png'],
+                  text=True
+              ).strip().split('\n')
+          )
+          with open('snapshots.json', 'w') as f:
+              json.dump(files, f)
+          EOF
 
-            git add --sparse snapshots.json
-            git commit -m "Snapshot ${TIMESTAMP} UTC" || echo "No changes"
-            git push origin assets
+          git add --sparse snapshots.json
+          git commit -m "Snapshot ${TIMESTAMP} UTC" || echo "No changes"
+          git push origin assets
