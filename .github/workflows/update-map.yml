@@ -1,12 +1,15 @@
 name: Update Map Snapshot
 
 concurrency:
-  group: update-map-snapshot
-  cancel-in-progress: false   # queue, don't cancel
+  # Use a shared group if your daily sparsening workflow also uses this name
+  # so that only one of them runs at a time.
+  group: assets-branch-update
+  cancel-in-progress: false   # queue instead of cancel
 
 on:
   workflow_dispatch:
-  # schedule: (your cron)
+  # schedule:   # uncomment when ready
+  #   - cron: '*/5 * * * *'
 
 jobs:
   update:
@@ -21,7 +24,7 @@ jobs:
           fetch-depth: 1
           sparse-checkout: |
             download-and-stitch.sh
-          sparse-checkout-cone-mode: false    # allow file patterns
+          sparse-checkout-cone-mode: false
 
       - name: Install ImageMagick
         run: sudo apt-get update && sudo apt-get install -y imagemagick
@@ -37,8 +40,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          # Stage the new snapshot
           git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
 
+          # Pull in any remote changes (e.g., daily sparsening) and rebase
+          git pull --rebase origin assets
+
+          # Rebuild snapshots.json from the current index (includes new snapshot
+          # and excludes any files that were deleted by the sparsening)
           python3 << 'EOF'
           import subprocess, json
           files = sorted(
