@@ -26,19 +26,13 @@ jobs:
             download-and-stitch.sh
           sparse-checkout-cone-mode: false
 
-      - name: Install ImageMagick and rclone
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y imagemagick
-          # Install rclone (no config file needed)
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
-          sudo dpkg -i rclone-current-linux-amd64.deb
-          rm rclone-current-linux-amd64.deb
+      - name: Install ImageMagick
+        run: sudo apt-get update && sudo apt-get install -y imagemagick
 
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
 
-      - name: Commit new snapshot, update list, and upload to R2
+      - name: Commit new snapshot and update list
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
           mv output.png "wdpsnapshot_${TIMESTAMP}.png"
@@ -46,14 +40,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Stage and commit the new snapshot (temporary commit)
+          # 1. Stage and commit the new snapshot (temporary commit)
           git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
           git commit -m "Snapshot ${TIMESTAMP} UTC (pre-rebase)"
 
-          # Pull latest remote changes and rebase our commit on top
+          # 2. Pull latest remote changes and rebase our commit on top
           git pull --rebase origin assets
 
-          # Rebuild snapshots.json from the current index
+          # 3. Rebuild snapshots.json from the current index
           python3 << 'EOF'
           import subprocess, json
           files = sorted(
@@ -68,21 +62,8 @@ jobs:
 
           git add --sparse snapshots.json
 
-          # Amend the commit to include the updated JSON
+          # 4. Amend the commit to include the updated JSON and final message
           git commit --amend -m "Snapshot ${TIMESTAMP} UTC" --no-edit
 
-          # Push to repo (as before)
+          # 5. Push
           git push origin assets
-
-          # --- New: Upload the same file to R2 (non-critical) ---
-          echo "Uploading to R2..."
-          rclone copyto "wdpsnapshot_${TIMESTAMP}.png" \
-            ":s3,provider=Cloudflare,access_key_id=$R2_ACCESS_KEY_ID,secret_access_key=$R2_SECRET_ACCESS_KEY,endpoint=$R2_ENDPOINT:$R2_BUCKET/wdpsnapshot_${TIMESTAMP}.png" \
-            --s3-no-check-bucket \
-            --verbose
-          echo "Upload complete."
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
