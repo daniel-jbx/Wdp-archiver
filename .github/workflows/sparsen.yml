@@ -1,8 +1,6 @@
 name: Daily Sparsen Snapshots
 
 on:
-  schedule:
-    - cron: '0 12 * * *' 
   workflow_dispatch:       # allows manual trigger
 
 permissions:
