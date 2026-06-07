@@ -20,19 +20,38 @@ body, html {
   pointer-events: none;        /* clicks pass through unless selection mode is on */
   display: block;
 }
-#interval-select, #snapshot-select {
-  background: #333; color: white; border: 1px solid #888;
-  border-radius: 4px; padding: 2px 4px; font-size: 0.8rem;
-  max-width: 110px;
+/* Style for interval dropdown, date picker, and time select */
+#interval-select,
+#date-picker,
+#time-select {
+  background: #333;
+  color: white;
+  border: 1px solid #888;
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 0.8rem;
+  font-family: inherit;
 }
+#date-picker {
+  min-width: 130px;  /* adjust as needed */
+}
+#time-select {
+  min-width: 110px;
+}
+/* Old snapshot-select removed – no longer used */
 #top-bar {
   position: absolute; top: 0; left: 0; right: 0;
   background: rgba(0,0,0,0.75); padding: 8px 12px;
   display: flex; align-items: center; justify-content: space-between;
   z-index: 20; pointer-events: auto;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 #timestamp-label-top {
   font-size: 1rem; font-weight: bold; text-align: center; flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 #download-group { display: flex; gap: 6px; }
 .dl-btn {
@@ -40,7 +59,6 @@ body, html {
   background: #444; color: white; border: 1px solid #888;
   border-radius: 4px; cursor: pointer; white-space: nowrap;
 }
-
 #controls {
   position: absolute; bottom: 20px; left: 5%; right: 5%;
   background: rgba(0,0,0,0.75); border-radius: 8px;
@@ -56,7 +74,6 @@ body, html {
   -webkit-appearance: none; width: 22px; height: 22px;
   background: white; border-radius: 50%; cursor: pointer; border: none;
 }
-
 @media (max-width: 500px) {
   #top-bar { flex-wrap: wrap; justify-content: center; gap: 6px; }
   #download-group { order: 1; width: 100%; justify-content: center; }
