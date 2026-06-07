@@ -16,16 +16,17 @@
       <select id="interval-select">
         <option value="1440">1 day</option>
         <option value="360">6 hrs</option>
-        <option value="180" selected>3 hrs</option>
-        <option value="60">1 hr</option>
+        <option value="180">3 hrs</option>
+        <option value="60" selected>1 hr</option>
         <option value="30">30 min</option>
         <option value="15">15 min</option>
         <option value="0">all</option>
       </select>
     </div>
-    <select id="snapshot-select">
-      <option value="">Jump to…</option>
-    </select>
+    <input type="date" id="date-picker" style="font-size:0.9rem; padding:4px;">
+<select id="time-select" style="display:none; min-width:120px;">
+  <option value="">Select date</option>
+</select>
     <span id="timestamp-label-top">--</span>
     <div id="download-group">
       <button class="dl-btn" id="dl-snapshot">snapshot png</button>
