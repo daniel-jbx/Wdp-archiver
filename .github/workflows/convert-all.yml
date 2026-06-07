@@ -1,0 +1,70 @@
+name: Convert Existing Snapshots to Indexed PNG (with Backup)
+
+on:
+  workflow_dispatch:    # manual trigger only
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install pngquant & rclone
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pngquant
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
+
+      - name: Convert all snapshots
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          mkdir work && cd work
+
+          # Configure rclone for Cloudflare R2
+          export RCLONE_CONFIG_R2_TYPE=s3
+          export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+          export RCLONE_CONFIG_R2_ENDPOINT="$R2_ENDPOINT"
+          export RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
+
+          REMOTE="r2:$R2_BUCKET"
+          BACKUP_PREFIX="backup/"
+
+          # List all snapshot files
+          rclone lsf "$REMOTE" --include "wdpsnapshot_*.png" > snapshots.txt
+          TOTAL=$(wc -l < snapshots.txt)
+          echo "Found $TOTAL snapshots to convert"
+
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "No snapshots found. Exiting."
+            exit 0
+          fi
+
+          COUNT=0
+          while IFS= read -r FILE; do
+            COUNT=$((COUNT + 1))
+            echo "[$COUNT/$TOTAL] Processing $FILE"
+
+            # 1. Download current file
+            rclone copyto "$REMOTE/$FILE" original.png --progress
+
+            # 2. Backup original to backup folder (same name)
+            rclone copyto original.png "$REMOTE/$BACKUP_PREFIX$FILE" --progress
+
+            # 3. Compress to 64‑colour indexed PNG (preserves transparency)
+            pngquant --quality=80-100 --speed=1 --force 64 original.png --output compressed.png
+
+            # 4. Overwrite the original with compressed version
+            rclone copyto compressed.png "$REMOTE/$FILE" --progress
+
+            # Cleanup local files
+            rm -f original.png compressed.png
+          done < snapshots.txt
+
+          echo "All snapshots converted. Originals are in backup/ folder."
