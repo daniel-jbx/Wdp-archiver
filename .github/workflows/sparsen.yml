@@ -1,7 +1,8 @@
-name: Daily Sparsen Snapshots
-
+name: Daily Sparsen Snapshots (1 per hour)
 on:
-  workflow_dispatch:       # allows manual trigger
+  workflow_dispatch:   # manual trigger for now
+  schedule:
+    - cron: '0 1 * * *'   # run daily at 01:00 UTC
 
 permissions:
   contents: write
@@ -16,78 +17,68 @@ jobs:
           ref: assets
           fetch-depth: 1
 
-      - name: Sparsen and push
+      - name: Sparsen to 1 per hour
         run: |
           set -euo pipefail
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # ---- Determine which snapshots to delete ----
+          # List all snapshots, sorted by name (which is chronological)
           mapfile -t ALL < <(ls -1 wdpsnapshot_*.png 2>/dev/null | sort)
-          NOW_EPOCH=$(date +%s)
 
+          # Helper: extract epoch from filename
           get_epoch() {
-              local f="$1"
-              local ts_part="${f#*snapshot_}"
-              ts_part="${ts_part%.png}"
-              local ts_fmt="${ts_part:0:4}-${ts_part:4:2}-${ts_part:6:2} ${ts_part:9:2}:${ts_part:11:2}:${ts_part:13:2}"
-              date -d "$ts_fmt" +%s 2>/dev/null || echo "0"
+            local f="$1"
+            local ts_part="${f#*snapshot_}"
+            ts_part="${ts_part%.png}"
+            local ts_fmt="${ts_part:0:4}-${ts_part:4:2}-${ts_part:6:2} ${ts_part:9:2}:${ts_part:11:2}:${ts_part:13:2}"
+            date -d "$ts_fmt" +%s 2>/dev/null || echo "0"
           }
 
+          # Group by hour (YYYYMMDD_HH)
           declare -A HOUR_GROUPS
           for f in "${ALL[@]}"; do
-              epoch=$(get_epoch "$f")
-              if [ "$epoch" -eq 0 ]; then continue; fi
-              hour_key=$(date -d "@$epoch" +"%Y%m%d_%H")
-              HOUR_GROUPS["$hour_key"]+="$f "
+            epoch=$(get_epoch "$f")
+            [ "$epoch" -eq 0 ] && continue
+            hour_key=$(date -d "@$epoch" +"%Y%m%d_%H")
+            HOUR_GROUPS["$hour_key"]+="$f "
           done
 
-          # Files to delete (we'll mark them for removal)
+          # Determine which files to delete
           TO_DELETE=()
-
           for hour in "${!HOUR_GROUPS[@]}"; do
-              snaps=($(echo ${HOUR_GROUPS[$hour]} | tr ' ' '\n' | sort))
-              first_epoch=$(get_epoch "${snaps[0]}")
-              age_sec=$(( NOW_EPOCH - first_epoch ))
-              age_hrs=$(( age_sec / 3600 ))
-
-              keep=0
-              if [ "$age_hrs" -le 72 ]; then
-                  keep=${#snaps[@]}
-              elif [ "$age_hrs" -le 168 ]; then
-                  keep=4
-              else
-                  keep=1
-              fi
-
-              if [ ${#snaps[@]} -gt $keep ]; then
-                  # delete oldest
-                  for ((i=0; i < ${#snaps[@]} - keep; i++)); do
-                      TO_DELETE+=("${snaps[$i]}")
-                  done
-              fi
+            # Split the space‑separated list into an array
+            IFS=' ' read -r -a snaps <<< "${HOUR_GROUPS[$hour]}"
+            # Sort by epoch (ascending)
+            IFS=$'\n' sorted=($(sort <<<"${snaps[*]}"))
+            unset IFS
+            # Keep only the first (earliest) snapshot
+            if [ ${#sorted[@]} -gt 1 ]; then
+              # Delete all but the first
+              for ((i=1; i<${#sorted[@]}; i++)); do
+                TO_DELETE+=("${sorted[$i]}")
+              done
+            fi
           done
 
           if [ ${#TO_DELETE[@]} -gt 0 ]; then
-              git rm "${TO_DELETE[@]}"
-              echo "Deleted ${#TO_DELETE[@]} snapshots"
+            git rm "${TO_DELETE[@]}"
+            echo "Deleted ${#TO_DELETE[@]} snapshots"
           else
-              echo "No snapshots to delete"
+            echo "No snapshots to delete"
           fi
 
-          # ---- Pull the latest remote changes (e.g., new snapshots from update-map) ----
+          # Pull latest remote changes (new snapshots)
           git pull --rebase origin assets
 
-          # ---- Rebuild snapshots.json to reflect current kept files ----
-          # (this automatically includes any new snapshots that were just pulled)
+          # Rebuild snapshots.json with remaining files
           ls -1 wdpsnapshot_*.png 2>/dev/null | jq -R . | jq -s . > snapshots.json
           git add snapshots.json
 
-          # ---- Commit and push ----
+          # Commit and push
           if git diff --cached --quiet; then
-              echo "No changes to commit"
+            echo "No changes to commit"
           else
-              git commit -m "Daily sparsen: remove old snapshots, update index"
-              git push origin assets
+            git commit -m "Sparsen to 1 snapshot per hour"
+            git push origin assets
           fi
