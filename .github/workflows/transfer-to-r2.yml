@@ -1,0 +1,42 @@
+name: Transfer GitHub assets to R2 (one-time)
+on:
+  workflow_dispatch:   # manual trigger only
+
+permissions:
+  contents: read
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout assets branch
+        uses: actions/checkout@v4
+        with:
+          ref: assets
+          fetch-depth: 1
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
+
+      - name: Upload all PNGs to R2
+        run: |
+          # Upload all wdpsnapshot_*.png files
+          rclone copy . ":s3:${{ secrets.R2_BUCKET }}" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+            --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --include "wdpsnapshot_*.png" \
+            --verbose
+
+      - name: Upload snapshots.json to R2 (optional)
+        run: |
+          rclone copyto snapshots.json ":s3:${{ secrets.R2_BUCKET }}/snapshots.json" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+            --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --verbose
