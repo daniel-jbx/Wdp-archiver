@@ -398,6 +398,77 @@ function buildFilteredList(anchorName = null) {
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
       allSnapshots = files;
+      // Build date -> snapshots map
+const snapshotsByDate = new Map(); // key: YYYY-MM-DD, value: array of {filename, timeStr}
+
+for (const filename of allSnapshots) {
+  const match = filename.match(/wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/);
+  if (match) {
+    const year = match[1], month = match[2], day = match[3];
+    const hour = match[4], minute = match[5], second = match[6];
+    const dateKey = `${year}-${month}-${day}`;
+    const timeStr = `${hour}:${minute}:${second}`;
+    if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
+    snapshotsByDate.get(dateKey).push({ filename, timeStr });
+  }
+}
+// Sort each day's snapshots by time
+for (const [date, snaps] of snapshotsByDate.entries()) {
+  snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
+}
+
+// Populate date picker with all available dates (sorted)
+const datePicker = document.getElementById('date-picker');
+const timeSelect = document.getElementById('time-select');
+const dates = Array.from(snapshotsByDate.keys()).sort(); // oldest to newest
+if (dates.length) {
+  datePicker.min = dates[0];
+  datePicker.max = dates[dates.length - 1];
+  // Optionally set default to latest date
+  datePicker.value = dates[dates.length - 1];
+}
+
+// When date changes, populate time dropdown
+function updateTimeSelect(dateValue) {
+  const snaps = snapshotsByDate.get(dateValue);
+  if (!snaps || snaps.length === 0) {
+    timeSelect.style.display = 'none';
+    return;
+  }
+  timeSelect.style.display = 'inline-block';
+  timeSelect.innerHTML = '<option value="">Select time...</option>';
+  for (const snap of snaps) {
+    const option = document.createElement('option');
+    option.value = snap.filename;
+    option.textContent = snap.timeStr;
+    timeSelect.appendChild(option);
+  }
+}
+
+datePicker.addEventListener('change', () => {
+  updateTimeSelect(datePicker.value);
+  timeSelect.value = ''; // reset
+});
+
+// When time selected, load the snapshot
+timeSelect.addEventListener('change', () => {
+  const filename = timeSelect.value;
+  if (!filename) return;
+  // Find the index in filteredSnapshots? Actually we can directly load.
+  // But to maintain slider state, we should rebuild the filtered list with this snapshot as anchor.
+  buildFilteredList(filename);
+});
+
+// Initialize: if datePicker has a value, populate time dropdown
+if (datePicker.value) {
+  updateTimeSelect(datePicker.value);
+  // Optionally auto-select the latest snapshot of that day
+  const snaps = snapshotsByDate.get(datePicker.value);
+  if (snaps && snaps.length) {
+    timeSelect.value = snaps[snaps.length-1].filename;
+    buildFilteredList(timeSelect.value);
+  }
+}
       snapshotSelect.innerHTML = '<option value="">Jump to…</option>';
       for (let i = allSnapshots.length - 1; i >= 0; i--) {
         const ts = getEpoch(allSnapshots[i]);
