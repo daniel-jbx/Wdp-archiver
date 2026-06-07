@@ -271,72 +271,99 @@
   // ---- Filtering ----
   let currentInterval = 180;
 
-  function buildFilteredList(anchorName = null) {
-    const intervalSec = currentInterval * 60;
-    const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
-    candidates.sort((a, b) => a.epoch - b.epoch);
-
-    let selected = [];
-    if (anchorName !== null) {
-      const anchorIdx = candidates.findIndex(c => c.name === anchorName);
-      if (anchorIdx === -1) {
-        anchorName = null;
-      } else {
-        const anchor = candidates[anchorIdx];
-        const anchorEpoch = anchor.epoch;
-
-        const forward = [];
-        let lastEpoch = anchorEpoch;
-        for (let i = anchorIdx + 1; i < candidates.length; i++) {
-          if (candidates[i].epoch - lastEpoch >= intervalSec) {
-            forward.push(candidates[i]);
-            lastEpoch = candidates[i].epoch;
-          }
-        }
-
-        const backward = [];
-        lastEpoch = anchorEpoch;
-        for (let i = anchorIdx - 1; i >= 0; i--) {
-          if (lastEpoch - candidates[i].epoch >= intervalSec) {
-            backward.unshift(candidates[i]);
-            lastEpoch = candidates[i].epoch;
-          }
-        }
-
-        selected = backward.concat(anchor).concat(forward);
-      }
-    }
-
-    if (!anchorName) {
-      for (let i = candidates.length - 1; i >= 0; i--) {
-        if (selected.length === 0) {
-          selected.unshift(candidates[i]);
-        } else {
-          const lastEpoch = selected[0].epoch;
-          if (lastEpoch - candidates[i].epoch >= intervalSec) {
-            selected.unshift(candidates[i]);
-          }
-        }
-      }
-    }
-
-    filteredSnapshots = selected.map(c => c.name);
-    sliderValueToName = {};
-    filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
-    slider.max = filteredSnapshots.length - 1;
-
-    if (filteredSnapshots.length === 0) {
-      timestampLabelTop.textContent = 'No snapshots match interval.';
-      return;
-    }
-
-    let targetIdx = filteredSnapshots.length - 1;
-    if (anchorName) {
-      const idx = filteredSnapshots.indexOf(anchorName);
-      if (idx !== -1) targetIdx = idx;
-    }
-    loadFilteredSnapshot(targetIdx);
+function buildFilteredList(anchorName = null) {
+  const intervalSec = currentInterval * 60;
+  if (intervalSec <= 0 || allSnapshots.length === 0) {
+    filteredSnapshots = [];
+    slider.max = 0;
+    timestampLabelTop.textContent = 'Invalid interval or no snapshots';
+    return;
   }
+
+  const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
+  candidates.sort((a, b) => a.epoch - b.epoch);
+
+  let anchorIndex;
+  if (anchorName !== null) {
+    anchorIndex = candidates.findIndex(c => c.name === anchorName);
+    if (anchorIndex === -1) anchorIndex = candidates.length - 1;
+  } else {
+    anchorIndex = candidates.length - 1;
+  }
+
+  const selected = new Map();
+  selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
+
+  // Forward direction
+  let lastEpochFwd = candidates[anchorIndex].epoch;
+  let targetFwd = lastEpochFwd + intervalSec;
+  let searchIdxFwd = anchorIndex + 1;
+  while (searchIdxFwd < candidates.length) {
+    let bestIdx = -1;
+    let bestDiff = Infinity;
+    for (let i = searchIdxFwd; i < candidates.length; i++) {
+      const diff = Math.abs(candidates[i].epoch - targetFwd);
+      if (diff > intervalSec / 2 && bestIdx !== -1) break;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) break;
+    const best = candidates[bestIdx];
+    if (!selected.has(best.epoch)) {
+      selected.set(best.epoch, best.name);
+      lastEpochFwd = best.epoch;
+      targetFwd = lastEpochFwd + intervalSec;
+      searchIdxFwd = bestIdx + 1;
+    } else {
+      searchIdxFwd = bestIdx + 1;
+    }
+  }
+
+  // Backward direction
+  let lastEpochBwd = candidates[anchorIndex].epoch;
+  let targetBwd = lastEpochBwd - intervalSec;
+  let searchIdxBwd = anchorIndex - 1;
+  while (searchIdxBwd >= 0) {
+    let bestIdx = -1;
+    let bestDiff = Infinity;
+    for (let i = searchIdxBwd; i >= 0; i--) {
+      const diff = Math.abs(candidates[i].epoch - targetBwd);
+      if (diff > intervalSec / 2 && bestIdx !== -1) break;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) break;
+    const best = candidates[bestIdx];
+    if (!selected.has(best.epoch)) {
+      selected.set(best.epoch, best.name);
+      lastEpochBwd = best.epoch;
+      targetBwd = lastEpochBwd - intervalSec;
+      searchIdxBwd = bestIdx - 1;
+    } else {
+      searchIdxBwd = bestIdx - 1;
+    }
+  }
+
+  const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
+  filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
+
+  sliderValueToName = {};
+  filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+  slider.max = filteredSnapshots.length - 1;
+
+  if (filteredSnapshots.length === 0) {
+    timestampLabelTop.textContent = 'No snapshots match interval.';
+    return;
+  }
+
+  let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
+  if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
+  loadFilteredSnapshot(targetIdx);
+}
 
   function loadFilteredSnapshot(idx) {
     if (idx < 0 || idx >= filteredSnapshots.length) return;
@@ -348,7 +375,7 @@
     timestampLabelTop.textContent = m
       ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}`
       : filename;
-    currentImage.src = 'https://raw.githubusercontent.com/daniel-jbx/Wdp-archiver/assets/' + filename;
+    currentImage.src = 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/' + filename;
   }
 
   currentImage.onload = () => {
@@ -365,40 +392,8 @@
   };
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-  // ---- Load overlay definitions from overlays.txt ----
-  let CROPS = {};
-  const downloadGroup = document.getElementById('download-group');
-
-  fetch('https://raw.githubusercontent.com/daniel-jbx/Wdp-archiver/assets/overlays.txt')
-    .then(r => r.text())
-    .then(txt => {
-      const lines = txt.split('\n');
-      lines.forEach(line => {
-        line = line.trim();
-        if (line === '' || line.startsWith('#')) return;
-        const parts = line.split('\t');
-        if (parts.length !== 5) return;
-        const [name, x1, y1, x2, y2] = parts.map(s => s.trim());
-        const crop = {
-          x: parseInt(x1),
-          y: parseInt(y1),
-          w: parseInt(x2) - parseInt(x1),
-          h: parseInt(y2) - parseInt(y1)
-        };
-        CROPS[name] = crop;
-
-        const btn = document.createElement('button');
-        btn.className = 'dl-btn';
-        btn.textContent = name;
-        btn.addEventListener('click', () => downloadOverlay(name));
-        downloadGroup.appendChild(btn);
-      });
-      console.log('Overlays loaded:', Object.keys(CROPS));
-    })
-    .catch(e => console.error('Failed to load overlays.txt', e));
-
   // ---- Initial snapshot loading ----
-  fetch('https://raw.githubusercontent.com/daniel-jbx/Wdp-archiver/assets/snapshots.json')
+  fetch('https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/snapshots.json')
     .then(r => r.json())
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
@@ -592,7 +587,7 @@
     if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
     const filename = filteredSnapshots[currentFilteredIndex];
     const a = document.createElement('a');
-    a.href = 'https://raw.githubusercontent.com/daniel-jbx/Wdp-archiver/assets/' + filename;
+    a.href = 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/' + filename;
     a.download = filename;
     document.body.appendChild(a);
     a.click();
