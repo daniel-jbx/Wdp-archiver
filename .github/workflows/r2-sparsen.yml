@@ -1,10 +1,12 @@
-name: R2 Sparsen (1 per hour)
+name: R2 Tiered Sparsen (Daily)
 
 on:
-  workflow_dispatch:   # manual trigger only
+  schedule:
+    - cron: '0 2 * * *'   # daily at 02:00 UTC
+  workflow_dispatch:       # also manual trigger
 
 permissions:
-  contents: read       # no need to write to repo, only R2
+  contents: read
 
 jobs:
   sparsen:
@@ -16,15 +18,30 @@ jobs:
           sudo dpkg -i rclone-current-linux-amd64.deb
           rm rclone-current-linux-amd64.deb
 
-      - name: Run sparsening (keep 1 per hour)
+      - name: Run tiered sparsening
         run: |
           set -euo pipefail
 
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Working on bucket: $BUCKET"
+          NOW=$(date +%s)
 
-          # List all snapshot PNGs from R2
-          echo "Fetching file list from R2..."
+          # Helper: convert filename to epoch seconds
+          filename_to_epoch() {
+            local f="$1"
+            if [[ $f =~ wdpsnapshot_([0-9]{8})_([0-9]{2})([0-9]{2})([0-9]{2})\.png ]]; then
+              local yyyy="${BASH_REMATCH[1]:0:4}"
+              local mm="${BASH_REMATCH[1]:4:2}"
+              local dd="${BASH_REMATCH[1]:6:2}"
+              local hh="${BASH_REMATCH[2]}"
+              local min="${BASH_REMATCH[3]}"
+              local sec="${BASH_REMATCH[4]}"
+              date -d "${yyyy}-${mm}-${dd} ${hh}:${min}:${sec}" +%s 2>/dev/null || echo "0"
+            else
+              echo "0"
+            fi
+          }
+
+          echo "Fetching all snapshots from R2..."
           rclone lsf ":s3:${BUCKET}" \
             --s3-provider="Cloudflare" \
             --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
@@ -35,47 +52,107 @@ jobs:
 
           total=$(wc -l < all_snapshots.txt)
           echo "Total snapshots found: $total"
-
           if [ "$total" -eq 0 ]; then
             echo "No snapshots to process."
             exit 0
           fi
 
-          # Group by hour (YYYYMMDD_HH)
-          declare -A HOUR_GROUPS
+          # Build associative array: hour_key -> list of files (space-separated) and also store their epochs
+          declare -A HOUR_FILES
+          declare -A HOUR_EPOCHS  # store epochs as comma-separated corresponding to files
 
           while IFS= read -r file; do
-            # Extract date and hour from filename
-            if [[ $file =~ wdpsnapshot_([0-9]{8})_([0-9]{2})[0-9]{4}\.png$ ]]; then
-              date_part="${BASH_REMATCH[1]}"   # YYYYMMDD
-              hour_part="${BASH_REMATCH[2]}"   # HH
-              hour_key="${date_part}_${hour_part}"
-              HOUR_GROUPS["$hour_key"]+="$file "
-            else
-              echo "Warning: skipping unexpected file: $file"
+            epoch=$(filename_to_epoch "$file")
+            if [ "$epoch" -eq 0 ]; then
+              echo "Warning: could not parse timestamp from $file, skipping"
+              continue
             fi
+            # hour key: YYYYMMDD_HH
+            hour_key=$(date -d "@$epoch" +"%Y%m%d_%H")
+            # Append file and epoch
+            HOUR_FILES["$hour_key"]="${HOUR_FILES[$hour_key]-}$file "
+            HOUR_EPOCHS["$hour_key"]="${HOUR_EPOCHS[$hour_key]-}$epoch,"
           done < all_snapshots.txt
 
-          echo "Found ${#HOUR_GROUPS[@]} unique hours."
-
-          # Determine which files to delete (all but the earliest per hour)
           TO_DELETE=()
-          for hour in "${!HOUR_GROUPS[@]}"; do
-            IFS=' ' read -r -a snaps <<< "${HOUR_GROUPS[$hour]}"
-            # Sort lexicographically – filename includes HHMMSS so earliest first
-            IFS=$'\n' sorted=($(sort <<<"${snaps[*]}"))
-            unset IFS
-            # Keep first, delete rest
-            if [ ${#sorted[@]} -gt 1 ]; then
-              for ((i=1; i<${#sorted[@]}; i++)); do
-                TO_DELETE+=("${sorted[$i]}")
-              done
+
+          for hour_key in "${!HOUR_FILES[@]}"; do
+            # Get arrays of files and epochs
+            IFS=' ' read -r -a files <<< "${HOUR_FILES[$hour_key]}"
+            IFS=',' read -r -a epochs <<< "${HOUR_EPOCHS[$hour_key]}"
+            # Remove trailing empty element if any
+            if [ "${#epochs[@]}" -gt 0 ] && [ -z "${epochs[-1]}" ]; then
+              unset 'epochs[-1]'
             fi
+
+            # Determine age of this hour (use the earliest snapshot in the hour as reference)
+            min_epoch=${epochs[0]}
+            for e in "${epochs[@]}"; do
+              if [ "$e" -lt "$min_epoch" ]; then min_epoch=$e; fi
+            done
+            hour_start_epoch=$(( min_epoch - (min_epoch % 3600) ))  # round down to beginning of hour
+            age_hours=$(( (NOW - hour_start_epoch) / 3600 ))
+            age_days=$(( age_hours / 24 ))
+
+            # Determine which snapshots to keep
+            keep_indices=()
+
+            if [ $age_hours -lt 24 ]; then
+              # Keep all
+              for i in "${!files[@]}"; do
+                keep_indices+=($i)
+              done
+            elif [ $age_days -ge 7 ]; then
+              # Keep only the earliest (smallest epoch)
+              earliest_idx=0
+              for i in "${!epochs[@]}"; do
+                if [ "${epochs[$i]}" -lt "${epochs[$earliest_idx]}" ]; then
+                  earliest_idx=$i
+                fi
+              done
+              keep_indices+=($earliest_idx)
+            else
+              # Keep up to 4 snapshots, closest to quarter hours (0,15,30,45 minutes)
+              # For each target minute (0,15,30,45), find best match
+              targets=(0 15 30 45)
+              for target_min in "${targets[@]}"; do
+                best_idx=-1
+                best_diff=999999
+                for i in "${!epochs[@]}"; do
+                  epoch=${epochs[$i]}
+                  # Compute minutes into the hour
+                  minute_of_hour=$(( (epoch % 3600) / 60 ))
+                  diff=$(( minute_of_hour - target_min ))
+                  if [ $diff -lt 0 ]; then diff=$(( -diff )); fi
+                  # Prefer snapshot at or after target? Use simple absolute diff.
+                  # If tie, keep the earlier one (smaller epoch)
+                  if [ $diff -lt $best_diff ] || ( [ $diff -eq $best_diff ] && [ $best_idx -eq -1 ] ); then
+                    best_diff=$diff
+                    best_idx=$i
+                  fi
+                done
+                if [ $best_idx -ne -1 ]; then
+                  keep_indices+=($best_idx)
+                fi
+              done
+              # Remove duplicate indices (if same snapshot is best for two targets)
+              keep_indices=($(printf "%s\n" "${keep_indices[@]}" | sort -u))
+            fi
+
+            # Mark for deletion any index not in keep_indices
+            for i in "${!files[@]}"; do
+              keep=0
+              for k in "${keep_indices[@]}"; do
+                if [ "$i" -eq "$k" ]; then keep=1; break; fi
+              done
+              if [ $keep -eq 0 ]; then
+                TO_DELETE+=("${files[$i]}")
+              fi
+            done
           done
 
           if [ ${#TO_DELETE[@]} -gt 0 ]; then
             echo "Deleting ${#TO_DELETE[@]} snapshots from R2..."
-            # Delete one by one (rclone delete supports multiple but this is clearer)
             for file in "${TO_DELETE[@]}"; do
               echo "  Deleting: $file"
               rclone delete ":s3:${BUCKET}/${file}" \
@@ -87,10 +164,10 @@ jobs:
             done
             echo "Sparsen complete. Deleted ${#TO_DELETE[@]} files."
           else
-            echo "No extra snapshots to delete. Already 1 per hour."
+            echo "No files to delete."
           fi
 
-          # Optionally regenerate snapshots.json after cleanup
+          # Regenerate snapshots.json
           echo "Regenerating snapshots.json..."
           rclone lsf ":s3:${BUCKET}" \
             --s3-provider="Cloudflare" \
@@ -100,7 +177,6 @@ jobs:
             --s3-no-check-bucket \
             --include "wdpsnapshot_*.png" | sort | jq -R . | jq -s . > snapshots.json
 
-          # Upload the new snapshots.json to R2 (overwrite)
           rclone copyto snapshots.json ":s3:${BUCKET}/snapshots.json" \
             --s3-provider="Cloudflare" \
             --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
