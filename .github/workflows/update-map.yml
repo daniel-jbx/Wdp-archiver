@@ -17,16 +17,24 @@ jobs:
             download-and-stitch.sh
           sparse-checkout-cone-mode: false
 
-      - name: Install ImageMagick and rclone
+      - name: Install ImageMagick, pngquant and rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick
+          sudo apt-get install -y imagemagick pngquant
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
           rm rclone-current-linux-amd64.deb
 
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
+
+      - name: Compress to 64-color indexed PNG (preserves transparency)
+        run: |
+          echo "Original size:"
+          ls -lh output.png
+          pngquant --quality=80-100 --speed=1 --force --verbose 64 output.png --output output.png
+          echo "Compressed size:"
+          ls -lh output.png
 
       - name: Upload snapshot to R2 (and optionally update snapshots.json)
         run: |
@@ -44,15 +52,13 @@ jobs:
             --s3-no-check-bucket \
             --verbose
 
-          # Optional: Update snapshots.json in R2 immediately (so new snapshot appears in viewer)
-          # Fetch current snapshots.json, append new filename, sort, and re-upload
+          # Optional: Update snapshots.json in R2 immediately
           echo "Updating snapshots.json in R2..."
           rclone cat ":s3:${R2_BUCKET}/snapshots.json" \
             --s3-provider="Cloudflare" \
             --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" \
             --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" 2>/dev/null > current.json || echo "[]" > current.json
-          # Append new filename and sort
           python3 << EOF
           import json
           try:
