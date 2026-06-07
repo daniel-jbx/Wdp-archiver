@@ -1,0 +1,91 @@
+name: R2 Sparsen (1 per hour)
+on:
+  workflow_dispatch:   # manual trigger only
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  sparsen-r2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          acl = private
+          EOF
+
+      - name: Run sparsening script (1 per hour)
+        run: |
+          set -euo pipefail
+
+          BUCKET="${{ secrets.R2_BUCKET_NAME }}"
+          echo "Listing all snapshots from R2 bucket: $BUCKET"
+
+          # Get all wdpsnapshot_*.png files
+          rclone lsf "r2:$BUCKET" --include "wdpsnapshot_*.png" > all_snapshots.txt
+          total=$(wc -l < all_snapshots.txt)
+          echo "Total snapshots found: $total"
+
+          # Group by hour and keep only the earliest
+          declare -A HOUR_GROUPS
+
+          while IFS= read -r file; do
+            # Extract timestamp: wdpsnapshot_20260526_103109.png
+            if [[ $file =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png ]]; then
+              date_part="${BASH_REMATCH[1]}"   # YYYYMMDD
+              hour_part="${BASH_REMATCH[2]:0:2}"  # HH
+              hour_key="${date_part}_${hour_part}"
+              HOUR_GROUPS["$hour_key"]+="$file "
+            else
+              echo "Warning: skipping unexpected file: $file"
+            fi
+          done < all_snapshots.txt
+
+          TO_DELETE=()
+          for hour in "${!HOUR_GROUPS[@]}"; do
+            IFS=' ' read -r -a snaps <<< "${HOUR_GROUPS[$hour]}"
+            # Sort by timestamp (the filename's HHMMSS)
+            IFS=$'\n' sorted=($(sort <<<"${snaps[*]}"))
+            unset IFS
+            # Keep first (earliest), delete the rest
+            if [ ${#sorted[@]} -gt 1 ]; then
+              for ((i=1; i<${#sorted[@]}; i++)); do
+                TO_DELETE+=("${sorted[$i]}")
+              done
+            fi
+          done
+
+          if [ ${#TO_DELETE[@]} -gt 0 ]; then
+            echo "Deleting ${#TO_DELETE[@]} snapshots from R2..."
+            for file in "${TO_DELETE[@]}"; do
+              rclone delete "r2:$BUCKET/$file"
+              echo "  Deleted: $file"
+            done
+            echo "Sparsen complete. Deleted count: ${#TO_DELETE[@]}"
+          else
+            echo "No extra snapshots to delete. Already at 1 per hour."
+          fi
+
+          # Optional: Generate fresh snapshots.json after cleanup
+          echo "Generating snapshots.json from remaining files..."
+          rclone lsf "r2:$BUCKET" --include "wdpsnapshot_*.png" | \
+            jq -R . | jq -s . > snapshots.json
+          rclone copyto snapshots.json "r2:$BUCKET/snapshots.json" --verbose
+          echo "snapshots.json updated in R2."
