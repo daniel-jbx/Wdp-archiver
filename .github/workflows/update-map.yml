@@ -1,9 +1,5 @@
 name: Update Map Snapshot
 
-concurrency:
-  group: assets-branch-update
-  cancel-in-progress: false
-
 on:
   workflow_dispatch:
   # schedule: (add your cron when ready)
@@ -11,13 +7,11 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
-      - name: Checkout assets (sparse – only script)
+      - name: Checkout main branch (to get download-and-stitch.sh)
         uses: actions/checkout@v4
         with:
-          ref: assets
+          ref: main
           fetch-depth: 1
           sparse-checkout: |
             download-and-stitch.sh
@@ -27,7 +21,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y imagemagick
-          # Install rclone (no config file needed)
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
           rm rclone-current-linux-amd64.deb
@@ -35,53 +28,51 @@ jobs:
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
 
-      - name: Commit new snapshot, update list, and upload to R2
+      - name: Upload snapshot to R2 (and optionally update snapshots.json)
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
           mv output.png "wdpsnapshot_${TIMESTAMP}.png"
+          SNAPSHOT_FILE="wdpsnapshot_${TIMESTAMP}.png"
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          # Stage and commit the new snapshot (temporary commit)
-          git add --sparse "wdpsnapshot_${TIMESTAMP}.png"
-          git commit -m "Snapshot ${TIMESTAMP} UTC (pre-rebase)"
-
-          # Pull latest remote changes and rebase our commit on top
-          git pull --rebase origin assets
-
-          # Rebuild snapshots.json from the current index
-          python3 << 'EOF'
-          import subprocess, json
-          files = sorted(
-              subprocess.check_output(
-                  ['git', 'ls-files', 'wdpsnapshot_*.png'],
-                  text=True
-              ).strip().split('\n')
-          )
-          with open('snapshots.json', 'w') as f:
-              json.dump(files, f)
-          EOF
-
-          git add --sparse snapshots.json
-
-          # Amend the commit to include the updated JSON and final message
-          git commit --amend -m "Snapshot ${TIMESTAMP} UTC" --no-edit
-
-          # Push to repo (as before)
-          git push origin assets
-
-          # --- NEW: Upload the same file to R2 (non-critical) ---
-          echo "Uploading wdpsnapshot_${TIMESTAMP}.png to R2..."
-          rclone copyto "wdpsnapshot_${TIMESTAMP}.png" \
-            ":s3:${R2_BUCKET}/wdpsnapshot_${TIMESTAMP}.png" \
+          echo "Uploading ${SNAPSHOT_FILE} to R2..."
+          rclone copyto "${SNAPSHOT_FILE}" \
+            ":s3:${R2_BUCKET}/${SNAPSHOT_FILE}" \
             --s3-provider="Cloudflare" \
             --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" \
             --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket \
             --verbose
-          echo "Upload complete."
+
+          # Optional: Update snapshots.json in R2 immediately (so new snapshot appears in viewer)
+          # Fetch current snapshots.json, append new filename, sort, and re-upload
+          echo "Updating snapshots.json in R2..."
+          rclone cat ":s3:${R2_BUCKET}/snapshots.json" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" 2>/dev/null > current.json || echo "[]" > current.json
+          # Append new filename and sort
+          python3 << EOF
+          import json
+          try:
+              with open('current.json') as f:
+                  files = json.load(f)
+          except:
+              files = []
+          files.append("${SNAPSHOT_FILE}")
+          files = sorted(set(files))
+          with open('snapshots.json', 'w') as f:
+              json.dump(files, f)
+          EOF
+          rclone copyto snapshots.json ":s3:${R2_BUCKET}/snapshots.json" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --verbose
+
+          echo "Done. No changes pushed to GitHub assets branch."
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
