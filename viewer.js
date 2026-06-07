@@ -3,7 +3,6 @@
   const slider = document.getElementById('slider');
   const timestampLabelTop = document.getElementById('timestamp-label-top');
   const intervalSelect = document.getElementById('interval-select');
-  const snapshotSelect = document.getElementById('snapshot-select');
 
   // ---- WebGL context ----
   const gl = canvas.getContext('webgl', { antialias: false }) ||
@@ -234,8 +233,6 @@
     }
   }
 
-  // ---- Resize ----
-
   function resetView() {
     if (!currentImage.complete || currentImage.naturalWidth === 0) return;
     const w = currentImage.width, h = currentImage.height;
@@ -257,113 +254,102 @@
     ) / 1000;
   }
 
-  function timeAgo(epochSec) {
-    const now = Date.now() / 1000;
-    let diff = Math.max(0, Math.round(now - epochSec));
-    const d = Math.floor(diff / 86400); diff -= d*86400;
-    const h = Math.floor(diff / 3600); diff -= h*3600;
-    const m = Math.floor(diff / 60);
-    if (d > 0) return `${d}d ${h}h ${m}m ago`;
-    if (h > 0) return `${h}h ${m}m ago`;
-    return `${m}m ago`;
-  }
-
   // ---- Filtering ----
   let currentInterval = 180;
 
-function buildFilteredList(anchorName = null) {
-  const intervalSec = currentInterval * 60;
-  if (intervalSec <= 0 || allSnapshots.length === 0) {
-    filteredSnapshots = [];
-    slider.max = 0;
-    timestampLabelTop.textContent = 'Invalid interval or no snapshots';
-    return;
-  }
+  function buildFilteredList(anchorName = null) {
+    const intervalSec = currentInterval * 60;
+    if (intervalSec <= 0 || allSnapshots.length === 0) {
+      filteredSnapshots = [];
+      slider.max = 0;
+      timestampLabelTop.textContent = 'Invalid interval or no snapshots';
+      return;
+    }
 
-  const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
-  candidates.sort((a, b) => a.epoch - b.epoch);
+    const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
+    candidates.sort((a, b) => a.epoch - b.epoch);
 
-  let anchorIndex;
-  if (anchorName !== null) {
-    anchorIndex = candidates.findIndex(c => c.name === anchorName);
-    if (anchorIndex === -1) anchorIndex = candidates.length - 1;
-  } else {
-    anchorIndex = candidates.length - 1;
-  }
+    let anchorIndex;
+    if (anchorName !== null) {
+      anchorIndex = candidates.findIndex(c => c.name === anchorName);
+      if (anchorIndex === -1) anchorIndex = candidates.length - 1;
+    } else {
+      anchorIndex = candidates.length - 1;
+    }
 
-  const selected = new Map();
-  selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
+    const selected = new Map();
+    selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
 
-  // Forward direction
-  let lastEpochFwd = candidates[anchorIndex].epoch;
-  let targetFwd = lastEpochFwd + intervalSec;
-  let searchIdxFwd = anchorIndex + 1;
-  while (searchIdxFwd < candidates.length) {
-    let bestIdx = -1;
-    let bestDiff = Infinity;
-    for (let i = searchIdxFwd; i < candidates.length; i++) {
-      const diff = Math.abs(candidates[i].epoch - targetFwd);
-      if (diff > intervalSec / 2 && bestIdx !== -1) break;
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        bestIdx = i;
+    // Forward direction
+    let lastEpochFwd = candidates[anchorIndex].epoch;
+    let targetFwd = lastEpochFwd + intervalSec;
+    let searchIdxFwd = anchorIndex + 1;
+    while (searchIdxFwd < candidates.length) {
+      let bestIdx = -1;
+      let bestDiff = Infinity;
+      for (let i = searchIdxFwd; i < candidates.length; i++) {
+        const diff = Math.abs(candidates[i].epoch - targetFwd);
+        if (diff > intervalSec / 2 && bestIdx !== -1) break;
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx === -1) break;
+      const best = candidates[bestIdx];
+      if (!selected.has(best.epoch)) {
+        selected.set(best.epoch, best.name);
+        lastEpochFwd = best.epoch;
+        targetFwd = lastEpochFwd + intervalSec;
+        searchIdxFwd = bestIdx + 1;
+      } else {
+        searchIdxFwd = bestIdx + 1;
       }
     }
-    if (bestIdx === -1) break;
-    const best = candidates[bestIdx];
-    if (!selected.has(best.epoch)) {
-      selected.set(best.epoch, best.name);
-      lastEpochFwd = best.epoch;
-      targetFwd = lastEpochFwd + intervalSec;
-      searchIdxFwd = bestIdx + 1;
-    } else {
-      searchIdxFwd = bestIdx + 1;
-    }
-  }
 
-  // Backward direction
-  let lastEpochBwd = candidates[anchorIndex].epoch;
-  let targetBwd = lastEpochBwd - intervalSec;
-  let searchIdxBwd = anchorIndex - 1;
-  while (searchIdxBwd >= 0) {
-    let bestIdx = -1;
-    let bestDiff = Infinity;
-    for (let i = searchIdxBwd; i >= 0; i--) {
-      const diff = Math.abs(candidates[i].epoch - targetBwd);
-      if (diff > intervalSec / 2 && bestIdx !== -1) break;
-      if (diff < bestDiff) {
-        bestDiff = diff;
-        bestIdx = i;
+    // Backward direction
+    let lastEpochBwd = candidates[anchorIndex].epoch;
+    let targetBwd = lastEpochBwd - intervalSec;
+    let searchIdxBwd = anchorIndex - 1;
+    while (searchIdxBwd >= 0) {
+      let bestIdx = -1;
+      let bestDiff = Infinity;
+      for (let i = searchIdxBwd; i >= 0; i--) {
+        const diff = Math.abs(candidates[i].epoch - targetBwd);
+        if (diff > intervalSec / 2 && bestIdx !== -1) break;
+        if (diff < bestDiff) {
+          bestDiff = diff;
+          bestIdx = i;
+        }
+      }
+      if (bestIdx === -1) break;
+      const best = candidates[bestIdx];
+      if (!selected.has(best.epoch)) {
+        selected.set(best.epoch, best.name);
+        lastEpochBwd = best.epoch;
+        targetBwd = lastEpochBwd - intervalSec;
+        searchIdxBwd = bestIdx - 1;
+      } else {
+        searchIdxBwd = bestIdx - 1;
       }
     }
-    if (bestIdx === -1) break;
-    const best = candidates[bestIdx];
-    if (!selected.has(best.epoch)) {
-      selected.set(best.epoch, best.name);
-      lastEpochBwd = best.epoch;
-      targetBwd = lastEpochBwd - intervalSec;
-      searchIdxBwd = bestIdx - 1;
-    } else {
-      searchIdxBwd = bestIdx - 1;
+
+    const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
+    filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
+
+    sliderValueToName = {};
+    filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+    slider.max = filteredSnapshots.length - 1;
+
+    if (filteredSnapshots.length === 0) {
+      timestampLabelTop.textContent = 'No snapshots match interval.';
+      return;
     }
+
+    let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
+    if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
+    loadFilteredSnapshot(targetIdx);
   }
-
-  const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
-  filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
-
-  sliderValueToName = {};
-  filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
-  slider.max = filteredSnapshots.length - 1;
-
-  if (filteredSnapshots.length === 0) {
-    timestampLabelTop.textContent = 'No snapshots match interval.';
-    return;
-  }
-
-  let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
-  if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
-  loadFilteredSnapshot(targetIdx);
-}
 
   function loadFilteredSnapshot(idx) {
     if (idx < 0 || idx >= filteredSnapshots.length) return;
@@ -392,92 +378,83 @@ function buildFilteredList(anchorName = null) {
   };
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-  // ---- Initial snapshot loading ----
+  // ---- Initial snapshot loading with date/time picker ----
   fetch('https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/snapshots.json')
     .then(r => r.json())
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
       allSnapshots = files;
+
       // Build date -> snapshots map
-const snapshotsByDate = new Map(); // key: YYYY-MM-DD, value: array of {filename, timeStr}
-
-for (const filename of allSnapshots) {
-  const match = filename.match(/wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/);
-  if (match) {
-    const year = match[1], month = match[2], day = match[3];
-    const hour = match[4], minute = match[5], second = match[6];
-    const dateKey = `${year}-${month}-${day}`;
-    const timeStr = `${hour}:${minute}:${second}`;
-    if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
-    snapshotsByDate.get(dateKey).push({ filename, timeStr });
-  }
-}
-// Sort each day's snapshots by time
-for (const [date, snaps] of snapshotsByDate.entries()) {
-  snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
-}
-
-// Populate date picker with all available dates (sorted)
-const datePicker = document.getElementById('date-picker');
-const timeSelect = document.getElementById('time-select');
-const dates = Array.from(snapshotsByDate.keys()).sort(); // oldest to newest
-if (dates.length) {
-  datePicker.min = dates[0];
-  datePicker.max = dates[dates.length - 1];
-  // Optionally set default to latest date
-  datePicker.value = dates[dates.length - 1];
-}
-
-// When date changes, populate time dropdown
-function updateTimeSelect(dateValue) {
-  const snaps = snapshotsByDate.get(dateValue);
-  if (!snaps || snaps.length === 0) {
-    timeSelect.style.display = 'none';
-    return;
-  }
-  timeSelect.style.display = 'inline-block';
-  timeSelect.innerHTML = '<option value="">Select time...</option>';
-  for (const snap of snaps) {
-    const option = document.createElement('option');
-    option.value = snap.filename;
-    option.textContent = snap.timeStr;
-    timeSelect.appendChild(option);
-  }
-}
-
-datePicker.addEventListener('change', () => {
-  updateTimeSelect(datePicker.value);
-  timeSelect.value = ''; // reset
-});
-
-// When time selected, load the snapshot
-timeSelect.addEventListener('change', () => {
-  const filename = timeSelect.value;
-  if (!filename) return;
-  // Find the index in filteredSnapshots? Actually we can directly load.
-  // But to maintain slider state, we should rebuild the filtered list with this snapshot as anchor.
-  buildFilteredList(filename);
-});
-
-// Initialize: if datePicker has a value, populate time dropdown
-if (datePicker.value) {
-  updateTimeSelect(datePicker.value);
-  // Optionally auto-select the latest snapshot of that day
-  const snaps = snapshotsByDate.get(datePicker.value);
-  if (snaps && snaps.length) {
-    timeSelect.value = snaps[snaps.length-1].filename;
-    buildFilteredList(timeSelect.value);
-  }
-}
-      snapshotSelect.innerHTML = '<option value="">Jump to…</option>';
-      for (let i = allSnapshots.length - 1; i >= 0; i--) {
-        const ts = getEpoch(allSnapshots[i]);
-        const opt = document.createElement('option');
-        opt.value = allSnapshots[i];
-        opt.textContent = timeAgo(ts);
-        snapshotSelect.appendChild(opt);
+      const snapshotsByDate = new Map();
+      for (const filename of allSnapshots) {
+        const match = filename.match(/wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/);
+        if (match) {
+          const year = match[1], month = match[2], day = match[3];
+          const hour = match[4], minute = match[5], second = match[6];
+          const dateKey = `${year}-${month}-${day}`;
+          const timeStr = `${hour}:${minute}:${second}`;
+          if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
+          snapshotsByDate.get(dateKey).push({ filename, timeStr });
+        }
       }
-      buildFilteredList(null);
+      for (const snaps of snapshotsByDate.values()) {
+        snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
+      }
+
+      const datePicker = document.getElementById('date-picker');
+      const timeSelect = document.getElementById('time-select');
+      if (!datePicker || !timeSelect) {
+        console.error('Date picker or time select missing from HTML');
+        buildFilteredList(null);
+        return;
+      }
+
+      const dates = Array.from(snapshotsByDate.keys()).sort();
+      if (dates.length) {
+        datePicker.min = dates[0];
+        datePicker.max = dates[dates.length - 1];
+        datePicker.value = dates[dates.length - 1];
+      }
+
+      function updateTimeSelect(dateValue) {
+        const snaps = snapshotsByDate.get(dateValue);
+        if (!snaps || snaps.length === 0) {
+          timeSelect.style.display = 'none';
+          return;
+        }
+        timeSelect.style.display = 'inline-block';
+        timeSelect.innerHTML = '<option value="">Select time...</option>';
+        for (const snap of snaps) {
+          const opt = document.createElement('option');
+          opt.value = snap.filename;
+          opt.textContent = snap.timeStr;
+          timeSelect.appendChild(opt);
+        }
+      }
+
+      datePicker.addEventListener('change', () => {
+        updateTimeSelect(datePicker.value);
+        timeSelect.value = '';
+      });
+
+      timeSelect.addEventListener('change', () => {
+        const filename = timeSelect.value;
+        if (filename) buildFilteredList(filename);
+      });
+
+      if (datePicker.value) {
+        updateTimeSelect(datePicker.value);
+        const snaps = snapshotsByDate.get(datePicker.value);
+        if (snaps && snaps.length) {
+          timeSelect.value = snaps[snaps.length-1].filename;
+          buildFilteredList(timeSelect.value);
+        } else {
+          buildFilteredList(null);
+        }
+      } else {
+        buildFilteredList(null);
+      }
     })
     .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
 
@@ -485,13 +462,6 @@ if (datePicker.value) {
   intervalSelect.addEventListener('change', () => {
     currentInterval = parseInt(intervalSelect.value);
     buildFilteredList(null);
-  });
-
-  // ---- Snapshot jump dropdown ----
-  snapshotSelect.addEventListener('change', () => {
-    const selectedFilename = snapshotSelect.value;
-    if (!selectedFilename) return;
-    buildFilteredList(selectedFilename);
   });
 
   // ---- Slider ----
@@ -512,12 +482,12 @@ if (datePicker.value) {
     else if(e.key==='r'||e.key==='R') resetView();
   });
 
-  // ---- Pan & Zoom events (unchanged) ----
+  // ---- Pan & Zoom events ----
   canvas.addEventListener('mousedown', e => { if (selectionMode) return; e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
   window.addEventListener('mousemove', e => { if (selectionMode) return; if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawScene(); });
   window.addEventListener('mouseup', () => { if (selectionMode) return; dragging = false; canvas.style.cursor = 'grab'; });
 
-  // ---- Touch events (unchanged) ----
+  // ---- Touch events ----
   canvas.addEventListener('touchstart', e => {
     if (selectionMode) return;
     e.preventDefault();
@@ -608,62 +578,20 @@ if (datePicker.value) {
     drawScene();
   }, {passive:false});
 
-  // ---- Overlay download (transparent) ----
-  let exportCanvas = null;
-
-  function downloadOverlay(cropKey) {
-    if (!currentImage.complete || currentImage.naturalWidth === 0) return;
-    const crop = CROPS[cropKey];
-    if (!crop) return;
-
-    if (!exportCanvas) exportCanvas = document.createElement('canvas');
-    exportCanvas.width = crop.w;
-    exportCanvas.height = crop.h;
-    const tctx = exportCanvas.getContext('2d');
-    tctx.clearRect(0, 0, crop.w, crop.h);
-    tctx.drawImage(currentImage, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
-
-    const dataUrl = exportCanvas.toDataURL('image/png');
-    const bounds = cropToBounds(crop.x, crop.y, crop.w, crop.h);
-    const currentFilename = filteredSnapshots[currentFilteredIndex];
-    const m = currentFilename ? currentFilename.match(/(\d{8}_\d{6})/) : null;
-    const ts = m ? m[0] : 'unknown';
-    const overlay = {
-      id: `wdp_${cropKey}_${ts}`,
-      schemaVersion: "1",
-      name: `${cropKey}_${ts}.png`,
-      opacity: 1,
-      image: { dataUrl, width: crop.w, height: crop.h },
-      bounds,
-      colorMetric: "lab",
-      dithering: false,
-      order: 0,
-      locked: false,
-      hasPlaced: true,
-      visible: true
-    };
-    const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `wdp_${cropKey}_${ts}.wplace`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
+  // ---- Full snapshot download ----
   const dlSnapshot = document.getElementById('dl-snapshot');
-  dlSnapshot.addEventListener('click', () => {
-    if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
-    const filename = filteredSnapshots[currentFilteredIndex];
-    const a = document.createElement('a');
-    a.href = 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/' + filename;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  });
+  if (dlSnapshot) {
+    dlSnapshot.addEventListener('click', () => {
+      if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
+      const filename = filteredSnapshots[currentFilteredIndex];
+      const a = document.createElement('a');
+      a.href = 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/' + filename;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
+  }
 
   // ---- Selection mode ----
   const selCanvas = document.getElementById('sel-canvas');
@@ -695,46 +623,38 @@ if (datePicker.value) {
   }
 
   function drawSelection() {
-  selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-  const rect = getSelectionRect();
-  if (!rect) return;
+    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    const rect = getSelectionRect();
+    if (!rect) return;
 
-  const start = imgToClient(rect.x1, rect.y1);
-  const end = imgToClient(rect.x2, rect.y2);
+    const start = imgToClient(rect.x1, rect.y1);
+    const end = imgToClient(rect.x2, rect.y2);
 
-  // Snap to whole CSS pixels so the rectangle is crisp
-  let x = Math.round(Math.min(start.x, end.x));
-  let y = Math.round(Math.min(start.y, end.y));
-  let w = Math.round(Math.abs(end.x - start.x));
-  let h = Math.round(Math.abs(end.y - start.y));
+    let x = Math.round(Math.min(start.x, end.x));
+    let y = Math.round(Math.min(start.y, end.y));
+    let w = Math.round(Math.abs(end.x - start.x));
+    let h = Math.round(Math.abs(end.y - start.y));
 
-  // Avoid zero‑size rectangle
-  if (w < 1) w = 1;
-  if (h < 1) h = 1;
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
 
-  selCtx.fillStyle = 'rgba(255, 255, 0, 0.1)';
-  selCtx.fillRect(x, y, w, h);
-  selCtx.strokeStyle = '#FF0';
-  selCtx.lineWidth = 1;
-  selCtx.strokeRect(x, y, w, h);
+    selCtx.fillStyle = 'rgba(255, 255, 0, 0.1)';
+    selCtx.fillRect(x, y, w, h);
+    selCtx.strokeStyle = '#FF0';
+    selCtx.lineWidth = 1;
+    selCtx.strokeRect(x, y, w, h);
 
-  const handles = [
-    { x: x, y: y },
-    { x: x + w, y: y },
-    { x: x, y: y + h },
-    { x: x + w, y: y + h },
-    { x: x + w/2, y: y },
-    { x: x + w/2, y: y + h },
-    { x: x, y: y + h/2 },
-    { x: x + w, y: y + h/2 }
-  ];
-  selCtx.fillStyle = '#FFF';
-  selCtx.strokeStyle = '#000';
-  handles.forEach(h => {
-    selCtx.fillRect(h.x - HANDLE_SIZE/2, h.y - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE);
-    selCtx.strokeRect(h.x - HANDLE_SIZE/2, h.y - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE);
-  });
-}
+    const handles = [
+      { x: x, y: y }, { x: x + w, y: y }, { x: x, y: y + h }, { x: x + w, y: y + h },
+      { x: x + w/2, y: y }, { x: x + w/2, y: y + h }, { x: x, y: y + h/2 }, { x: x + w, y: y + h/2 }
+    ];
+    selCtx.fillStyle = '#FFF';
+    selCtx.strokeStyle = '#000';
+    handles.forEach(h => {
+      selCtx.fillRect(h.x - HANDLE_SIZE/2, h.y - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE);
+      selCtx.strokeRect(h.x - HANDLE_SIZE/2, h.y - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE);
+    });
+  }
   
   function hitTestHandle(clientX, clientY) {
     const rect = getSelectionRect();
@@ -755,11 +675,11 @@ if (datePicker.value) {
     return null;
   }
 
-function clientToImg(clientX, clientY) {
-  const imgX = Math.round((clientX - offsetX) / scale);
-  const imgY = Math.round((clientY - offsetY) / scale);
-  return { x: imgX, y: imgY };
-}
+  function clientToImg(clientX, clientY) {
+    const imgX = Math.round((clientX - offsetX) / scale);
+    const imgY = Math.round((clientY - offsetY) / scale);
+    return { x: imgX, y: imgY };
+  }
 
   function imgToClient(imgX, imgY) {
     const clientX = imgX * scale + offsetX;
@@ -809,142 +729,144 @@ function clientToImg(clientX, clientY) {
     drawSelection();
   }
 
-  // Toggle selection mode
   const dlSelectToggle = document.getElementById('dl-select-toggle');
   const dlSelectPng = document.getElementById('dl-select-png');
   const dlSelectOverlay = document.getElementById('dl-select-overlay');
 
-function setSelectionButtonsVisible(visible) {
-  const disp = visible ? 'inline-block' : 'none';
-  dlSelectPng.style.display = disp;
-  dlSelectOverlay.style.display = disp;
-}
-
-dlSelectToggle.addEventListener('click', () => {
-  selectionMode = !selectionMode;
-  if (selectionMode) {
-    dlSelectToggle.textContent = 'done';
-    selCanvas.style.pointerEvents = 'auto';
-  } else {
-    dlSelectToggle.textContent = 'select area';
-    selCanvas.style.pointerEvents = 'none';
-    // Clear selection
-    selStartImg = selEndImg = null;
-    dragHandle = null;
-    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-    setSelectionButtonsVisible(false);
+  function setSelectionButtonsVisible(visible) {
+    const disp = visible ? 'inline-block' : 'none';
+    dlSelectPng.style.display = disp;
+    dlSelectOverlay.style.display = disp;
   }
-});
 
-  // ---- Override mouse events for selection mode ----
-  selCanvas.addEventListener('mousedown', e => {
-    if (!selectionMode) return;
-    e.preventDefault();
-    const clientX = e.clientX, clientY = e.clientY;
-    const img = constrainToImage(clientToImg(clientX, clientY));
-
-    if (selStartImg && selEndImg && getSelectionRect()) {
-      const handle = hitTestHandle(clientX, clientY);
-      if (handle) {
-        dragHandle = handle;
-        selecting = false;
-        return;
+  if (dlSelectToggle) {
+    dlSelectToggle.addEventListener('click', () => {
+      selectionMode = !selectionMode;
+      if (selectionMode) {
+        dlSelectToggle.textContent = 'done';
+        selCanvas.style.pointerEvents = 'auto';
+      } else {
+        dlSelectToggle.textContent = 'select area';
+        selCanvas.style.pointerEvents = 'none';
+        selStartImg = selEndImg = null;
+        dragHandle = null;
+        selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+        setSelectionButtonsVisible(false);
       }
-    }
+    });
+  }
 
-    selecting = true;
-    selStartImg = img;
-    selEndImg = null;
-    dragHandle = null;
-    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-  });
+  // Selection canvas events
+  if (selCanvas) {
+    selCanvas.addEventListener('mousedown', e => {
+      if (!selectionMode) return;
+      e.preventDefault();
+      const clientX = e.clientX, clientY = e.clientY;
+      const img = constrainToImage(clientToImg(clientX, clientY));
 
-  selCanvas.addEventListener('mousemove', e => {
-    if (!selectionMode) return;
-    if (selecting) {
-      const img = constrainToImage(clientToImg(e.clientX, e.clientY));
-      selEndImg = img;
-      drawSelection();
-    } else if (dragHandle) {
-      dragSelection(e.clientX, e.clientY);
-    }
-  });
-
-  selCanvas.addEventListener('mouseup', e => {
-    if (!selectionMode) return;
-    if (selecting) {
-      selecting = false;
-      if (selStartImg && selEndImg) {
-        if (Math.abs(selEndImg.x - selStartImg.x) < 1 || Math.abs(selEndImg.y - selStartImg.y) < 1) {
-          selStartImg = selEndImg = null;
-          setSelectionButtonsVisible(false);
-        } else {
-          setSelectionButtonsVisible(true);
+      if (selStartImg && selEndImg && getSelectionRect()) {
+        const handle = hitTestHandle(clientX, clientY);
+        if (handle) {
+          dragHandle = handle;
+          selecting = false;
+          return;
         }
       }
-      drawSelection();
-    } else if (dragHandle) {
+
+      selecting = true;
+      selStartImg = img;
+      selEndImg = null;
       dragHandle = null;
-      drawSelection();
-    }
-  });
+      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    });
 
-  // Touch events for selection
-  selCanvas.addEventListener('touchstart', e => {
-    if (!selectionMode) return;
-    e.preventDefault();
-    const t = e.touches[0];
-    const clientX = t.clientX, clientY = t.clientY;
-    const img = constrainToImage(clientToImg(clientX, clientY));
-
-    if (selStartImg && selEndImg && getSelectionRect()) {
-      const handle = hitTestHandle(clientX, clientY);
-      if (handle) {
-        dragHandle = handle;
-        selecting = false;
-        return;
+    selCanvas.addEventListener('mousemove', e => {
+      if (!selectionMode) return;
+      if (selecting) {
+        const img = constrainToImage(clientToImg(e.clientX, e.clientY));
+        selEndImg = img;
+        drawSelection();
+      } else if (dragHandle) {
+        dragSelection(e.clientX, e.clientY);
       }
-    }
+    });
 
-    selecting = true;
-    selStartImg = img;
-    selEndImg = null;
-    dragHandle = null;
-    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-  }, { passive: false });
+    selCanvas.addEventListener('mouseup', e => {
+      if (!selectionMode) return;
+      if (selecting) {
+        selecting = false;
+        if (selStartImg && selEndImg) {
+          if (Math.abs(selEndImg.x - selStartImg.x) < 1 || Math.abs(selEndImg.y - selStartImg.y) < 1) {
+            selStartImg = selEndImg = null;
+            setSelectionButtonsVisible(false);
+          } else {
+            setSelectionButtonsVisible(true);
+          }
+        }
+        drawSelection();
+      } else if (dragHandle) {
+        dragHandle = null;
+        drawSelection();
+      }
+    });
 
-  selCanvas.addEventListener('touchmove', e => {
-    if (!selectionMode) return;
-    e.preventDefault();
-    const t = e.touches[0];
-    if (selecting) {
-      selEndImg = constrainToImage(clientToImg(t.clientX, t.clientY));
-      drawSelection();
-    } else if (dragHandle) {
-      dragSelection(t.clientX, t.clientY);
-    }
-  }, { passive: false });
+    // Touch events for selection
+    selCanvas.addEventListener('touchstart', e => {
+      if (!selectionMode) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      const clientX = t.clientX, clientY = t.clientY;
+      const img = constrainToImage(clientToImg(clientX, clientY));
 
-  selCanvas.addEventListener('touchend', e => {
-    if (!selectionMode) return;
-    if (selecting) {
-      selecting = false;
-      if (selStartImg && selEndImg) {
-        if (Math.abs(selEndImg.x - selStartImg.x) < 1 || Math.abs(selEndImg.y - selStartImg.y) < 1) {
-          selStartImg = selEndImg = null;
-          setSelectionButtonsVisible(false);
-        } else {
-          setSelectionButtonsVisible(true);
+      if (selStartImg && selEndImg && getSelectionRect()) {
+        const handle = hitTestHandle(clientX, clientY);
+        if (handle) {
+          dragHandle = handle;
+          selecting = false;
+          return;
         }
       }
-      drawSelection();
-    } else if (dragHandle) {
-      dragHandle = null;
-      drawSelection();
-    }
-  });
 
-  // ---- Download custom selection ----
+      selecting = true;
+      selStartImg = img;
+      selEndImg = null;
+      dragHandle = null;
+      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    }, { passive: false });
+
+    selCanvas.addEventListener('touchmove', e => {
+      if (!selectionMode) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      if (selecting) {
+        selEndImg = constrainToImage(clientToImg(t.clientX, t.clientY));
+        drawSelection();
+      } else if (dragHandle) {
+        dragSelection(t.clientX, t.clientY);
+      }
+    }, { passive: false });
+
+    selCanvas.addEventListener('touchend', e => {
+      if (!selectionMode) return;
+      if (selecting) {
+        selecting = false;
+        if (selStartImg && selEndImg) {
+          if (Math.abs(selEndImg.x - selStartImg.x) < 1 || Math.abs(selEndImg.y - selStartImg.y) < 1) {
+            selStartImg = selEndImg = null;
+            setSelectionButtonsVisible(false);
+          } else {
+            setSelectionButtonsVisible(true);
+          }
+        }
+        drawSelection();
+      } else if (dragHandle) {
+        dragHandle = null;
+        drawSelection();
+      }
+    });
+  }
+
+  // Download custom selection
   function getCroppedImageData() {
     if (!selStartImg || !selEndImg) return null;
     const rect = getSelectionRect();
@@ -964,72 +886,77 @@ dlSelectToggle.addEventListener('click', () => {
     };
   }
 
-  dlSelectPng.addEventListener('click', () => {
-    const cropData = getCroppedImageData();
-    if (!cropData) return;
-    const a = document.createElement('a');
-    a.href = cropData.dataUrl;
-    a.download = 'selection.png';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  });
-
-  dlSelectOverlay.addEventListener('click', () => {
-    const cropData = getCroppedImageData();
-    if (!cropData) return;
-    const bounds = cropToBounds(cropData.x, cropData.y, cropData.width, cropData.height);
-    const m = (filteredSnapshots[currentFilteredIndex] || '').match(/(\d{8}_\d{6})/);
-    const ts = m ? m[0] : Date.now();
-
-    const overlay = {
-      id: `wdp_custom_${ts}`,
-      schemaVersion: "1",
-      name: `custom_${ts}.png`,
-      opacity: 1,
-      image: { dataUrl: cropData.dataUrl, width: cropData.width, height: cropData.height },
-      bounds,
-      colorMetric: "lab",
-      dithering: false,
-      order: 0,
-      locked: false,
-      hasPlaced: true,
-      visible: true
-    };
-
-    const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `wdp_custom_${ts}.wplace`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  });
-
-  // Ensure the selection canvas resizes with the window
-// ---- Resize (final, safe version) ----
-function safeResize() {
-  try {
-    // original resize (sets physical canvas + WebGL viewport)
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = window.innerWidth * dpr;
-    canvas.height = window.innerHeight * dpr;
-    canvas.style.width = window.innerWidth + 'px';
-    canvas.style.height = window.innerHeight + 'px';
-    gl.viewport(0, 0, canvas.width, canvas.height);
-
-    // selection canvas (CSS pixels only)
-    selCanvas.width = window.innerWidth;
-    selCanvas.height = window.innerHeight;
-    selCanvas.style.width = window.innerWidth + 'px';
-    selCanvas.style.height = window.innerHeight + 'px';
-
-    drawScene();
-  } catch (e) {
-    console.error('Resize error:', e);
+  if (dlSelectPng) {
+    dlSelectPng.addEventListener('click', () => {
+      const cropData = getCroppedImageData();
+      if (!cropData) return;
+      const a = document.createElement('a');
+      a.href = cropData.dataUrl;
+      a.download = 'selection.png';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+    });
   }
-}
 
-window.addEventListener('resize', safeResize);
-safeResize();  // call it now
+  if (dlSelectOverlay) {
+    dlSelectOverlay.addEventListener('click', () => {
+      const cropData = getCroppedImageData();
+      if (!cropData) return;
+      const bounds = cropToBounds(cropData.x, cropData.y, cropData.width, cropData.height);
+      const m = (filteredSnapshots[currentFilteredIndex] || '').match(/(\d{8}_\d{6})/);
+      const ts = m ? m[0] : Date.now();
+
+      const overlay = {
+        id: `wdp_custom_${ts}`,
+        schemaVersion: "1",
+        name: `custom_${ts}.png`,
+        opacity: 1,
+        image: { dataUrl: cropData.dataUrl, width: cropData.width, height: cropData.height },
+        bounds,
+        colorMetric: "lab",
+        dithering: false,
+        order: 0,
+        locked: false,
+        hasPlaced: true,
+        visible: true
+      };
+
+      const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `wdp_custom_${ts}.wplace`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    });
+  }
+
+  // Resize handler
+  function safeResize() {
+    try {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = window.innerWidth * dpr;
+      canvas.height = window.innerHeight * dpr;
+      canvas.style.width = window.innerWidth + 'px';
+      canvas.style.height = window.innerHeight + 'px';
+      gl.viewport(0, 0, canvas.width, canvas.height);
+
+      if (selCanvas) {
+        selCanvas.width = window.innerWidth;
+        selCanvas.height = window.innerHeight;
+        selCanvas.style.width = window.innerWidth + 'px';
+        selCanvas.style.height = window.innerHeight + 'px';
+      }
+
+      drawScene();
+    } catch (e) {
+      console.error('Resize error:', e);
+    }
+  }
+
+  window.addEventListener('resize', safeResize);
+  safeResize();
 })();
