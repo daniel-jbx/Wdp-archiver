@@ -1,11 +1,16 @@
 name: Daily Sparsen Snapshots (1 per hour)
 on:
-  workflow_dispatch:   # manual trigger for now
+  workflow_dispatch:   # manual trigger for testing
   schedule:
     - cron: '0 1 * * *'   # run daily at 01:00 UTC
 
+# Give the workflow write access to the repository
 permissions:
   contents: write
+
+# Silence Node.js 20 deprecation warning (optional)
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   sparsen:
@@ -17,16 +22,16 @@ jobs:
           ref: assets
           fetch-depth: 1
 
-      - name: Sparsen to 1 per hour
+      - name: Sparsen to 1 snapshot per hour
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # List all snapshots, sorted by name (which is chronological)
+          # List all snapshots in chronological order
           mapfile -t ALL < <(ls -1 wdpsnapshot_*.png 2>/dev/null | sort)
 
-          # Helper: extract epoch from filename
+          # Helper: extract epoch timestamp from filename
           get_epoch() {
             local f="$1"
             local ts_part="${f#*snapshot_}"
@@ -47,20 +52,19 @@ jobs:
           # Determine which files to delete
           TO_DELETE=()
           for hour in "${!HOUR_GROUPS[@]}"; do
-            # Split the space‑separated list into an array
             IFS=' ' read -r -a snaps <<< "${HOUR_GROUPS[$hour]}"
-            # Sort by epoch (ascending)
+            # Sort by epoch ascending (earliest first)
             IFS=$'\n' sorted=($(sort <<<"${snaps[*]}"))
             unset IFS
             # Keep only the first (earliest) snapshot
             if [ ${#sorted[@]} -gt 1 ]; then
-              # Delete all but the first
               for ((i=1; i<${#sorted[@]}; i++)); do
                 TO_DELETE+=("${sorted[$i]}")
               done
             fi
           done
 
+          # Delete extra files
           if [ ${#TO_DELETE[@]} -gt 0 ]; then
             git rm "${TO_DELETE[@]}"
             echo "Deleted ${#TO_DELETE[@]} snapshots"
@@ -68,17 +72,14 @@ jobs:
             echo "No snapshots to delete"
           fi
 
-          # Pull latest remote changes (new snapshots)
-          git pull --rebase origin assets
-
           # Rebuild snapshots.json with remaining files
           ls -1 wdpsnapshot_*.png 2>/dev/null | jq -R . | jq -s . > snapshots.json
           git add snapshots.json
 
-          # Commit and push
-          if git diff --cached --quiet; then
-            echo "No changes to commit"
-          else
+          # Commit and push only if there are changes
+          if ! git diff --cached --quiet; then
             git commit -m "Sparsen to 1 snapshot per hour"
             git push origin assets
+          else
+            echo "No changes to commit"
           fi
