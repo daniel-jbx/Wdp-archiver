@@ -2,7 +2,7 @@ name: Targeted Backfill (Jan 10 – May 11 + May 26-28)
 
 on:
   schedule:
-    - cron: '20 */6 * * *'
+    - cron: '20 */1 * * *'
   workflow_dispatch:
 
 jobs:
