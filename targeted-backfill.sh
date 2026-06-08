@@ -81,7 +81,6 @@ process_release() {
     
     echo "--- Processing $tag_name -> $snapshot_name"
     
-    # Skip if already exists
     if rclone ls "r2:$R2_BUCKET/" | grep -q "$snapshot_name"; then
         echo "  Already exists in R2, skipping."
         return 0
@@ -101,38 +100,26 @@ process_release() {
         return 1
     fi
     
-    # Build list of tile patterns (relative paths after stripping top dir)
+    # Build patterns for exact tile paths after stripping top directory
     local tile_patterns=()
     for x in $(seq $X_START $X_END); do
         for y in $(seq $Y_START $Y_END); do
-            tile_patterns+=("*/$x/$y.png")
+            tile_patterns+=("$x/$y.png")
         done
     done
-
-    # DEBUG: for first snapshot, list archive contents (only once)
-if [[ -z "${DEBUG_DONE:-}" ]]; then
-    echo "  DEBUG: Listing first 20 entries from the concatenated archive (first 2MB)..."
-    (
-        for url in "${asset_urls[@]}"; do
-            curl -L -s --fail --range 0-2097152 "$url"
-            break  # only first part
-        done
-    ) | tar -tzf - 2>/dev/null | head -20
-    export DEBUG_DONE=1
-fi
     
     mkdir -p "$temp_dir/tiles"
-    # Stream all parts and extract only needed tiles, stripping the top directory
+    # Stream all parts, strip the first path component, extract only needed tiles
     (
         for url in "${asset_urls[@]}"; do
             curl -L -s --fail "$url"
         done
-    ) | tar -xz --transform='s/^[^/]*\///' -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
+    ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
     
     # Count extracted tiles
     extracted_count=$(find "$temp_dir/tiles" -name "*.png" | wc -l)
     if [[ $extracted_count -eq 0 ]]; then
-        echo "  ERROR: No tiles extracted. Check pattern."
+        echo "  ERROR: No tiles extracted. Pattern may still be wrong."
         return 1
     fi
     echo "  Extracted $extracted_count tiles (expected 42)."
