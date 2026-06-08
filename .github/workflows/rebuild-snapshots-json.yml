@@ -1,0 +1,59 @@
+name: Rebuild snapshots.json from all R2 snapshots
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          acl = private
+          no_check_bucket = true
+          bucket = ${{ secrets.R2_BUCKET }}
+          EOF
+
+      - name: List all snapshot PNGs and generate snapshots.json
+        run: |
+          echo "Listing all wdpsnapshot_*.png files in R2..."
+          # Get list of filenames, extract timestamp for sorting
+          rclone lsjson "r2:${{ secrets.R2_BUCKET }}/" --files-only --include "wdpsnapshot_*.png" > files.json
+          # Generate array of filenames sorted by the embedded timestamp (oldest first)
+          jq -r '
+            map(select(.Name | test("^wdpsnapshot_\\d{8}_\\d{6}\\.png$"))) |
+            map({name: .Name, ts: (.Name | capture("wdpsnapshot_(?<ts>\\d{8}_\\d{6})\\.png").ts)}) |
+            sort_by(.ts) |
+            map(.name)
+          ' files.json > snapshots.json
+          echo "Found $(jq length snapshots.json) snapshots."
+          echo "First 5:"
+          jq '.[0:5]' snapshots.json
+
+      - name: Backup current snapshots.json
+        run: |
+          TIMESTAMP=$(date -u +%Y%m%d_%H%M%S)
+          rclone copyto "r2:${{ secrets.R2_BUCKET }}/snapshots.json" "r2:${{ secrets.R2_BUCKET }}/snapshots.json.backup.${TIMESTAMP}" 2>/dev/null || echo "No existing snapshots.json to backup."
+
+      - name: Upload new snapshots.json
+        run: |
+          rclone copyto snapshots.json "r2:${{ secrets.R2_BUCKET }}/snapshots.json"
+          echo "snapshots.json has been rebuilt and uploaded."
+
+      - name: Show summary
+        run: |
+          echo "✅ Rebuild complete. New snapshots.json contains $(jq length snapshots.json) entries."
