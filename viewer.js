@@ -378,77 +378,66 @@
   };
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-  // ---- Initial snapshot loading with date/time picker ----
+  // ---- Initial snapshot loading with datetime-local picker ----
   fetch('https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/snapshots.json')
     .then(r => r.json())
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
       allSnapshots = files;
 
-      // Build date -> snapshots map
-      const snapshotsByDate = new Map();
+      // Build map of datetime string -> filename
+      const snapshotsByDatetime = new Map(); // key: YYYY-MM-DDTHH:MM:SS, value: filename
+      
       for (const filename of allSnapshots) {
         const match = filename.match(/wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/);
         if (match) {
           const year = match[1], month = match[2], day = match[3];
           const hour = match[4], minute = match[5], second = match[6];
-          const dateKey = `${year}-${month}-${day}`;
-          const timeStr = `${hour}:${minute}:${second}`;
-          if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
-          snapshotsByDate.get(dateKey).push({ filename, timeStr });
+          const datetimeKey = `${year}-${month}-${day}T${hour}:${minute}:${second}`;
+          snapshotsByDatetime.set(datetimeKey, filename);
         }
       }
-      for (const snaps of snapshotsByDate.values()) {
-        snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
-      }
 
-      const datePicker = document.getElementById('date-picker');
-      const timeSelect = document.getElementById('time-select');
-      if (!datePicker || !timeSelect) {
-        console.error('Date picker or time select missing from HTML');
+      const datetimePicker = document.getElementById('datetime-picker');
+      if (!datetimePicker) {
+        console.error('Datetime picker missing from HTML');
         buildFilteredList(null);
         return;
       }
 
-      const dates = Array.from(snapshotsByDate.keys()).sort();
-      if (dates.length) {
-        datePicker.min = dates[0];
-        datePicker.max = dates[dates.length - 1];
-        datePicker.value = dates[dates.length - 1];
+      // Get all available datetimes, sorted
+      const datetimes = Array.from(snapshotsByDatetime.keys()).sort();
+      
+      if (datetimes.length) {
+        // Set min/max for the picker
+        datetimePicker.min = datetimes[0];
+        datetimePicker.max = datetimes[datetimes.length - 1];
+        // Default to latest
+        datetimePicker.value = datetimes[datetimes.length - 1];
       }
 
-      function updateTimeSelect(dateValue) {
-        const snaps = snapshotsByDate.get(dateValue);
-        if (!snaps || snaps.length === 0) {
-          timeSelect.style.display = 'none';
-          return;
+      // When datetime changes, load that snapshot
+      datetimePicker.addEventListener('change', () => {
+        const filename = snapshotsByDatetime.get(datetimePicker.value);
+        if (filename) {
+          buildFilteredList(filename);
+        } else {
+          // If exact match not found, find the closest available snapshot
+          const available = Array.from(snapshotsByDatetime.keys());
+          const closest = available.reduce((prev, curr) => {
+            return Math.abs(new Date(curr) - new Date(datetimePicker.value)) < 
+                   Math.abs(new Date(prev) - new Date(datetimePicker.value)) ? curr : prev;
+          });
+          datetimePicker.value = closest;
+          buildFilteredList(snapshotsByDatetime.get(closest));
         }
-        timeSelect.style.display = 'inline-block';
-        timeSelect.innerHTML = '<option value="">Select time...</option>';
-        for (const snap of snaps) {
-          const opt = document.createElement('option');
-          opt.value = snap.filename;
-          opt.textContent = snap.timeStr;
-          timeSelect.appendChild(opt);
-        }
-      }
-
-      datePicker.addEventListener('change', () => {
-        updateTimeSelect(datePicker.value);
-        timeSelect.value = '';
       });
 
-      timeSelect.addEventListener('change', () => {
-        const filename = timeSelect.value;
-        if (filename) buildFilteredList(filename);
-      });
-
-      if (datePicker.value) {
-        updateTimeSelect(datePicker.value);
-        const snaps = snapshotsByDate.get(datePicker.value);
-        if (snaps && snaps.length) {
-          timeSelect.value = snaps[snaps.length-1].filename;
-          buildFilteredList(timeSelect.value);
+      // Initialize with latest snapshot
+      if (datetimePicker.value) {
+        const filename = snapshotsByDatetime.get(datetimePicker.value);
+        if (filename) {
+          buildFilteredList(filename);
         } else {
           buildFilteredList(null);
         }
