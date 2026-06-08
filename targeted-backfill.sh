@@ -12,7 +12,7 @@ STATE_FILE="backfill-progress.json"
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 R2_STATE_PATH="backfill-progress.json"
 
-# Tile range (your 42 tiles)
+# Tile range
 X_START=1225
 X_END=1231
 Y_START=513
@@ -20,14 +20,14 @@ Y_END=518
 TILE_COLS=$((X_END - X_START + 1))
 TILE_ROWS=$((Y_END - Y_START + 1))
 
-# GitHub token (provided by workflow)
+# GitHub token
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 AUTH_HEADER=()
 if [[ -n "$GITHUB_TOKEN" ]]; then
     AUTH_HEADER=(-H "Authorization: token $GITHUB_TOKEN")
 fi
 
-# Check required tools
+# Tools check
 for tool in curl jq tar montage pngquant rclone; do
     if ! command -v "$tool" &>/dev/null; then
         echo "Missing required tool: $tool"
@@ -39,7 +39,6 @@ done
 # FUNCTIONS
 # ============================
 
-# Fetch all release tags (tag_name and published_at) using pagination
 fetch_all_releases() {
     local page=1
     local all_entries=()
@@ -56,41 +55,31 @@ fetch_all_releases() {
             break
         fi
         
-        # Check if response is a non-empty JSON array
         if ! jq -e 'type == "array" and length > 0' "$response_file" >/dev/null 2>&1; then
             rm "$response_file"
             break
         fi
         
-        # Extract tag_name and published_at
         while IFS=$'\t' read -r tag published; do
             all_entries+=("$tag|$published")
         done < <(jq -r '.[] | [.tag_name, .published_at] | @tsv' "$response_file")
         
         rm "$response_file"
         ((page++))
-        
-        # Safety limit
         if [[ $page -gt 200 ]]; then
             echo "WARNING: Reached page 200 limit, stopping." >&2
             break
         fi
-        
-        # Be polite to GitHub API
         sleep 0.5
     done
-    
     printf '%s\n' "${all_entries[@]}"
 }
 
-# Convert tag to YYYYMMDD_HHMMSS filename (drop milliseconds)
 date_from_tag() {
     local tag="$1"
-    # Example: world-2026-05-26T01-10-14.124Z -> 20260526_011014
     echo "$tag" | sed 's/world-//' | sed 's/T/_/' | sed 's/-//g' | sed 's/\..*//'
 }
 
-# Process a single release
 process_release() {
     local tag_name="$1"
     local snap_date=$(date_from_tag "$tag_name")
@@ -98,7 +87,7 @@ process_release() {
     
     echo "--- Processing $tag_name -> $snapshot_name"
     
-    # Skip if already exists in R2 (check snapshots.json)
+    # Skip if already exists
     if rclone cat "r2:$R2_BUCKET/snapshots.json" 2>/dev/null | jq -e 'type == "array"' >/dev/null; then
         if rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r ".[].filename" | grep -qx "$snapshot_name"; then
             echo "  Already exists in R2, skipping."
@@ -109,7 +98,6 @@ process_release() {
     local temp_dir=$(mktemp -d)
     trap "rm -rf '$temp_dir'" RETURN
     
-    # Fetch asset URLs for the split tarballs
     local asset_urls=()
     while IFS= read -r url; do
         asset_urls+=("$url")
@@ -120,7 +108,6 @@ process_release() {
         return 1
     fi
     
-    # Prepare tile paths (e.g., 1225/513.png)
     local tile_paths=()
     for x in $(seq $X_START $X_END); do
         for y in $(seq $Y_START $Y_END); do
@@ -129,7 +116,6 @@ process_release() {
     done
     
     mkdir -p "$temp_dir/tiles"
-    # Stream and extract only needed tiles
     (
         for url in "${asset_urls[@]}"; do
             curl -s --fail "$url"
@@ -145,7 +131,6 @@ process_release() {
         done
     }
     
-    # Build montage command (row-major order)
     local tile_files=()
     for y in $(seq $Y_START $Y_END); do
         for x in $(seq $X_START $X_END); do
@@ -154,13 +139,9 @@ process_release() {
     done
     montage "${tile_files[@]}" -tile ${TILE_COLS}x${TILE_ROWS} -geometry 1000x1000+0+0 "$temp_dir/stitched.png"
     
-    # Compress with pngquant
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
-    
-    # Upload to R2
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
-    # Update snapshots.json manifest
     local manifest_tmp=$(mktemp)
     local iso_timestamp=$(date -d "${tag_name//world-/}" -Iseconds 2>/dev/null || echo "1970-01-01T00:00:00Z")
     if rclone cat "r2:$R2_BUCKET/snapshots.json" 2>/dev/null | jq -e 'type == "array"' >/dev/null; then
@@ -179,7 +160,6 @@ process_release() {
 # MAIN
 # ============================
 
-# Download state file from R2
 if rclone cat "r2:$R2_BUCKET/$R2_STATE_PATH" 2>/dev/null > "$STATE_FILE"; then
     last_processed=$(jq -r '.last_processed_tag' "$STATE_FILE")
     processed_count=$(jq -r '.processed_count' "$STATE_FILE")
@@ -192,22 +172,23 @@ fi
 echo "Last processed tag: ${last_processed:-none}"
 echo "Total processed so far: $processed_count"
 
-# Fetch all releases (real tags, with irregular timestamps)
 echo "Fetching all releases from GitHub (paginated)..."
 all_releases=$(fetch_all_releases)
 if [[ -z "$all_releases" ]]; then
-    echo "ERROR: No releases found. Check GitHub API and token."
+    echo "ERROR: No releases found."
     exit 1
 fi
 
 total_fetched=$(echo "$all_releases" | wc -l)
 echo "Fetched $total_fetched total releases."
 
-# Filter releases by date range
+# Filter by date
 target_tags=()
 while IFS=$'|' read -r tag published; do
-    pub_date="${published:0:10}"  # YYYY-MM-DD
-    if [[ "$pub_date" >= "$START_DATE" && "$pub_date" <= "$END_DATE" ]]; then
+    pub_date="${published:0:10}"
+    # Check if date is in main range (string comparison)
+    if [[ "$pub_date" > "$START_DATE" || "$pub_date" == "$START_DATE" ]] && \
+       [[ "$pub_date" < "$END_DATE" || "$pub_date" == "$END_DATE" ]]; then
         target_tags+=("$tag")
     else
         for extra in "${EXTRA_DATES[@]}"; do
@@ -219,19 +200,18 @@ while IFS=$'|' read -r tag published; do
     fi
 done <<< "$all_releases"
 
-# Sort chronologically (oldest first)
+# Sort tags chronologically
 IFS=$'\n' target_tags=($(sort <<<"${target_tags[*]}"))
 unset IFS
 
 total_targets=${#target_tags[@]}
-echo "Total snapshots to backfill (within date range): $total_targets"
+echo "Total snapshots to backfill: $total_targets"
 
 if [[ $total_targets -eq 0 ]]; then
-    echo "No releases found in the target date range."
+    echo "No releases in target date range."
     exit 0
 fi
 
-# Find resume index
 start_idx=0
 if [[ -n "$last_processed" ]]; then
     for i in "${!target_tags[@]}"; do
@@ -243,20 +223,18 @@ if [[ -n "$last_processed" ]]; then
 fi
 
 if [[ $start_idx -ge $total_targets ]]; then
-    echo "All target snapshots have already been processed!"
+    echo "All done!"
     exit 0
 fi
 
 echo "Resuming from index $start_idx (${target_tags[$start_idx]:-end})"
 
-# Process up to BATCH_SIZE snapshots
 processed_this_run=0
 for ((i=start_idx; i<total_targets && processed_this_run<BATCH_SIZE; i++)); do
     tag="${target_tags[$i]}"
     if process_release "$tag"; then
         processed_this_run=$((processed_this_run + 1))
         processed_count=$((processed_count + 1))
-        # Update state file after each success
         jq --arg tag "$tag" --argjson cnt "$processed_count" \
             '.last_processed_tag = $tag | .processed_count = $cnt' "$STATE_FILE" > "$STATE_FILE.tmp"
         mv "$STATE_FILE.tmp" "$STATE_FILE"
