@@ -12,7 +12,7 @@ if [[ -n "$GITHUB_TOKEN" ]]; then
     AUTH_HEADER=(-H "Authorization: token $GITHUB_TOKEN")
 fi
 
-for tool in curl jq tar; do
+for tool in curl jq tar xxd; do
     if ! command -v "$tool" &>/dev/null; then
         echo "Missing required tool: $tool"
         exit 1
@@ -21,7 +21,7 @@ done
 
 # Fetch the most recent release in the date range
 echo "Fetching all releases..."
-all_releases=$(curl -s "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases?per_page=100" | jq -r '.[] | "\(.tag_name)|\(.published_at)"')
+all_releases=$(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases?per_page=100" | jq -r '.[] | "\(.tag_name)|\(.published_at)"')
 target_tags=()
 while IFS='|' read -r tag published; do
     pub_date="${published:0:10}"
@@ -47,23 +47,25 @@ echo "Debug snapshot: $first_tag"
 asset_urls=()
 while IFS= read -r url; do
     asset_urls+=("$url")
-done < <(curl -s "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$first_tag" | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
+done < <(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$first_tag" | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
 
 if [[ ${#asset_urls[@]} -eq 0 ]]; then
     echo "ERROR: No split tarballs found."
     exit 1
 fi
 
-echo "Downloading ${#asset_urls[@]} split parts..."
+echo "Downloading ${#asset_urls[@]} split parts with redirect following..."
 temp_file=$(mktemp)
 for url in "${asset_urls[@]}"; do
     echo "  $url"
-    curl -s --fail "$url" >> "$temp_file"
+    curl -L -s --fail "$url" >> "$temp_file"
+    # Check that we actually downloaded something
+    size=$(stat -c%s "$temp_file" 2>/dev/null || stat -f%z "$temp_file" 2>/dev/null || echo "0")
+    echo "  Current total size: $size bytes"
 done
 
 echo "Checking file type..."
 file "$temp_file"
-
 echo "First 100 bytes (hexdump):"
 xxd -l 100 "$temp_file"
 
