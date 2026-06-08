@@ -99,7 +99,7 @@ process_release() {
         return 1
     fi
     
-    # Build patterns for the 42 tiles (after stripping top dir)
+    # Build patterns for the 42 tiles (match any top directory)
     local tile_patterns=()
     for x in $(seq $X_START $X_END); do
         for y in $(seq $Y_START $Y_END); do
@@ -108,16 +108,16 @@ process_release() {
     done
     
     mkdir -p "$temp_dir/tiles"
-    # Stream concatenated parts, strip top directory, extract any matching file
+    # Stream concatenated parts, strip top directory, extract matching files
     (
         for url in "${asset_urls[@]}"; do
             curl -L -s --fail "$url"
         done
     ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
     
-    # Check extracted count
+    # Count extracted tiles
     extracted_count=$(find "$temp_dir/tiles" -name "*.png" 2>/dev/null | wc -l)
-    echo "  Extracted $extracted_count tiles (up to 42). Missing tiles will be placeholders."
+    echo "  Extracted $extracted_count tiles (up to 42). Missing tiles will be transparent placeholders."
     
     # Build list of expected tile files (relative to temp_dir/tiles)
     local tile_files=()
@@ -127,7 +127,7 @@ process_release() {
         done
     done
     
-    # Create placeholders for missing ones
+    # Create transparent placeholders for missing ones
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
@@ -139,7 +139,7 @@ process_release() {
     montage "${tile_files[@]}" -tile ${TILE_COLS}x${TILE_ROWS} -geometry 1000x1000+0+0 "$temp_dir/stitched.png"
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
     
-    # Upload
+    # Upload to R2
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
     echo "  ✓ Successfully uploaded $snapshot_name (no manifest update)"
