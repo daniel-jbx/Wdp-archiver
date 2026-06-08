@@ -1,7 +1,6 @@
 name: Targeted Backfill (Jan 10 – May 11 + May 26-28)
 
 on:
-  schedule:
   workflow_dispatch:   # allows manual trigger from GitHub UI
 
 jobs:
