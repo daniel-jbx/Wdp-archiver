@@ -17,28 +17,26 @@ body, html {
   position: absolute;
   top: 0;
   left: 0;
-  pointer-events: none;        /* clicks pass through unless selection mode is on */
+  pointer-events: none;
   display: block;
 }
-/* Style for interval dropdown, date picker, and time select */
+
+/* Style for interval dropdown and datetime picker */
 #interval-select,
-#date-picker,
-#time-select {
+#datetime-picker {
   background: #333;
   color: white;
   border: 1px solid #888;
   border-radius: 4px;
-  padding: 2px 4px;
+  padding: 4px 8px;
   font-size: 0.8rem;
   font-family: inherit;
 }
-#date-picker {
-  min-width: 130px;  /* adjust as needed */
+
+#datetime-picker {
+  max-width: 200px;
 }
-#time-select {
-  min-width: 110px;
-}
-/* Old snapshot-select removed – no longer used */
+
 #top-bar {
   position: absolute; top: 0; left: 0; right: 0;
   background: rgba(0,0,0,0.75); padding: 8px 12px;
@@ -47,18 +45,24 @@ body, html {
   flex-wrap: wrap;
   gap: 8px;
 }
+
 #timestamp-label-top {
-  font-size: 1rem; font-weight: bold; text-align: center; flex: 1;
+  font-size: 1rem;
+  font-weight: bold;
+  text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  min-width: 120px;
 }
+
 #download-group { display: flex; gap: 6px; }
 .dl-btn {
   font-size: 0.8rem; padding: 4px 8px;
   background: #444; color: white; border: 1px solid #888;
   border-radius: 4px; cursor: pointer; white-space: nowrap;
 }
+
 #controls {
   position: absolute; bottom: 20px; left: 5%; right: 5%;
   background: rgba(0,0,0,0.75); border-radius: 8px;
@@ -74,7 +78,50 @@ body, html {
   -webkit-appearance: none; width: 22px; height: 22px;
   background: white; border-radius: 50%; cursor: pointer; border: none;
 }
-@media (max-width: 500px) {
-  #top-bar { flex-wrap: wrap; justify-content: center; gap: 6px; }
-  #download-group { order: 1; width: 100%; justify-content: center; }
+
+/* Mobile-specific layout */
+@media (max-width: 600px) {
+  #top-bar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    padding: 8px;
+  }
+  
+  /* First row: interval + datetime */
+  #interval-group {
+    display: flex;
+    justify-content: space-between;
+    gap: 6px;
+  }
+  
+  #interval-select,
+  #datetime-picker {
+    flex: 1;
+    min-width: 0;
+  }
+  
+  #datetime-picker {
+    max-width: none;
+    width: 100%;
+  }
+  
+  /* Second row: timestamp (full width) */
+  #timestamp-label-top {
+    order: 1;
+    white-space: normal;
+    word-break: break-word;
+    text-align: center;
+    font-size: 0.9rem;
+    padding: 4px 0;
+  }
+  
+  /* Third row: download buttons */
+  #download-group {
+    order: 2;
+    display: flex;
+    justify-content: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
 }
