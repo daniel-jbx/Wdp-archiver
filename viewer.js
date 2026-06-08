@@ -259,9 +259,11 @@
 
 function buildFilteredList(anchorName = null) {
   const intervalSec = currentInterval * 60;
+  console.log(`[DEBUG] buildFilteredList called - intervalSec: ${intervalSec}, anchorName: ${anchorName}, allSnapshots length: ${allSnapshots.length}`);
   
-  // Handle "all" interval (0) - show all snapshots in chronological order
+  // Handle "all" interval (0) - show all snapshots
   if (intervalSec <= 0 || allSnapshots.length === 0) {
+    console.log("[DEBUG] Using ALL snapshots (interval 0 or no snapshots)");
     const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
     candidates.sort((a, b) => a.epoch - b.epoch);
     filteredSnapshots = candidates.map(c => c.name);
@@ -274,27 +276,32 @@ function buildFilteredList(anchorName = null) {
       return;
     }
     
-    // Find anchor index if provided
     let targetIdx = filteredSnapshots.length - 1;
     if (anchorName !== null) {
       const idx = filteredSnapshots.indexOf(anchorName);
       if (idx !== -1) targetIdx = idx;
     }
+    console.log(`[DEBUG] Loading snapshot index ${targetIdx}`);
     loadFilteredSnapshot(targetIdx);
     return;
   }
 
   // Regular interval-based filtering
+  console.log("[DEBUG] Building interval-filtered list");
   const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
   candidates.sort((a, b) => a.epoch - b.epoch);
 
   let anchorIndex;
   if (anchorName !== null) {
     anchorIndex = candidates.findIndex(c => c.name === anchorName);
-    if (anchorIndex === -1) anchorIndex = candidates.length - 1;
+    if (anchorIndex === -1) {
+      console.warn(`[DEBUG] Anchor ${anchorName} not found, using latest`);
+      anchorIndex = candidates.length - 1;
+    }
   } else {
     anchorIndex = candidates.length - 1;
   }
+  console.log(`[DEBUG] Anchor index: ${anchorIndex}, epoch: ${candidates[anchorIndex].epoch}`);
 
   const selected = new Map();
   selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
@@ -355,6 +362,7 @@ function buildFilteredList(anchorName = null) {
 
   const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
   filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
+  console.log(`[DEBUG] Filtered list length: ${filteredSnapshots.length}`);
 
   sliderValueToName = {};
   filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
@@ -367,6 +375,7 @@ function buildFilteredList(anchorName = null) {
 
   let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
   if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
+  console.log(`[DEBUG] Loading filtered snapshot index ${targetIdx}`);
   loadFilteredSnapshot(targetIdx);
 }
 
