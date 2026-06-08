@@ -198,7 +198,7 @@ echo "Fetched $total_fetched total releases."
 target_tags=()
 while IFS=$'|' read -r tag published; do
     pub_date="${published:0:10}"
-    if [[ "$pub_date" >= "$START_DATE" && "$pub_date" <= "$END_DATE" ]]; then
+    if [[ "$pub_date" > "$START_DATE" || "$pub_date" == "$START_DATE" ]] && [[ "$pub_date" < "$END_DATE" || "$pub_date" == "$END_DATE" ]]; then
         target_tags+=("$tag")
     fi
 done <<< "$all_releases"
