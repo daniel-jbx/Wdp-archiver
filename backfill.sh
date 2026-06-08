@@ -11,8 +11,9 @@ STATE_FILE="backfill-progress.json"
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 R2_STATE_PATH="backfill-progress.json"
 
-# Special single-snapshot date (only the oldest snapshot of that day)
+# Special single-snapshot date – only the exact midnight snapshot
 SINGLE_SNAPSHOT_DATE="2026-05-29"
+SPECIAL_TAG="world-2026-05-29T00-15-15.367Z"
 
 X_START=1225
 X_END=1231
@@ -223,27 +224,10 @@ for tag in $all_tags; do
     fi
 done
 
-# Add the special single-snapshot date (only the oldest snapshot of that day)
+# Special date: hardcoded tag for 2026-05-29 midnight
 if [[ -n "$SINGLE_SNAPSHOT_DATE" ]]; then
-    # Find all tags for that date (using the same pattern)
-    single_tags=""
-    for tag in $all_tags; do
-        if [[ "$tag" == world-$SINGLE_SNAPSHOT_DATE* ]]; then
-            single_tags+="$tag|"
-        fi
-    done
-    if [[ -n "$single_tags" ]]; then
-        # Get the oldest (smallest timestamp) snapshot for that date
-        oldest_tag=$(echo "$single_tags" | tr '|' '\n' | sort | head -1)
-        if [[ -n "$oldest_tag" ]]; then
-            day_tags["$SINGLE_SNAPSHOT_DATE"]="$oldest_tag|"
-            echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $oldest_tag"
-        else
-            echo "Warning: No valid tag found for special date $SINGLE_SNAPSHOT_DATE"
-        fi
-    else
-        echo "Warning: No tags found for special date $SINGLE_SNAPSHOT_DATE"
-    fi
+    day_tags["$SINGLE_SNAPSHOT_DATE"]="$SPECIAL_TAG|"
+    echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $SPECIAL_TAG"
 fi
 
 # Get sorted list of dates (newest first)
