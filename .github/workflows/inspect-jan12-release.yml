@@ -126,13 +126,14 @@ jobs:
           rclone copyto compressed.png "r2:${{ secrets.R2_BUCKET }}/test_wdpsnapshot_20260112.png"
           echo "Test snapshot uploaded as test_wdpsnapshot_20260112.png"
 
+      - name: Generate archive listing file
+        run: tar -tzf "$ARCHIVE_PATH" > archive.list
+
       - name: Upload archive listing as artifact
         uses: actions/upload-artifact@v4
         with:
           name: archive-listing
           path: archive.list
-        run: |
-          tar -tzf "$ARCHIVE_PATH" > archive.list
 
       - name: Cleanup
         run: rm -f "$ARCHIVE_PATH"
