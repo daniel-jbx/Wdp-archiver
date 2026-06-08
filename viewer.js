@@ -259,11 +259,9 @@
 
 function buildFilteredList(anchorName = null) {
   const intervalSec = currentInterval * 60;
-  console.log(`[DEBUG] buildFilteredList called - intervalSec: ${intervalSec}, anchorName: ${anchorName}, allSnapshots length: ${allSnapshots.length}`);
   
-  // Handle "all" interval (0) - show all snapshots
+  // Handle "all" interval (0) - show all snapshots in chronological order
   if (intervalSec <= 0 || allSnapshots.length === 0) {
-    console.log("[DEBUG] Using ALL snapshots (interval 0 or no snapshots)");
     const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
     candidates.sort((a, b) => a.epoch - b.epoch);
     filteredSnapshots = candidates.map(c => c.name);
@@ -281,88 +279,74 @@ function buildFilteredList(anchorName = null) {
       const idx = filteredSnapshots.indexOf(anchorName);
       if (idx !== -1) targetIdx = idx;
     }
-    console.log(`[DEBUG] Loading snapshot index ${targetIdx}`);
     loadFilteredSnapshot(targetIdx);
     return;
   }
 
-  // Regular interval-based filtering
-  console.log("[DEBUG] Building interval-filtered list");
+  // Get all snapshots with epochs, sorted oldest to newest
   const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
   candidates.sort((a, b) => a.epoch - b.epoch);
 
+  // Find anchor index
   let anchorIndex;
   if (anchorName !== null) {
     anchorIndex = candidates.findIndex(c => c.name === anchorName);
-    if (anchorIndex === -1) {
-      console.warn(`[DEBUG] Anchor ${anchorName} not found, using latest`);
-      anchorIndex = candidates.length - 1;
-    }
+    if (anchorIndex === -1) anchorIndex = candidates.length - 1;
   } else {
     anchorIndex = candidates.length - 1;
   }
-  console.log(`[DEBUG] Anchor index: ${anchorIndex}, epoch: ${candidates[anchorIndex].epoch}`);
+  const anchorEpoch = candidates[anchorIndex].epoch;
 
+  const minEpoch = candidates[0].epoch;
+  const maxEpoch = candidates[candidates.length - 1].epoch;
+  
+  // Determine range of k (multiples of interval)
+  const minK = Math.ceil((minEpoch - anchorEpoch) / intervalSec);
+  const maxK = Math.floor((maxEpoch - anchorEpoch) / intervalSec);
+  
   const selected = new Map();
-  selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
-
-  // Forward direction
-  let lastEpochFwd = candidates[anchorIndex].epoch;
-  let targetFwd = lastEpochFwd + intervalSec;
-  let searchIdxFwd = anchorIndex + 1;
-  while (searchIdxFwd < candidates.length) {
+  selected.set(anchorEpoch, candidates[anchorIndex].name);
+  
+  // For each target time (anchor + k*interval), find the closest snapshot
+  for (let k = minK; k <= maxK; k++) {
+    if (k === 0) continue;
+    const target = anchorEpoch + k * intervalSec;
+    
+    // Binary search for the first snapshot with epoch >= target
+    let left = 0, right = candidates.length - 1;
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      if (candidates[mid].epoch < target) left = mid + 1;
+      else right = mid - 1;
+    }
+    // left is the index of first element >= target
     let bestIdx = -1;
     let bestDiff = Infinity;
-    for (let i = searchIdxFwd; i < candidates.length; i++) {
-      const diff = Math.abs(candidates[i].epoch - targetFwd);
-      if (diff > intervalSec / 2 && bestIdx !== -1) break;
+    if (left < candidates.length) {
+      const diff = Math.abs(candidates[left].epoch - target);
       if (diff < bestDiff) {
         bestDiff = diff;
-        bestIdx = i;
+        bestIdx = left;
       }
     }
-    if (bestIdx === -1) break;
-    const best = candidates[bestIdx];
-    if (!selected.has(best.epoch)) {
-      selected.set(best.epoch, best.name);
-      lastEpochFwd = best.epoch;
-      targetFwd = lastEpochFwd + intervalSec;
-      searchIdxFwd = bestIdx + 1;
-    } else {
-      searchIdxFwd = bestIdx + 1;
-    }
-  }
-
-  // Backward direction
-  let lastEpochBwd = candidates[anchorIndex].epoch;
-  let targetBwd = lastEpochBwd - intervalSec;
-  let searchIdxBwd = anchorIndex - 1;
-  while (searchIdxBwd >= 0) {
-    let bestIdx = -1;
-    let bestDiff = Infinity;
-    for (let i = searchIdxBwd; i >= 0; i--) {
-      const diff = Math.abs(candidates[i].epoch - targetBwd);
-      if (diff > intervalSec / 2 && bestIdx !== -1) break;
+    if (left - 1 >= 0) {
+      const diff = Math.abs(candidates[left - 1].epoch - target);
       if (diff < bestDiff) {
         bestDiff = diff;
-        bestIdx = i;
+        bestIdx = left - 1;
       }
     }
-    if (bestIdx === -1) break;
-    const best = candidates[bestIdx];
-    if (!selected.has(best.epoch)) {
-      selected.set(best.epoch, best.name);
-      lastEpochBwd = best.epoch;
-      targetBwd = lastEpochBwd - intervalSec;
-      searchIdxBwd = bestIdx - 1;
-    } else {
-      searchIdxBwd = bestIdx - 1;
+    if (bestIdx !== -1) {
+      const best = candidates[bestIdx];
+      if (!selected.has(best.epoch)) {
+        selected.set(best.epoch, best.name);
+      }
     }
   }
-
+  
+  // Convert selected map to sorted array
   const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
   filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
-  console.log(`[DEBUG] Filtered list length: ${filteredSnapshots.length}`);
 
   sliderValueToName = {};
   filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
@@ -375,7 +359,6 @@ function buildFilteredList(anchorName = null) {
 
   let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
   if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
-  console.log(`[DEBUG] Loading filtered snapshot index ${targetIdx}`);
   loadFilteredSnapshot(targetIdx);
 }
 
