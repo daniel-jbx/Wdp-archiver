@@ -7,21 +7,15 @@ set -euo pipefail
 START_DATE="2026-01-10"
 END_DATE="2026-05-11"
 EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
-BATCH_SIZE=4
+BATCH_SIZE=1                     # Only one snapshot for debugging
 STATE_FILE="backfill-progress.json"
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 R2_STATE_PATH="backfill-progress.json"
 
-# Tile range
 X_START=1225
 X_END=1231
 Y_START=513
 Y_END=518
-TILE_COLS=$((X_END - X_START + 1))
-TILE_ROWS=$((Y_END - Y_START + 1))
-
-# Hardcoded tile path pattern (based on common murolem archive structure)
-TILE_PATH_PATTERN="%d/%d.png"
 
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 AUTH_HEADER=()
@@ -77,31 +71,14 @@ date_from_tag() {
     echo "$tag" | sed 's/world-//' | sed 's/T/_/' | sed 's/-//g' | sed 's/\..*//'
 }
 
-process_release() {
+process_release_debug() {
     local tag_name="$1"
     local snap_date=$(date_from_tag "$tag_name")
     local snapshot_name="a_wdpsnapshot_${snap_date}.png"
     
-    echo "--- Processing $tag_name -> $snapshot_name"
+    echo "--- DEBUG: Processing $tag_name -> $snapshot_name"
     
-    # Skip if already exists
-    if rclone ls "r2:$R2_BUCKET/" | grep -q "$snapshot_name"; then
-        echo "  Already exists in R2, skipping."
-        return 0
-    fi
-    
-    # Build expected tile paths using the hardcoded pattern
-    local tile_paths=()
-    for x in $(seq $X_START $X_END); do
-        for y in $(seq $Y_START $Y_END); do
-            tile_paths+=("$(printf "$TILE_PATH_PATTERN" "$x" "$y")")
-        done
-    done
-    
-    local temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" RETURN
-    
-    # Fetch asset URLs (split tarballs)
+    # Fetch asset URLs
     local asset_urls=()
     while IFS= read -r url; do
         asset_urls+=("$url")
@@ -112,48 +89,19 @@ process_release() {
         return 1
     fi
     
-    mkdir -p "$temp_dir/tiles"
-    # Stream all parts and extract only the needed tiles
+    echo "  Downloading and listing first 30 files from the concatenated archive..."
+    # Stream all parts, list contents (first 30 lines)
     (
         for url in "${asset_urls[@]}"; do
             curl -s --fail "$url"
         done
-    ) | tar -xz -C "$temp_dir/tiles" --wildcards "${tile_paths[@]}" 2>/dev/null || true
+    ) | tar -tzf - 2>/dev/null | head -30
     
-    # Count extracted tiles
-    extracted_count=$(find "$temp_dir/tiles" -name "*.png" | wc -l)
-    if [[ $extracted_count -eq 0 ]]; then
-        echo "  ERROR: No tiles extracted. Pattern may be wrong."
-        echo "  Expected pattern: $TILE_PATH_PATTERN"
-        return 1
-    fi
-    echo "  Extracted $extracted_count tiles (expected 42)."
+    echo ""
+    echo "  If the listing above is empty, the archive may be corrupted or not a valid tar.gz."
+    echo "  If you see paths, please note the directory structure (e.g., '1225/513.png' or 'tiles/1225/513.png')."
+    echo "  Then we will adjust the TILE_PATH_PATTERN accordingly."
     
-    # Build montage command
-    local tile_files=()
-    for y in $(seq $Y_START $Y_END); do
-        for x in $(seq $X_START $X_END); do
-            local path="$temp_dir/tiles/$(printf "$TILE_PATH_PATTERN" "$x" "$y")"
-            tile_files+=("$path")
-        done
-    done
-    
-    # Create missing tiles as transparent placeholders
-    for tf in "${tile_files[@]}"; do
-        if [[ ! -f "$tf" ]]; then
-            mkdir -p "$(dirname "$tf")"
-            convert -size 1000x1000 xc:none "$tf"
-        fi
-    done
-    
-    # Stitch
-    montage "${tile_files[@]}" -tile ${TILE_COLS}x${TILE_ROWS} -geometry 1000x1000+0+0 "$temp_dir/stitched.png"
-    pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
-    
-    # Upload to R2 with a_ prefix
-    rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
-    
-    echo "  ✓ Successfully uploaded $snapshot_name (no manifest update)"
     return 0
 }
 
@@ -161,19 +109,10 @@ process_release() {
 # MAIN
 # ============================
 
-if rclone cat "r2:$R2_BUCKET/$R2_STATE_PATH" 2>/dev/null > "$STATE_FILE"; then
-    last_processed=$(jq -r '.last_processed_tag' "$STATE_FILE")
-    processed_count=$(jq -r '.processed_count' "$STATE_FILE")
-else
-    last_processed=""
-    processed_count=0
-    echo '{"last_processed_tag": "", "processed_count": 0}' > "$STATE_FILE"
-fi
+# Load state (ignore for debug, start fresh)
+echo "Debug mode: will process only the first snapshot and list its contents."
 
-echo "Last processed tag: ${last_processed:-none}"
-echo "Total processed so far: $processed_count"
-echo "Using tile path pattern: $TILE_PATH_PATTERN"
-
+# Fetch all releases
 echo "Fetching all releases from GitHub (paginated)..."
 all_releases=$(fetch_all_releases)
 if [[ -z "$all_releases" ]]; then
@@ -184,6 +123,7 @@ fi
 total_fetched=$(echo "$all_releases" | wc -l)
 echo "Fetched $total_fetched total releases."
 
+# Filter by date range (same as before)
 target_tags=()
 while IFS=$'|' read -r tag published; do
     pub_date="${published:0:10}"
@@ -211,42 +151,9 @@ if [[ $total_targets -eq 0 ]]; then
     exit 0
 fi
 
-start_idx=0
-if [[ -n "$last_processed" ]]; then
-    for i in "${!target_tags[@]}"; do
-        if [[ "${target_tags[$i]}" == "$last_processed" ]]; then
-            start_idx=$((i + 1))
-            break
-        fi
-    done
-fi
+# Take the first snapshot (most recent)
+first_tag="${target_tags[0]}"
+echo "Processing debug snapshot: $first_tag"
+process_release_debug "$first_tag"
 
-if [[ $start_idx -ge $total_targets ]]; then
-    echo "All snapshots already processed!"
-    exit 0
-fi
-
-echo "Resuming from index $start_idx (${target_tags[$start_idx]:-end})"
-
-processed_this_run=0
-for ((i=start_idx; i<total_targets && processed_this_run<BATCH_SIZE; i++)); do
-    tag="${target_tags[$i]}"
-    if process_release "$tag"; then
-        processed_this_run=$((processed_this_run + 1))
-        processed_count=$((processed_count + 1))
-        jq --arg tag "$tag" --argjson cnt "$processed_count" \
-            '.last_processed_tag = $tag | .processed_count = $cnt' "$STATE_FILE" > "$STATE_FILE.tmp"
-        mv "$STATE_FILE.tmp" "$STATE_FILE"
-        rclone copyto "$STATE_FILE" "r2:$R2_BUCKET/$R2_STATE_PATH"
-    else
-        echo "Failed to process $tag – stopping batch."
-        break
-    fi
-done
-
-echo "============================================="
-echo "Run finished. Processed $processed_this_run snapshots."
-echo "Total processed overall: $processed_count"
-if [[ $((start_idx + processed_this_run)) -ge $total_targets ]]; then
-    echo "🎉 All target snapshots have been backfilled!"
-fi
+echo "Debug complete. Script will now exit without uploading any files."
