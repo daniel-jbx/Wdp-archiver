@@ -255,7 +255,7 @@
   }
 
   // ---- Filtering ----
-  let currentInterval = 180;
+  let currentInterval = parseInt(intervalSelect.value, 10);
 
 function buildFilteredList(anchorName = null) {
   const intervalSec = currentInterval * 60;
