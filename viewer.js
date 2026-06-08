@@ -257,99 +257,118 @@
   // ---- Filtering ----
   let currentInterval = 180;
 
-  function buildFilteredList(anchorName = null) {
-    const intervalSec = currentInterval * 60;
-    if (intervalSec <= 0 || allSnapshots.length === 0) {
-      filteredSnapshots = [];
-      slider.max = 0;
-      timestampLabelTop.textContent = 'Invalid interval or no snapshots';
-      return;
-    }
-
+function buildFilteredList(anchorName = null) {
+  const intervalSec = currentInterval * 60;
+  
+  // Handle "all" interval (0) - show all snapshots in chronological order
+  if (intervalSec <= 0 || allSnapshots.length === 0) {
     const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
     candidates.sort((a, b) => a.epoch - b.epoch);
-
-    let anchorIndex;
-    if (anchorName !== null) {
-      anchorIndex = candidates.findIndex(c => c.name === anchorName);
-      if (anchorIndex === -1) anchorIndex = candidates.length - 1;
-    } else {
-      anchorIndex = candidates.length - 1;
-    }
-
-    const selected = new Map();
-    selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
-
-    // Forward direction
-    let lastEpochFwd = candidates[anchorIndex].epoch;
-    let targetFwd = lastEpochFwd + intervalSec;
-    let searchIdxFwd = anchorIndex + 1;
-    while (searchIdxFwd < candidates.length) {
-      let bestIdx = -1;
-      let bestDiff = Infinity;
-      for (let i = searchIdxFwd; i < candidates.length; i++) {
-        const diff = Math.abs(candidates[i].epoch - targetFwd);
-        if (diff > intervalSec / 2 && bestIdx !== -1) break;
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx === -1) break;
-      const best = candidates[bestIdx];
-      if (!selected.has(best.epoch)) {
-        selected.set(best.epoch, best.name);
-        lastEpochFwd = best.epoch;
-        targetFwd = lastEpochFwd + intervalSec;
-        searchIdxFwd = bestIdx + 1;
-      } else {
-        searchIdxFwd = bestIdx + 1;
-      }
-    }
-
-    // Backward direction
-    let lastEpochBwd = candidates[anchorIndex].epoch;
-    let targetBwd = lastEpochBwd - intervalSec;
-    let searchIdxBwd = anchorIndex - 1;
-    while (searchIdxBwd >= 0) {
-      let bestIdx = -1;
-      let bestDiff = Infinity;
-      for (let i = searchIdxBwd; i >= 0; i--) {
-        const diff = Math.abs(candidates[i].epoch - targetBwd);
-        if (diff > intervalSec / 2 && bestIdx !== -1) break;
-        if (diff < bestDiff) {
-          bestDiff = diff;
-          bestIdx = i;
-        }
-      }
-      if (bestIdx === -1) break;
-      const best = candidates[bestIdx];
-      if (!selected.has(best.epoch)) {
-        selected.set(best.epoch, best.name);
-        lastEpochBwd = best.epoch;
-        targetBwd = lastEpochBwd - intervalSec;
-        searchIdxBwd = bestIdx - 1;
-      } else {
-        searchIdxBwd = bestIdx - 1;
-      }
-    }
-
-    const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
-    filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
-
+    filteredSnapshots = candidates.map(c => c.name);
     sliderValueToName = {};
     filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
     slider.max = filteredSnapshots.length - 1;
-
+    
     if (filteredSnapshots.length === 0) {
-      timestampLabelTop.textContent = 'No snapshots match interval.';
+      timestampLabelTop.textContent = 'No snapshots found.';
       return;
     }
-
-    let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
-    if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
+    
+    // Find anchor index if provided
+    let targetIdx = filteredSnapshots.length - 1;
+    if (anchorName !== null) {
+      const idx = filteredSnapshots.indexOf(anchorName);
+      if (idx !== -1) targetIdx = idx;
+    }
     loadFilteredSnapshot(targetIdx);
+    return;
   }
+
+  // Regular interval-based filtering
+  const candidates = allSnapshots.map(name => ({ name, epoch: getEpoch(name) }));
+  candidates.sort((a, b) => a.epoch - b.epoch);
+
+  let anchorIndex;
+  if (anchorName !== null) {
+    anchorIndex = candidates.findIndex(c => c.name === anchorName);
+    if (anchorIndex === -1) anchorIndex = candidates.length - 1;
+  } else {
+    anchorIndex = candidates.length - 1;
+  }
+
+  const selected = new Map();
+  selected.set(candidates[anchorIndex].epoch, candidates[anchorIndex].name);
+
+  // Forward direction
+  let lastEpochFwd = candidates[anchorIndex].epoch;
+  let targetFwd = lastEpochFwd + intervalSec;
+  let searchIdxFwd = anchorIndex + 1;
+  while (searchIdxFwd < candidates.length) {
+    let bestIdx = -1;
+    let bestDiff = Infinity;
+    for (let i = searchIdxFwd; i < candidates.length; i++) {
+      const diff = Math.abs(candidates[i].epoch - targetFwd);
+      if (diff > intervalSec / 2 && bestIdx !== -1) break;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) break;
+    const best = candidates[bestIdx];
+    if (!selected.has(best.epoch)) {
+      selected.set(best.epoch, best.name);
+      lastEpochFwd = best.epoch;
+      targetFwd = lastEpochFwd + intervalSec;
+      searchIdxFwd = bestIdx + 1;
+    } else {
+      searchIdxFwd = bestIdx + 1;
+    }
+  }
+
+  // Backward direction
+  let lastEpochBwd = candidates[anchorIndex].epoch;
+  let targetBwd = lastEpochBwd - intervalSec;
+  let searchIdxBwd = anchorIndex - 1;
+  while (searchIdxBwd >= 0) {
+    let bestIdx = -1;
+    let bestDiff = Infinity;
+    for (let i = searchIdxBwd; i >= 0; i--) {
+      const diff = Math.abs(candidates[i].epoch - targetBwd);
+      if (diff > intervalSec / 2 && bestIdx !== -1) break;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestIdx = i;
+      }
+    }
+    if (bestIdx === -1) break;
+    const best = candidates[bestIdx];
+    if (!selected.has(best.epoch)) {
+      selected.set(best.epoch, best.name);
+      lastEpochBwd = best.epoch;
+      targetBwd = lastEpochBwd - intervalSec;
+      searchIdxBwd = bestIdx - 1;
+    } else {
+      searchIdxBwd = bestIdx - 1;
+    }
+  }
+
+  const sortedEpochs = Array.from(selected.keys()).sort((a, b) => a - b);
+  filteredSnapshots = sortedEpochs.map(epoch => selected.get(epoch));
+
+  sliderValueToName = {};
+  filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+  slider.max = filteredSnapshots.length - 1;
+
+  if (filteredSnapshots.length === 0) {
+    timestampLabelTop.textContent = 'No snapshots match interval.';
+    return;
+  }
+
+  let targetIdx = filteredSnapshots.indexOf(candidates[anchorIndex].name);
+  if (targetIdx === -1) targetIdx = filteredSnapshots.length - 1;
+  loadFilteredSnapshot(targetIdx);
+}
 
   function loadFilteredSnapshot(idx) {
     if (idx < 0 || idx >= filteredSnapshots.length) return;
@@ -378,66 +397,83 @@
   };
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-  // ---- Initial snapshot loading with datetime-local picker ----
+  // ---- Initial snapshot loading with date picker + time dropdown ----
   fetch('https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/snapshots.json')
     .then(r => r.json())
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
       allSnapshots = files;
 
-      // Build map of datetime string -> filename
-      const snapshotsByDatetime = new Map(); // key: YYYY-MM-DDTHH:MM:SS, value: filename
+      // Build date -> snapshots map
+      const snapshotsByDate = new Map(); // key: YYYY-MM-DD, value: array of {filename, timeStr}
       
       for (const filename of allSnapshots) {
         const match = filename.match(/wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/);
         if (match) {
           const year = match[1], month = match[2], day = match[3];
           const hour = match[4], minute = match[5], second = match[6];
-          const datetimeKey = `${year}-${month}-${day}T${hour}:${minute}:${second}`;
-          snapshotsByDatetime.set(datetimeKey, filename);
+          const dateKey = `${year}-${month}-${day}`;
+          const timeStr = `${hour}:${minute}:${second}`;
+          if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
+          snapshotsByDate.get(dateKey).push({ filename, timeStr });
         }
       }
+      
+      // Sort each day's snapshots by time
+      for (const snaps of snapshotsByDate.values()) {
+        snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
+      }
 
-      const datetimePicker = document.getElementById('datetime-picker');
-      if (!datetimePicker) {
-        console.error('Datetime picker missing from HTML');
+      const datePicker = document.getElementById('date-picker');
+      const timeSelect = document.getElementById('time-select');
+      
+      if (!datePicker || !timeSelect) {
+        console.error('Date picker or time select missing from HTML');
         buildFilteredList(null);
         return;
       }
 
-      // Get all available datetimes, sorted
-      const datetimes = Array.from(snapshotsByDatetime.keys()).sort();
-      
-      if (datetimes.length) {
-        // Set min/max for the picker
-        datetimePicker.min = datetimes[0];
-        datetimePicker.max = datetimes[datetimes.length - 1];
-        // Default to latest
-        datetimePicker.value = datetimes[datetimes.length - 1];
+      // Populate date picker with all available dates
+      const dates = Array.from(snapshotsByDate.keys()).sort();
+      if (dates.length) {
+        datePicker.min = dates[0];
+        datePicker.max = dates[dates.length - 1];
+        datePicker.value = dates[dates.length - 1];
       }
 
-      // When datetime changes, load that snapshot
-      datetimePicker.addEventListener('change', () => {
-        const filename = snapshotsByDatetime.get(datetimePicker.value);
-        if (filename) {
-          buildFilteredList(filename);
-        } else {
-          // If exact match not found, find the closest available snapshot
-          const available = Array.from(snapshotsByDatetime.keys());
-          const closest = available.reduce((prev, curr) => {
-            return Math.abs(new Date(curr) - new Date(datetimePicker.value)) < 
-                   Math.abs(new Date(prev) - new Date(datetimePicker.value)) ? curr : prev;
-          });
-          datetimePicker.value = closest;
-          buildFilteredList(snapshotsByDatetime.get(closest));
+      function updateTimeSelect(dateValue) {
+        const snaps = snapshotsByDate.get(dateValue);
+        if (!snaps || snaps.length === 0) {
+          timeSelect.style.display = 'none';
+          return;
         }
+        timeSelect.style.display = 'inline-block';
+        timeSelect.innerHTML = '<option value="">Select time...</option>';
+        for (const snap of snaps) {
+          const opt = document.createElement('option');
+          opt.value = snap.filename;
+          opt.textContent = snap.timeStr;
+          timeSelect.appendChild(opt);
+        }
+      }
+
+      datePicker.addEventListener('change', () => {
+        updateTimeSelect(datePicker.value);
+        timeSelect.value = '';
       });
 
-      // Initialize with latest snapshot
-      if (datetimePicker.value) {
-        const filename = snapshotsByDatetime.get(datetimePicker.value);
-        if (filename) {
-          buildFilteredList(filename);
+      timeSelect.addEventListener('change', () => {
+        const filename = timeSelect.value;
+        if (filename) buildFilteredList(filename);
+      });
+
+      // Initialize
+      if (datePicker.value) {
+        updateTimeSelect(datePicker.value);
+        const snaps = snapshotsByDate.get(datePicker.value);
+        if (snaps && snaps.length) {
+          timeSelect.value = snaps[snaps.length - 1].filename;
+          buildFilteredList(timeSelect.value);
         } else {
           buildFilteredList(null);
         }
@@ -446,7 +482,6 @@
       }
     })
     .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
-
   // ---- Interval dropdown ----
   intervalSelect.addEventListener('change', () => {
     currentInterval = parseInt(intervalSelect.value);
