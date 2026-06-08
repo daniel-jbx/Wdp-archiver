@@ -4,7 +4,6 @@ set -euo pipefail
 START_DATE="2026-01-10"
 END_DATE="2026-05-11"
 EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
-R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
 AUTH_HEADER=()
@@ -12,7 +11,7 @@ if [[ -n "$GITHUB_TOKEN" ]]; then
     AUTH_HEADER=(-H "Authorization: token $GITHUB_TOKEN")
 fi
 
-for tool in curl jq tar xxd; do
+for tool in curl jq strings; do
     if ! command -v "$tool" &>/dev/null; then
         echo "Missing required tool: $tool"
         exit 1
@@ -20,7 +19,7 @@ for tool in curl jq tar xxd; do
 done
 
 # Fetch the most recent release in the date range
-echo "Fetching all releases..."
+echo "Fetching releases..."
 all_releases=$(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases?per_page=100" | jq -r '.[] | "\(.tag_name)|\(.published_at)"')
 target_tags=()
 while IFS='|' read -r tag published; do
@@ -38,40 +37,35 @@ while IFS='|' read -r tag published; do
     fi
 done <<< "$all_releases"
 
-# Pick the most recent (first after sort -r)
 IFS=$'\n' target_tags=($(sort -r <<<"${target_tags[*]}"))
 first_tag="${target_tags[0]}"
 echo "Debug snapshot: $first_tag"
 
-# Fetch asset URLs for this release
-asset_urls=()
-while IFS= read -r url; do
-    asset_urls+=("$url")
-done < <(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$first_tag" | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
-
-if [[ ${#asset_urls[@]} -eq 0 ]]; then
-    echo "ERROR: No split tarballs found."
+# Get the first split part URL (aa)
+asset_url=$(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$first_tag" | jq -r '.assets[] | select(.name | endswith(".tar.gz.aa")) | .browser_download_url')
+if [[ -z "$asset_url" ]]; then
+    echo "ERROR: No .aa split part found."
     exit 1
 fi
+echo "First part URL: $asset_url"
 
-echo "Downloading ${#asset_urls[@]} split parts with redirect following..."
+echo "Downloading first 2 MB of this part (no full download)..."
 temp_file=$(mktemp)
-for url in "${asset_urls[@]}"; do
-    echo "  $url"
-    curl -L -s --fail "$url" >> "$temp_file"
-    # Check that we actually downloaded something
-    size=$(stat -c%s "$temp_file" 2>/dev/null || stat -f%z "$temp_file" 2>/dev/null || echo "0")
-    echo "  Current total size: $size bytes"
-done
+curl -L -s --fail -r 0-2097152 "$asset_url" -o "$temp_file"
 
-echo "Checking file type..."
+echo "File type:"
 file "$temp_file"
-echo "First 100 bytes (hexdump):"
-xxd -l 100 "$temp_file"
 
-echo "Attempting to list tar contents..."
-tar -tzf "$temp_file" 2>&1 | head -30 || {
-    echo "tar command failed. The archive might be corrupted or not a valid tar.gz."
-}
+echo "First 100 bytes (hexdump):"
+xxd -l 100 "$temp_file" || true
+
+echo "Attempting to list filenames from partial tarball (may show first few files)..."
+if tar -tzf "$temp_file" 2>/dev/null | head -30; then
+    echo "Successfully listed some entries."
+else
+    echo "tar failed. Using 'strings' to grep for potential tile paths..."
+    strings "$temp_file" | grep -E '[0-9]{3,4}/[0-9]{3,4}\.png' | head -30
+fi
 
 rm "$temp_file"
+echo "Debug complete. No full downloads were performed."
