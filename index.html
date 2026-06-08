@@ -11,19 +11,21 @@
   <canvas id="sel-canvas"></canvas>
 
   <div id="top-bar">
-    <div id="interval-group">
-      <label for="interval-select" style="font-size:0.8rem;">Interval:</label>
+    <div id="selector-group">
       <select id="interval-select">
         <option value="1440">1 day</option>
         <option value="360">6 hrs</option>
-        <option value="180">3 hrs</option>
         <option value="60" selected>1 hr</option>
-        <option value="30">30 min</option>
         <option value="15">15 min</option>
         <option value="0">all</option>
       </select>
+      <div id="date-group">
+        <input type="date" id="date-picker">
+        <select id="time-select" style="display:none;">
+          <option value="">Select time...</option>
+        </select>
+      </div>
     </div>
-    <input type="datetime-local" id="datetime-picker" step="1">
     <span id="timestamp-label-top">--</span>
     <div id="download-group">
       <button class="dl-btn" id="dl-snapshot">snapshot png</button>
