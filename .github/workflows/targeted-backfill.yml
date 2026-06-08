@@ -1,7 +1,9 @@
 name: Targeted Backfill (Jan 10 – May 11 + May 26-28)
 
 on:
-  workflow_dispatch:   # allows manual trigger from GitHub UI
+  schedule:
+    - cron: '20 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   backfill:
@@ -27,15 +29,17 @@ jobs:
           secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
           endpoint = ${{ secrets.R2_ENDPOINT }}
           acl = private
+          no_check_bucket = true
+          bucket = ${{ secrets.R2_BUCKET }}
           EOF
 
       - name: Run backfill script
         env:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # automatically provided by Actions
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash targeted-backfill.sh
 
-      - name: Upload progress state (for debugging)
+      - name: Upload progress state
         if: always()
         uses: actions/upload-artifact@v4
         with:
