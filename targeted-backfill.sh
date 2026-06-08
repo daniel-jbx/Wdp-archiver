@@ -2,12 +2,12 @@
 set -euo pipefail
 
 # ============================
-# CONFIGURATION (TEST PHASE)
+# CONFIGURATION (May 26–29)
 # ============================
-START_DATE="2026-01-10"
-END_DATE="2026-05-11"
-EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
-BATCH_SIZE=4
+START_DATE="2026-05-26"
+END_DATE="2026-05-29"
+EXTRA_DATES=()   # not needed, already in range
+BATCH_SIZE=50    # enough to process all ~24 snapshots in one run
 STATE_FILE="backfill-progress.json"
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 R2_STATE_PATH="backfill-progress.json"
@@ -73,15 +73,32 @@ date_from_tag() {
     echo "$tag" | sed 's/world-//' | sed 's/T/_/' | sed 's/-//g' | sed 's/\..*//'
 }
 
+# Ensure snapshots.json is a valid JSON array
+ensure_valid_manifest() {
+    local tmp_manifest=$(mktemp)
+    if rclone cat "r2:$R2_BUCKET/snapshots.json" 2>/dev/null > "$tmp_manifest"; then
+        if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
+            echo "  WARNING: snapshots.json is corrupted. Backing up and resetting."
+            rclone copyto "$tmp_manifest" "r2:$R2_BUCKET/snapshots.json.corrupted.$(date +%s)"
+            echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
+        fi
+    else
+        echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
+    fi
+    rm -f "$tmp_manifest"
+}
+
 process_release() {
     local tag_name="$1"
     local snap_date=$(date_from_tag "$tag_name")
-    local snapshot_name="a_wdpsnapshot_${snap_date}.png"
+    local snapshot_name="wdpsnapshot_${snap_date}.png"
     
     echo "--- Processing $tag_name -> $snapshot_name"
     
-    if rclone ls "r2:$R2_BUCKET/" | grep -q "$snapshot_name"; then
-        echo "  Already exists in R2, skipping."
+    # Skip if already in manifest
+    ensure_valid_manifest
+    if rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r ".[].filename" | grep -qx "$snapshot_name"; then
+        echo "  Already exists in snapshots.json, skipping."
         return 0
     fi
     
@@ -115,11 +132,10 @@ process_release() {
         done
     ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
     
-    # Count extracted tiles
     extracted_count=$(find "$temp_dir/tiles" -name "*.png" 2>/dev/null | wc -l)
     echo "  Extracted $extracted_count tiles (up to 42). Missing tiles will be transparent placeholders."
     
-    # Build list of expected tile files (relative to temp_dir/tiles)
+    # Build expected tile files
     local tile_files=()
     for y in $(seq $Y_START $Y_END); do
         for x in $(seq $X_START $X_END); do
@@ -127,7 +143,7 @@ process_release() {
         done
     done
     
-    # Create transparent placeholders for missing ones
+    # Create transparent placeholders for missing
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
@@ -142,7 +158,14 @@ process_release() {
     # Upload to R2
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
-    echo "  ✓ Successfully uploaded $snapshot_name (no manifest update)"
+    # Update snapshots.json (append new entry)
+    local iso_timestamp=$(date -d "${tag_name//world-/}" -Iseconds 2>/dev/null || echo "1970-01-01T00:00:00Z")
+    local manifest_tmp=$(mktemp)
+    rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
+    jq --arg name "$snapshot_name" --arg ts "$iso_timestamp" '. += [{"filename": $name, "timestamp": $ts}]' "$manifest_tmp" > "$manifest_tmp.new"
+    rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/snapshots.json"
+    
+    echo "  ✓ Successfully uploaded $snapshot_name and updated snapshots.json"
     return 0
 }
 
@@ -175,25 +198,17 @@ echo "Fetched $total_fetched total releases."
 target_tags=()
 while IFS=$'|' read -r tag published; do
     pub_date="${published:0:10}"
-    if [[ "$pub_date" > "$START_DATE" || "$pub_date" == "$START_DATE" ]] && \
-       [[ "$pub_date" < "$END_DATE" || "$pub_date" == "$END_DATE" ]]; then
+    if [[ "$pub_date" >= "$START_DATE" && "$pub_date" <= "$END_DATE" ]]; then
         target_tags+=("$tag")
-    else
-        for extra in "${EXTRA_DATES[@]}"; do
-            if [[ "$pub_date" == "$extra" ]]; then
-                target_tags+=("$tag")
-                break
-            fi
-        done
     fi
 done <<< "$all_releases"
 
-# Newest first
-IFS=$'\n' target_tags=($(sort -r <<<"${target_tags[*]}"))
+# Sort chronologically (oldest first – better for viewer timeline)
+IFS=$'\n' target_tags=($(sort <<<"${target_tags[*]}"))
 unset IFS
 
 total_targets=${#target_tags[@]}
-echo "Total snapshots in date range: $total_targets"
+echo "Total snapshots in date range ($START_DATE to $END_DATE): $total_targets"
 if [[ $total_targets -eq 0 ]]; then
     echo "No releases in target date range."
     exit 0
