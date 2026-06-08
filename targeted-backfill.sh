@@ -11,6 +11,9 @@ STATE_FILE="backfill-progress.json"
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 R2_STATE_PATH="backfill-progress.json"
 
+# Special single-snapshot date
+SINGLE_SNAPSHOT_DATE="2026-05-29"
+
 X_START=1225
 X_END=1231
 Y_START=513
@@ -54,8 +57,8 @@ fetch_all_releases() {
             break
         fi
         while IFS=$'\t' read -r tag published; do
-            all_entries+=("$tag|$published")
-        done < <(jq -r '.[] | [.tag_name, .published_at] | @tsv' "$response_file")
+            all_entries+=("$tag")
+        done < <(jq -r '.[] | .tag_name' "$response_file")
         rm "$response_file"
         ((page++))
         if [[ $page -gt 200 ]]; then
@@ -73,7 +76,6 @@ date_from_tag() {
 }
 
 ensure_valid_manifest() {
-    # Ensure snapshots.json exists and is an array of strings.
     local tmp_manifest=$(mktemp)
     if rclone cat "r2:$R2_BUCKET/snapshots.json" 2>/dev/null > "$tmp_manifest"; then
         if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
@@ -93,10 +95,18 @@ process_release() {
     
     echo "--- Processing $tag_name -> $snapshot_name"
     
-    # Skip if filename already in manifest (plain string check)
+    # Skip if already exists (check both manifest and bucket)
     ensure_valid_manifest
     if rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r '.[]' | grep -qx "$snapshot_name"; then
-        echo "  Already exists in snapshots.json, skipping."
+        echo "  Already in snapshots.json, skipping."
+        return 0
+    fi
+    if rclone ls "r2:$R2_BUCKET/" | grep -q "$snapshot_name"; then
+        echo "  File already exists in R2 (but not in manifest). Adding to manifest and skipping."
+        local manifest_tmp=$(mktemp)
+        rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
+        jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
+        rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/snapshots.json"
         return 0
     fi
     
@@ -130,8 +140,9 @@ process_release() {
     ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
     
     extracted_count=$(find "$temp_dir/tiles" -name "*.png" 2>/dev/null | wc -l)
-    echo "  Extracted $extracted_count tiles (up to 42). Missing tiles → placeholders."
+    echo "  Extracted $extracted_count tiles (up to 42). Missing tiles will be transparent."
     
+    # Build expected tile files
     local tile_files=()
     for y in $(seq $Y_START $Y_END); do
         for x in $(seq $X_START $X_END); do
@@ -139,16 +150,20 @@ process_release() {
         done
     done
     
+    # Create transparent placeholders for missing
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
-            convert -size 1000x1000 xc:none "$tf"
+            # Force fully transparent PNG
+            convert -size 1000x1000 xc:none PNG32:"$tf"
         fi
     done
     
+    # Stitch
     montage "${tile_files[@]}" -tile ${TILE_COLS}x${TILE_ROWS} -geometry 1000x1000+0+0 "$temp_dir/stitched.png"
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
     
+    # Upload to R2
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
     # Append filename to snapshots.json (plain string)
@@ -162,9 +177,10 @@ process_release() {
 }
 
 # ============================
-# MAIN – Process one entire day (all snapshots for a single date)
+# MAIN – Process one date per run (newest first)
 # ============================
 
+# Load state
 if rclone cat "r2:$R2_BUCKET/$R2_STATE_PATH" 2>/dev/null > "$STATE_FILE"; then
     last_processed_date=$(jq -r '.last_processed_date' "$STATE_FILE")
     processed_count=$(jq -r '.processed_count' "$STATE_FILE")
@@ -175,34 +191,60 @@ else
 fi
 
 echo "Last processed date: ${last_processed_date:-none}"
-echo "Total days processed: $processed_count"
+echo "Total dates processed: $processed_count"
 
+# Fetch all tags
 echo "Fetching all releases from GitHub (paginated)..."
-all_releases=$(fetch_all_releases)
-if [[ -z "$all_releases" ]]; then
+all_tags=$(fetch_all_releases)
+if [[ -z "$all_tags" ]]; then
     echo "ERROR: No releases found."
     exit 1
 fi
 
-total_fetched=$(echo "$all_releases" | wc -l)
-echo "Fetched $total_fetched total releases."
+total_tags=$(echo "$all_tags" | wc -l)
+echo "Fetched $total_tags total releases."
 
-# Build list of (date, tag) pairs for the target range
+# Group tags by date extracted from tag name
 declare -A day_tags
-while IFS=$'|' read -r tag published; do
-    pub_date="${published:0:10}"
+for tag in $all_tags; do
+    # Extract YYYY-MM-DD from tag name
+    tag_date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
+    if [[ -z "$tag_date" ]]; then
+        echo "Warning: could not parse date from tag $tag"
+        continue
+    fi
     # Check if date is in main range or extra dates
-    if [[ ( "$pub_date" > "$START_DATE" || "$pub_date" == "$START_DATE" ) && ( "$pub_date" < "$END_DATE" || "$pub_date" == "$END_DATE" ) ]]; then
-        day_tags["$pub_date"]+="$tag|"
+    if [[ ( "$tag_date" > "$START_DATE" || "$tag_date" == "$START_DATE" ) && ( "$tag_date" < "$END_DATE" || "$tag_date" == "$END_DATE" ) ]]; then
+        day_tags["$tag_date"]+="$tag|"
     else
         for extra in "${EXTRA_DATES[@]}"; do
-            if [[ "$pub_date" == "$extra" ]]; then
-                day_tags["$pub_date"]+="$tag|"
+            if [[ "$tag_date" == "$extra" ]]; then
+                day_tags["$tag_date"]+="$tag|"
                 break
             fi
         done
     fi
-done <<< "$all_releases"
+done
+
+# Add the special single-snapshot date (only the oldest snapshot of that day)
+if [[ -n "$SINGLE_SNAPSHOT_DATE" ]]; then
+    # Find all tags for that date (if any)
+    single_tags=""
+    for tag in $all_tags; do
+        if [[ "$tag" == world-$SINGLE_SNAPSHOT_DATE* ]]; then
+            single_tags+="$tag|"
+        fi
+    done
+    if [[ -n "$single_tags" ]]; then
+        # Get the oldest (smallest timestamp) snapshot for that date
+        # Tags are like world-2026-05-29T00-00-... (earliest = smallest after T)
+        oldest_tag=$(echo "$single_tags" | tr '|' '\n' | sort | head -1)
+        day_tags["$SINGLE_SNAPSHOT_DATE"]="$oldest_tag|"
+        echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $oldest_tag"
+    else
+        echo "Warning: No tags found for special date $SINGLE_SNAPSHOT_DATE"
+    fi
+fi
 
 # Get sorted list of dates (newest first)
 dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
@@ -214,7 +256,7 @@ if [[ $total_dates -eq 0 ]]; then
     exit 0
 fi
 
-# Find next date to process (after last_processed_date)
+# Find the next date to process (newest not yet completed)
 next_date=""
 for d in "${dates[@]}"; do
     if [[ -z "$last_processed_date" || "$d" < "$last_processed_date" ]]; then
@@ -232,13 +274,15 @@ echo "Processing all snapshots for date: $next_date"
 
 # Get all tags for this date
 IFS='|' read -ra tags <<< "${day_tags[$next_date]}"
-# Sort tags chronologically (oldest first within the day – order doesn't matter much)
-IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort))
+# Sort tags descending (newest first) – except for the special date we already have only one
+if [[ "$next_date" != "$SINGLE_SNAPSHOT_DATE" ]]; then
+    IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
+fi
 unset IFS
 
 echo "Found ${#tags[@]} snapshots for $next_date."
 
-# Process each snapshot for this date
+# Process each snapshot
 success_count=0
 for tag in "${tags[@]}"; do
     if process_release "$tag"; then
@@ -251,7 +295,7 @@ done
 
 echo "Processed $success_count / ${#tags[@]} snapshots for $next_date."
 
-# Update state
+# Update state only if all snapshots for the date succeeded
 if [[ $success_count -eq ${#tags[@]} ]]; then
     processed_count=$((processed_count + 1))
     jq --arg date "$next_date" --argjson cnt "$processed_count" \
