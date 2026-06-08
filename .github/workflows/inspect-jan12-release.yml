@@ -1,0 +1,142 @@
+name: Inspect Jan 12 Release (Full Download)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y curl jq
+
+      - name: Find Jan 12 release tag
+        id: find_tag
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          AUTH_HEADER=()
+          if [[ -n "$GITHUB_TOKEN" ]]; then
+            AUTH_HEADER=(-H "Authorization: token $GITHUB_TOKEN")
+          fi
+          # We want the release on 2026-01-12
+          TARGET_DATE="2026-01-12"
+          # Fetch all releases (paginated) and find the first matching tag
+          page=1
+          tag=""
+          while true; do
+            echo "Fetching page $page..." >&2
+            resp=$(curl -s "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases?page=$page&per_page=100")
+            if [[ "$(echo "$resp" | jq length)" -eq 0 ]]; then
+              break
+            fi
+            # Look for tag starting with world-2026-01-12
+            tag=$(echo "$resp" | jq -r '.[] | select(.tag_name | startswith("world-2026-01-12")) | .tag_name' | head -1)
+            if [[ -n "$tag" ]]; then
+              break
+            fi
+            ((page++))
+            sleep 0.5
+          done
+          if [[ -z "$tag" ]]; then
+            echo "No release found for 2026-01-12"
+            exit 1
+          fi
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "Found release: $tag"
+
+      - name: Download all split parts for that release
+        run: |
+          TAG="${{ steps.find_tag.outputs.tag }}"
+          echo "Downloading release $TAG"
+          # Fetch asset URLs (split tarballs)
+          asset_urls=$(curl -s -L -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$TAG" \
+            | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
+          temp_file=$(mktemp)
+          for url in $asset_urls; do
+            echo "Downloading $url"
+            curl -L --fail "$url" >> "$temp_file"
+          done
+          echo "Download complete. File size: $(du -h "$temp_file" | cut -f1)"
+          # Save the file path for subsequent steps
+          echo "ARCHIVE_PATH=$temp_file" >> $GITHUB_ENV
+
+      - name: List directory structure (first 200 entries)
+        run: |
+          echo "First 200 entries in the archive:"
+          tar -tzf "$ARCHIVE_PATH" | head -200
+
+      - name: Locate tile 1228/515.png
+        run: |
+          echo "Searching for 1228/515.png..."
+          result=$(tar -tzf "$ARCHIVE_PATH" | grep '1228/515\.png' | head -1)
+          if [[ -n "$result" ]]; then
+            echo "Found: $result"
+            echo "FULL_PATH=$result" >> $GITHUB_ENV
+          else
+            echo "ERROR: 1228/515.png not found in archive."
+            # Still list all directories to understand structure
+            echo "Top-level directories:"
+            tar -tzf "$ARCHIVE_PATH" | cut -d'/' -f1 | sort -u
+            exit 1
+          fi
+
+      - name: Extract only the 42 tiles (test extraction)
+        run: |
+          # Define your tile coordinates
+          X_START=1225
+          X_END=1231
+          Y_START=513
+          Y_END=518
+          # Determine the path pattern: e.g., if FULL_PATH is "2026-01-12T02-12-10.983Z+3h2m/1228/515.png"
+          # Then the top directory is the first component.
+          top_dir=$(echo "$FULL_PATH" | cut -d'/' -f1)
+          echo "Top directory: $top_dir"
+          # Build list of tile paths inside the archive (with top directory)
+          tile_paths=()
+          for x in $(seq $X_START $X_END); do
+            for y in $(seq $Y_START $Y_END); do
+              tile_paths+=("$top_dir/$x/$y.png")
+            done
+          done
+          # Create temp dir for extracted tiles
+          mkdir -p extracted_tiles
+          # Extract only those specific paths
+          tar -xzf "$ARCHIVE_PATH" -C extracted_tiles "${tile_paths[@]}"
+          # Count extracted
+          extracted_count=$(find extracted_tiles -name "*.png" | wc -l)
+          echo "Extracted $extracted_count tiles (expected 42)."
+          if [[ $extracted_count -eq 0 ]]; then
+            echo "No tiles extracted. Aborting."
+            exit 1
+          fi
+          # Stitch them (requires imagemagick, pngquant)
+          sudo apt-get update && sudo apt-get install -y imagemagick pngquant
+          TILE_COLS=$((X_END - X_START + 1))
+          TILE_ROWS=$((Y_END - Y_START + 1))
+          # Build montage command (row-major order)
+          tile_files=()
+          for y in $(seq $Y_START $Y_END); do
+            for x in $(seq $X_START $X_END); do
+              tile_files+=("extracted_tiles/$top_dir/$x/$y.png")
+            done
+          done
+          montage "${tile_files[@]}" -tile ${TILE_COLS}x${TILE_ROWS} -geometry 1000x1000+0+0 stitched.png
+          pngquant --quality=80-100 --speed=1 --force 64 stitched.png --output compressed.png
+          # Upload to R2 as test snapshot
+          rclone copyto compressed.png "r2:${{ secrets.R2_BUCKET }}/test_wdpsnapshot_20260112.png"
+          echo "Test snapshot uploaded as test_wdpsnapshot_20260112.png"
+
+      - name: Upload archive listing as artifact (for reference)
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-listing
+          path: |
+            ${{ env.ARCHIVE_PATH }}.list
+        run: |
+          tar -tzf "$ARCHIVE_PATH" > archive.list
+          echo "ARCHIVE_LIST=archive.list" >> $GITHUB_ENV
+
+      - name: Cleanup
+        run: rm -f "$ARCHIVE_PATH"
