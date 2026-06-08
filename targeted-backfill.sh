@@ -108,6 +108,18 @@ process_release() {
             tile_patterns+=("*/$x/$y.png")
         done
     done
+
+    # DEBUG: for first snapshot, list archive contents (only once)
+if [[ -z "${DEBUG_DONE:-}" ]]; then
+    echo "  DEBUG: Listing first 20 entries from the concatenated archive (first 2MB)..."
+    (
+        for url in "${asset_urls[@]}"; do
+            curl -L -s --fail --range 0-2097152 "$url"
+            break  # only first part
+        done
+    ) | tar -tzf - 2>/dev/null | head -20
+    export DEBUG_DONE=1
+fi
     
     mkdir -p "$temp_dir/tiles"
     # Stream all parts and extract only needed tiles, stripping the top directory
