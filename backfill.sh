@@ -35,6 +35,38 @@ for tool in curl jq tar montage pngquant rclone; do
 done
 
 # ============================
+# LOCKING (mutex using R2)
+# ============================
+LOCK_FILE="backfill.lock"
+LOCK_TIMEOUT=3600  # maximum seconds to wait (1 hour)
+LOCK_RETRY_INTERVAL=30  # seconds between retries
+
+acquire_lock() {
+    local start_time=$(date +%s)
+    while true; do
+        # Try to create the lock file atomically
+        if rclone copyto /dev/null "r2:$R2_BUCKET/$LOCK_FILE" --ignore-existing 2>/dev/null; then
+            echo "Lock acquired."
+            # Write timestamp into lock file (optional)
+            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | rclone rcat "r2:$R2_BUCKET/$LOCK_FILE" 2>/dev/null || true
+            return 0
+        fi
+        local now=$(date +%s)
+        if (( now - start_time >= LOCK_TIMEOUT )); then
+            echo "ERROR: Timeout waiting for lock. Exiting."
+            exit 1
+        fi
+        echo "Lock held by another run. Waiting ${LOCK_RETRY_INTERVAL} seconds..."
+        sleep $LOCK_RETRY_INTERVAL
+    done
+}
+
+release_lock() {
+    echo "Releasing lock..."
+    rclone deletefile "r2:$R2_BUCKET/$LOCK_FILE" 2>/dev/null || true
+}
+
+# ============================
 # FUNCTIONS
 # ============================
 
@@ -186,6 +218,10 @@ process_release() {
 # ============================
 # MAIN – Process one date per run (newest first, no state file)
 # ============================
+
+# Acquire lock to prevent concurrent runs
+acquire_lock
+trap release_lock EXIT
 
 echo "Fetching all releases from GitHub (paginated)..."
 all_tags=$(fetch_all_releases)
