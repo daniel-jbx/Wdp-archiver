@@ -1,0 +1,34 @@
+name: List May 9–10 Snapshots
+
+on:
+  workflow_dispatch:
+
+jobs:
+  list:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          acl = private
+          no_check_bucket = true
+          bucket = ${{ secrets.R2_BUCKET }}
+          EOF
+
+      - name: List files for 2026-05-09 and 2026-05-10
+        run: |
+          echo "Files for 2026-05-09:"
+          rclone ls "r2:${{ secrets.R2_BUCKET }}/" --include "wdpsnapshot_20260509_*.png"
+          echo ""
+          echo "Files for 2026-05-10:"
+          rclone ls "r2:${{ secrets.R2_BUCKET }}/" --include "wdpsnapshot_20260510_*.png"
