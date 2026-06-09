@@ -5,14 +5,15 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-05-11"
-EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
+END_DATE="2026-04-15"
+EXTRA_DATES=()
 
 # Special single-snapshot date – exact tag for midnight 2026-05-29
 SINGLE_SNAPSHOT_DATE="2026-05-29"
 SPECIAL_TAG="world-2026-05-29T00-15-15.367Z"
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
+STATE_FILE="backfill-state.txt"   # single line with last completed date
 
 X_START=1225
 X_END=1231
@@ -99,7 +100,6 @@ process_release() {
     
     echo "--- Processing $tag_name -> $snapshot_name"
     
-    # Skip if already exists (check both manifest and bucket)
     ensure_valid_manifest
     if rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r '.[]' | grep -qx "$snapshot_name"; then
         echo "  Already in snapshots.json, skipping."
@@ -117,7 +117,6 @@ process_release() {
     local temp_dir=$(mktemp -d)
     trap "rm -rf '$temp_dir'" RETURN
     
-    # Fetch split part URLs
     local asset_urls=()
     while IFS= read -r url; do
         asset_urls+=("$url")
@@ -128,7 +127,6 @@ process_release() {
         return 1
     fi
     
-    # Build patterns for the 42 tiles (match any top directory)
     local tile_patterns=()
     for x in $(seq $X_START $X_END); do
         for y in $(seq $Y_START $Y_END); do
@@ -146,7 +144,6 @@ process_release() {
     extracted_count=$(find "$temp_dir/tiles" -name "*.png" 2>/dev/null | wc -l)
     echo "  Extracted $extracted_count tiles (up to 42). Missing tiles will be transparent."
     
-    # Build expected tile files
     local tile_files=()
     for y in $(seq $Y_START $Y_END); do
         for x in $(seq $X_START $X_END); do
@@ -154,7 +151,6 @@ process_release() {
         done
     done
     
-    # Create transparent placeholders for missing tiles
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
@@ -162,7 +158,6 @@ process_release() {
         fi
     done
     
-    # Stitch with transparent background
     montage -background none -alpha on "${tile_files[@]}" \
         -tile ${TILE_COLS}x${TILE_ROWS} \
         -geometry 1000x1000+0+0 \
@@ -182,20 +177,25 @@ process_release() {
 }
 
 # ============================
-# MAIN – Process one date per run
+# MAIN – State‑based progression (newest to oldest)
 # ============================
 
-echo "Fetching all releases from GitHub (paginated)..."
+# Read last completed date from state file
+if rclone cat "r2:$R2_BUCKET/$STATE_FILE" 2>/dev/null > /tmp/state; then
+    last_done=$(cat /tmp/state)
+else
+    last_done=""  # will start from the newest date
+fi
+echo "Last completed date: ${last_done:-none}"
+
+# Fetch all tags and group by date
+echo "Fetching all releases..."
 all_tags=$(fetch_all_releases)
 if [[ -z "$all_tags" ]]; then
     echo "ERROR: No releases found."
     exit 1
 fi
 
-total_tags=$(echo "$all_tags" | wc -l)
-echo "Fetched $total_tags total releases."
-
-# Group tags by date extracted from tag name
 declare -A day_tags
 for tag in $all_tags; do
     tag_date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
@@ -214,57 +214,52 @@ for tag in $all_tags; do
     fi
 done
 
-# Special date: hardcoded tag for 2026-05-29 midnight
+# Special date: hardcoded midnight snapshot
 day_tags["$SINGLE_SNAPSHOT_DATE"]="$SPECIAL_TAG|"
 echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $SPECIAL_TAG"
 
-# Get sorted list of dates (newest first)
-dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
-echo "Total unique dates in range: ${#dates[@]}"
+# Get all dates sorted newest first
+all_dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
 
-# Find the newest date that is NOT fully present in snapshots.json
-ensure_valid_manifest
-existing_snapshots=$(rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r '.[]' | sort)
-
-next_date=""
-for d in "${dates[@]}"; do
-    IFS='|' read -ra tags <<< "${day_tags[$d]}"
-    all_expected=""
-    for t in "${tags[@]}"; do
-        if [[ -n "$t" ]]; then
-            name=$(date_from_tag "$t")
-            all_expected+="wdpsnapshot_${name}.png"$'\n'
-        fi
-    done
-    missing=0
-    while IFS= read -r expected; do
-        if [[ -n "$expected" ]] && ! echo "$existing_snapshots" | grep -qxF "$expected"; then
-            missing=1
-            break
-        fi
-    done <<< "$all_expected"
-    if [[ $missing -eq 1 ]]; then
-        next_date="$d"
-        break
-    fi
-done
-
-if [[ -z "$next_date" ]]; then
-    echo "All dates in range are already fully processed."
+if [[ ${#all_dates[@]} -eq 0 ]]; then
+    echo "No dates in range."
     exit 0
 fi
 
-echo "Processing date: $next_date (newest incomplete date)"
+# Determine next date to process: the next older date after last_done
+next_date=""
+if [[ -z "$last_done" ]]; then
+    # Start from the newest date
+    next_date="${all_dates[0]}"
+else
+    # Find the date that is the next older than last_done
+    for d in "${all_dates[@]}"; do
+        if [[ "$d" < "$last_done" ]]; then
+            next_date="$d"
+            break
+        fi
+    done
+fi
 
+if [[ -z "$next_date" ]]; then
+    echo "All dates processed (no date older than $last_done)."
+    exit 0
+fi
+
+echo "Processing date: $next_date"
+
+# Get tags for this date
 IFS='|' read -ra tags <<< "${day_tags[$next_date]}"
-tags=(${tags[@]/#/})
+tags=(${tags[@]/#/})  # remove empties
 if [[ "$next_date" != "$SINGLE_SNAPSHOT_DATE" ]]; then
+    # For normal dates, sort newest first within the day (optional)
     IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
 fi
 unset IFS
 
 echo "Found ${#tags[@]} snapshots for $next_date."
 
+# Process all snapshots for this date
 success_count=0
 for tag in "${tags[@]}"; do
     if [[ -z "$tag" ]]; then
@@ -278,9 +273,10 @@ for tag in "${tags[@]}"; do
     fi
 done
 
-echo "Processed $success_count / ${#tags[@]} snapshots for $next_date."
 if [[ $success_count -eq ${#tags[@]} ]]; then
-    echo "✅ Completed date $next_date."
+    # Update state file with this date
+    echo "$next_date" | rclone rcat "r2:$R2_BUCKET/$STATE_FILE"
+    echo "✅ Completed date $next_date. State updated."
 else
-    echo "⚠️ Not all snapshots succeeded for $next_date. Rerun will retry the same date."
+    echo "⚠️ Not all snapshots succeeded. State not updated. Rerun will retry same date."
 fi
