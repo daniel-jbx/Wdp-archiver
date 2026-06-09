@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-05-10"
+END_DATE="2026-05-11"
 EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
 
 # Special single-snapshot date – exact tag for midnight 2026-05-29
@@ -33,38 +33,6 @@ for tool in curl jq tar montage pngquant rclone; do
         exit 1
     fi
 done
-
-# ============================
-# LOCKING (mutex using R2)
-# ============================
-LOCK_FILE="backfill.lock"
-LOCK_TIMEOUT=3600  # maximum seconds to wait (1 hour)
-LOCK_RETRY_INTERVAL=30  # seconds between retries
-
-acquire_lock() {
-    local start_time=$(date +%s)
-    while true; do
-        # Try to create the lock file atomically
-        if rclone copyto /dev/null "r2:$R2_BUCKET/$LOCK_FILE" --ignore-existing 2>/dev/null; then
-            echo "Lock acquired."
-            # Write timestamp into lock file (optional)
-            echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | rclone rcat "r2:$R2_BUCKET/$LOCK_FILE" 2>/dev/null || true
-            return 0
-        fi
-        local now=$(date +%s)
-        if (( now - start_time >= LOCK_TIMEOUT )); then
-            echo "ERROR: Timeout waiting for lock. Exiting."
-            exit 1
-        fi
-        echo "Lock held by another run. Waiting ${LOCK_RETRY_INTERVAL} seconds..."
-        sleep $LOCK_RETRY_INTERVAL
-    done
-}
-
-release_lock() {
-    echo "Releasing lock..."
-    rclone deletefile "r2:$R2_BUCKET/$LOCK_FILE" 2>/dev/null || true
-}
 
 # ============================
 # FUNCTIONS
@@ -194,18 +162,16 @@ process_release() {
         fi
     done
     
-    # Stitch with transparent background, output as 32‑bit PNG
+    # Stitch with transparent background
     montage -background none -alpha on "${tile_files[@]}" \
         -tile ${TILE_COLS}x${TILE_ROWS} \
         -geometry 1000x1000+0+0 \
         PNG32:"$temp_dir/stitched.png"
     
-    # Compress to 64 colors, preserving alpha
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
     
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
-    # Append filename to snapshots.json (plain string)
     local manifest_tmp=$(mktemp)
     rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
@@ -216,12 +182,8 @@ process_release() {
 }
 
 # ============================
-# MAIN – Process one date per run (newest first, no state file)
+# MAIN – Process one date per run
 # ============================
-
-# Acquire lock to prevent concurrent runs
-acquire_lock
-trap release_lock EXIT
 
 echo "Fetching all releases from GitHub (paginated)..."
 all_tags=$(fetch_all_releases)
@@ -266,7 +228,6 @@ existing_snapshots=$(rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r '.[]' | s
 
 next_date=""
 for d in "${dates[@]}"; do
-    # Get all expected snapshot names for this date
     IFS='|' read -ra tags <<< "${day_tags[$d]}"
     all_expected=""
     for t in "${tags[@]}"; do
@@ -275,7 +236,6 @@ for d in "${dates[@]}"; do
             all_expected+="wdpsnapshot_${name}.png"$'\n'
         fi
     done
-    # Check if all expected snapshots already exist in manifest
     missing=0
     while IFS= read -r expected; do
         if [[ -n "$expected" ]] && ! echo "$existing_snapshots" | grep -qxF "$expected"; then
@@ -296,11 +256,8 @@ fi
 
 echo "Processing date: $next_date (newest incomplete date)"
 
-# Get tags for this date
 IFS='|' read -ra tags <<< "${day_tags[$next_date]}"
-# Remove empty elements
 tags=(${tags[@]/#/})
-# Sort tags descending (newest first) – except special date
 if [[ "$next_date" != "$SINGLE_SNAPSHOT_DATE" ]]; then
     IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
 fi
@@ -308,7 +265,6 @@ unset IFS
 
 echo "Found ${#tags[@]} snapshots for $next_date."
 
-# Process each snapshot
 success_count=0
 for tag in "${tags[@]}"; do
     if [[ -z "$tag" ]]; then
