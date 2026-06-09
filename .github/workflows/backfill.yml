@@ -3,6 +3,10 @@ name: Backfill (Jan 10 – May 11 + May 26-28)
 on:
   workflow_dispatch:
 
+concurrency:
+  group: backfill
+  cancel-in-progress: false
+
 jobs:
   backfill:
     runs-on: ubuntu-latest
