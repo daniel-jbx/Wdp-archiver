@@ -9,8 +9,8 @@ END_DATE="2026-04-15"
 EXTRA_DATES=()
 
 # Special single-snapshot date – exact tag for midnight 2026-05-29
-SINGLE_SNAPSHOT_DATE="2026-05-29"
-SPECIAL_TAG="world-2026-05-29T00-15-15.367Z"
+SINGLE_SNAPSHOT_DATE=""
+SPECIAL_TAG=""
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 STATE_FILE="backfill-state.txt"   # single line with last completed date
