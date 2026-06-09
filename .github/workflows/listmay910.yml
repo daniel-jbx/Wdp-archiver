@@ -1,10 +1,10 @@
-name: List May 9–10 Snapshots
+name: Rename Specific Old Snapshots
 
 on:
   workflow_dispatch:
 
 jobs:
-  list:
+  rename:
     runs-on: ubuntu-latest
     steps:
       - name: Install rclone
@@ -25,10 +25,20 @@ jobs:
           bucket = ${{ secrets.R2_BUCKET }}
           EOF
 
-      - name: List files for 2026-05-09 and 2026-05-10
+      - name: Rename selected files
         run: |
-          echo "Files for 2026-05-09:"
-          rclone ls "r2:${{ secrets.R2_BUCKET }}/" --include "wdpsnapshot_20260509_*.png"
-          echo ""
-          echo "Files for 2026-05-10:"
-          rclone ls "r2:${{ secrets.R2_BUCKET }}/" --include "wdpsnapshot_20260510_*.png"
+          # Replace these with the actual filenames you want to hide
+          FILES_TO_RENAME=(
+            "wdpsnapshot_20260509_123456.png"
+            "wdpsnapshot_20260510_789012.png"
+          )
+          for file in "${FILES_TO_RENAME[@]}"; do
+            echo "Renaming $file -> old_$file"
+            rclone moveto "r2:${{ secrets.R2_BUCKET }}/$file" "r2:${{ secrets.R2_BUCKET }}/old_$file"
+          done
+
+      - name: Rebuild snapshots.json (only from remaining wdpsnapshot_*.png)
+        run: |
+          rclone lsjson "r2:${{ secrets.R2_BUCKET }}/" --files-only --include "wdpsnapshot_*.png" | jq -r 'map(.Name) | sort' > snapshots.json
+          rclone copyto snapshots.json "r2:${{ secrets.R2_BUCKET }}/snapshots.json"
+          echo "Updated snapshots.json"
