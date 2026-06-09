@@ -7,13 +7,12 @@ set -euo pipefail
 START_DATE="2026-01-10"
 END_DATE="2026-05-11"
 EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
-STATE_FILE="backfill-progress.json"
-R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
-R2_STATE_PATH="backfill-progress.json"
 
-# Special single-snapshot date – only the exact midnight snapshot
+# Special single-snapshot date – exact tag for midnight 2026-05-29
 SINGLE_SNAPSHOT_DATE="2026-05-29"
 SPECIAL_TAG="world-2026-05-29T00-15-15.367Z"
+
+R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 
 X_START=1225
 X_END=1231
@@ -80,7 +79,7 @@ ensure_valid_manifest() {
     local tmp_manifest=$(mktemp)
     if rclone cat "r2:$R2_BUCKET/snapshots.json" 2>/dev/null > "$tmp_manifest"; then
         if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
-            echo "  WARNING: snapshots.json corrupted. Resetting to empty array."
+            echo "WARNING: snapshots.json corrupted. Resetting to empty array."
             echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
         fi
     else
@@ -147,6 +146,7 @@ process_release() {
     extracted_count=$(find "$temp_dir/tiles" -name "*.png" 2>/dev/null | wc -l)
     echo "  Extracted $extracted_count tiles (up to 42). Missing tiles will be transparent."
     
+    # Build expected tile files
     local tile_files=()
     for y in $(seq $Y_START $Y_END); do
         for x in $(seq $X_START $X_END); do
@@ -154,19 +154,26 @@ process_release() {
         done
     done
     
-    # Create transparent placeholders for missing
+    # Create transparent placeholders for missing tiles
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
-            convert -size 1000x1000 xc:none PNG32:"$tf"
+            convert -size 1000x1000 canvas:transparent PNG32:"$tf"
         fi
     done
     
-    montage "${tile_files[@]}" -tile ${TILE_COLS}x${TILE_ROWS} -geometry 1000x1000+0+0 "$temp_dir/stitched.png"
+    # Stitch with transparent background, output as 32‑bit PNG
+    montage -background none -alpha on "${tile_files[@]}" \
+        -tile ${TILE_COLS}x${TILE_ROWS} \
+        -geometry 1000x1000+0+0 \
+        PNG32:"$temp_dir/stitched.png"
+    
+    # Compress to 64 colors, preserving alpha
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
     
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
+    # Append filename to snapshots.json (plain string)
     local manifest_tmp=$(mktemp)
     rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
@@ -177,23 +184,9 @@ process_release() {
 }
 
 # ============================
-# MAIN
+# MAIN – Process one date per run (newest first, no state file)
 # ============================
 
-# Load state
-if rclone cat "r2:$R2_BUCKET/$R2_STATE_PATH" 2>/dev/null > "$STATE_FILE"; then
-    last_processed_date=$(jq -r '.last_processed_date' "$STATE_FILE")
-    processed_count=$(jq -r '.processed_count' "$STATE_FILE")
-else
-    last_processed_date=""
-    processed_count=0
-    echo '{"last_processed_date": "", "processed_count": 0}' > "$STATE_FILE"
-fi
-
-echo "Last processed date: ${last_processed_date:-none}"
-echo "Total dates processed: $processed_count"
-
-# Fetch all tags
 echo "Fetching all releases from GitHub (paginated)..."
 all_tags=$(fetch_all_releases)
 if [[ -z "$all_tags" ]]; then
@@ -209,7 +202,6 @@ declare -A day_tags
 for tag in $all_tags; do
     tag_date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
     if [[ -z "$tag_date" ]]; then
-        echo "Warning: could not parse date from tag $tag"
         continue
     fi
     if [[ ( "$tag_date" > "$START_DATE" || "$tag_date" == "$START_DATE" ) && ( "$tag_date" < "$END_DATE" || "$tag_date" == "$END_DATE" ) ]]; then
@@ -225,42 +217,54 @@ for tag in $all_tags; do
 done
 
 # Special date: hardcoded tag for 2026-05-29 midnight
-if [[ -n "$SINGLE_SNAPSHOT_DATE" ]]; then
-    day_tags["$SINGLE_SNAPSHOT_DATE"]="$SPECIAL_TAG|"
-    echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $SPECIAL_TAG"
-fi
+day_tags["$SINGLE_SNAPSHOT_DATE"]="$SPECIAL_TAG|"
+echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $SPECIAL_TAG"
 
 # Get sorted list of dates (newest first)
 dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
-total_dates=${#dates[@]}
-echo "Total dates in range: $total_dates"
+echo "Total unique dates in range: ${#dates[@]}"
 
-if [[ $total_dates -eq 0 ]]; then
-    echo "No dates found in target range."
-    exit 0
-fi
+# Find the newest date that is NOT fully present in snapshots.json
+ensure_valid_manifest
+existing_snapshots=$(rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r '.[]' | sort)
 
-# Find the next date to process (newest not yet completed)
 next_date=""
 for d in "${dates[@]}"; do
-    if [[ -z "$last_processed_date" || "$d" < "$last_processed_date" ]]; then
+    # Get all expected snapshot names for this date
+    IFS='|' read -ra tags <<< "${day_tags[$d]}"
+    all_expected=""
+    for t in "${tags[@]}"; do
+        if [[ -n "$t" ]]; then
+            name=$(date_from_tag "$t")
+            all_expected+="wdpsnapshot_${name}.png"$'\n'
+        fi
+    done
+    # Check if all expected snapshots already exist in manifest
+    missing=0
+    while IFS= read -r expected; do
+        if [[ -n "$expected" ]] && ! echo "$existing_snapshots" | grep -qxF "$expected"; then
+            missing=1
+            break
+        fi
+    done <<< "$all_expected"
+    if [[ $missing -eq 1 ]]; then
         next_date="$d"
         break
     fi
 done
 
 if [[ -z "$next_date" ]]; then
-    echo "All dates have been processed."
+    echo "All dates in range are already fully processed."
     exit 0
 fi
 
-echo "Processing all snapshots for date: $next_date"
+echo "Processing date: $next_date (newest incomplete date)"
 
-# Get all tags for this date
+# Get tags for this date
 IFS='|' read -ra tags <<< "${day_tags[$next_date]}"
-# Remove any empty elements
+# Remove empty elements
 tags=(${tags[@]/#/})
-# Sort tags descending (newest first) – except for the special date we already have only one
+# Sort tags descending (newest first) – except special date
 if [[ "$next_date" != "$SINGLE_SNAPSHOT_DATE" ]]; then
     IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
 fi
@@ -272,7 +276,6 @@ echo "Found ${#tags[@]} snapshots for $next_date."
 success_count=0
 for tag in "${tags[@]}"; do
     if [[ -z "$tag" ]]; then
-        echo "Skipping empty tag."
         continue
     fi
     if process_release "$tag"; then
@@ -284,17 +287,8 @@ for tag in "${tags[@]}"; do
 done
 
 echo "Processed $success_count / ${#tags[@]} snapshots for $next_date."
-
-# Update state only if all snapshots for the date succeeded
 if [[ $success_count -eq ${#tags[@]} ]]; then
-    processed_count=$((processed_count + 1))
-    jq --arg date "$next_date" --argjson cnt "$processed_count" \
-        '.last_processed_date = $date | .processed_count = $cnt' "$STATE_FILE" > "$STATE_FILE.tmp"
-    mv "$STATE_FILE.tmp" "$STATE_FILE"
-    rclone copyto "$STATE_FILE" "r2:$R2_BUCKET/$R2_STATE_PATH"
     echo "✅ Completed date $next_date."
 else
-    echo "⚠️ Not all snapshots succeeded for $next_date. State not updated. Rerun will retry same date."
+    echo "⚠️ Not all snapshots succeeded for $next_date. Rerun will retry the same date."
 fi
-
-echo "============================================="
