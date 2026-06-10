@@ -1,18 +1,18 @@
 name: Move WDP snapshots from wdp/ to root
 
 on:
-  workflow_dispatch:    # Manual trigger only
+  workflow_dispatch:
 
 jobs:
   move-wdp:
     runs-on: ubuntu-latest
     steps:
-      - name: Install rclone
+      - name: Install rclone and jq
         run: |
           sudo apt-get update
           sudo apt-get install -y rclone jq
 
-      - name: Configure rclone with R2
+      - name: Configure rclone for R2
         run: |
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
@@ -25,44 +25,52 @@ jobs:
           region = auto
           EOF
 
-      - name: Move wdp snapshots to root
+      - name: Move files (copy + delete)
         run: |
           set -euo pipefail
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Moving WDP snapshots from wdp/ to root..."
 
-          # Move each snapshot file
-          rclone lsf "r2:$BUCKET/wdp/wdpsnapshot_*.png" | while read -r file; do
-            echo "Moving wdp/$file -> $file"
-            rclone moveto "r2:$BUCKET/wdp/$file" "r2:$BUCKET/$file"
-          done
+          echo "Copying wdp/wdpsnapshot_*.png to root..."
+          rclone copy "r2:$BUCKET/wdp/" "r2:$BUCKET/" --include "wdpsnapshot_*.png"
 
-          # Merge wdp/snapshots.json into root snapshots.json
-          tmp_manifest=$(mktemp)
-          if rclone cat "r2:$BUCKET/wdp/snapshots.json" 2>/dev/null > "$tmp_manifest"; then
-            echo "Merging wdp/snapshots.json into root snapshots.json"
-            root_tmp=$(mktemp)
-            if rclone cat "r2:$BUCKET/snapshots.json" 2>/dev/null > "$root_tmp"; then
-              jq -s 'add | unique' "$root_tmp" "$tmp_manifest" > "$root_tmp.new"
-              rclone copyto "$root_tmp.new" "r2:$BUCKET/snapshots.json"
+          echo "Deleting original files from wdp/..."
+          rclone delete "r2:$BUCKET/wdp/" --include "wdpsnapshot_*.png"
+
+          echo "Merging manifests..."
+          # Download wdp manifest if it exists
+          if rclone lsf "r2:$BUCKET/wdp/snapshots.json" &>/dev/null; then
+            rclone cat "r2:$BUCKET/wdp/snapshots.json" > /tmp/wdp_manifest.json
+            # Download root manifest or create empty
+            if rclone lsf "r2:$BUCKET/snapshots.json" &>/dev/null; then
+              rclone cat "r2:$BUCKET/snapshots.json" > /tmp/root_manifest.json
             else
-              rclone copyto "$tmp_manifest" "r2:$BUCKET/snapshots.json"
+              echo '[]' > /tmp/root_manifest.json
             fi
-            rm -f "$root_tmp" "$root_tmp.new"
+            # Merge and deduplicate
+            jq -s 'add | unique' /tmp/root_manifest.json /tmp/wdp_manifest.json > /tmp/merged.json
+            rclone copyto /tmp/merged.json "r2:$BUCKET/snapshots.json"
+            rm -f /tmp/*.json
           fi
-          rm -f "$tmp_manifest"
 
-          # Remove the wdp/ directory (must be empty)
-          rclone rmdir "r2:$BUCKET/wdp" 2>/dev/null || echo "wdp/ already removed or not empty"
+          echo "Deleting wdp/snapshots.json (now merged)"
+          rclone delete "r2:$BUCKET/wdp/snapshots.json" 2>/dev/null || true
 
-          echo "Cleanup complete. WDP snapshots are now at bucket root."
+          echo "Removing empty wdp/ directory"
+          rclone rmdir "r2:$BUCKET/wdp" 2>/dev/null && echo "wdp/ removed" || echo "wdp/ not empty or already gone"
 
-      - name: Verify move
+      - name: Verify the move
         run: |
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Root snapshots.json entries:"
-          rclone cat "r2:$BUCKET/snapshots.json" | jq -r '.[]' | head -5
-          echo "Root wdpsnapshot_*.png files:"
-          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" | head -5
-          echo "wdp/ prefix should be gone:"
-          rclone lsd "r2:$BUCKET/" | grep -q wdp && echo "wdp/ still exists!" || echo "wdp/ removed successfully"
+          echo "Root snapshots.json entries (first 10):"
+          rclone cat "r2:$BUCKET/snapshots.json" 2>/dev/null | jq -r '.[]' | head -10 || echo "No root manifest yet"
+          echo ""
+          echo "Root wdpsnapshot files count:"
+          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" 2>/dev/null | wc -l
+          echo ""
+          echo "wdp/ prefix still present?"
+          if rclone lsd "r2:$BUCKET/" | grep -q wdp; then
+            echo "❌ ERROR: wdp/ still exists (not empty)"
+            rclone lsf "r2:$BUCKET/wdp/"
+          else
+            echo "✅ wdp/ successfully removed"
+          fi
