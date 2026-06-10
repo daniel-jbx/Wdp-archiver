@@ -30,11 +30,14 @@ CROP="${WIDTH}x${HEIGHT}+${X1}+${Y1}"
 : "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID not set}"
 : "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY not set}"
 
-RCLONE_BASE=(--s3-provider="Cloudflare" --s3-endpoint="$R2_ENDPOINT"
-             --s3-access-key-id="$R2_ACCESS_KEY_ID"
-             --s3-secret-access-key="$R2_SECRET_ACCESS_KEY"
-             --s3-no-check-bucket)
-             --log-level ERROR)
+RCLONE_BASE=(
+  --s3-provider="Cloudflare"
+  --s3-endpoint="$R2_ENDPOINT"
+  --s3-access-key-id="$R2_ACCESS_KEY_ID"
+  --s3-secret-access-key="$R2_SECRET_ACCESS_KEY"
+  --s3-no-check-bucket
+  --log-level ERROR
+)
 
 # -- Fetch snapshot list from R2 ---------------------------------------
 echo "Downloading snapshots.json..."
