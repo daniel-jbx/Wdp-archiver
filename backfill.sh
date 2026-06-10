@@ -215,11 +215,16 @@ if [[ -z "$all_tags" ]]; then
     exit 1
 fi
 
-echo "Total releases fetched: $(echo "$all_tags" | wc -l)"
-echo "First 3 tags:"
-echo "$all_tags" | head -3
-echo "Last 3 tags:"
-echo "$all_tags" | tail -3
+total_count=$(echo "$all_tags" | wc -l)
+echo "Total releases fetched: $total_count"
+
+# Safe debug output (avoid broken pipe)
+if [[ $total_count -gt 0 ]]; then
+    echo "First 3 tags:"
+    echo "$all_tags" | sed -n '1,3p'
+    echo "Last 3 tags:"
+    echo "$all_tags" | sed -n "$((total_count-2)),${total_count}p"
+fi
 
 # Show distinct years from tags for debugging
 echo "Years present in tags:"
