@@ -5,8 +5,8 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-05-11"
-EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
+END_DATE="2026-04-11"
+EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
 STATE_FILE="backfill-state.txt"
