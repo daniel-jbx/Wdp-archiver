@@ -25,52 +25,46 @@ jobs:
           region = auto
           EOF
 
-      - name: Move files (copy + delete)
-        run: |
-          set -euo pipefail
-          BUCKET="${{ secrets.R2_BUCKET }}"
-
-          echo "Copying wdp/wdpsnapshot_*.png to root..."
-          rclone copy "r2:$BUCKET/wdp/" "r2:$BUCKET/" --include "wdpsnapshot_*.png"
-
-          echo "Deleting original files from wdp/..."
-          rclone delete "r2:$BUCKET/wdp/" --include "wdpsnapshot_*.png"
-
-          echo "Merging manifests..."
-          # Download wdp manifest if it exists
-          if rclone lsf "r2:$BUCKET/wdp/snapshots.json" &>/dev/null; then
-            rclone cat "r2:$BUCKET/wdp/snapshots.json" > /tmp/wdp_manifest.json
-            # Download root manifest or create empty
-            if rclone lsf "r2:$BUCKET/snapshots.json" &>/dev/null; then
-              rclone cat "r2:$BUCKET/snapshots.json" > /tmp/root_manifest.json
-            else
-              echo '[]' > /tmp/root_manifest.json
-            fi
-            # Merge and deduplicate
-            jq -s 'add | unique' /tmp/root_manifest.json /tmp/wdp_manifest.json > /tmp/merged.json
-            rclone copyto /tmp/merged.json "r2:$BUCKET/snapshots.json"
-            rm -f /tmp/*.json
-          fi
-
-          echo "Deleting wdp/snapshots.json (now merged)"
-          rclone delete "r2:$BUCKET/wdp/snapshots.json" 2>/dev/null || true
-
-          echo "Removing empty wdp/ directory"
-          rclone rmdir "r2:$BUCKET/wdp" 2>/dev/null && echo "wdp/ removed" || echo "wdp/ not empty or already gone"
-
-      - name: Verify the move
+      - name: Copy ALL snapshot files to root (both name patterns)
         run: |
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Root snapshots.json entries (first 10):"
-          rclone cat "r2:$BUCKET/snapshots.json" 2>/dev/null | jq -r '.[]' | head -10 || echo "No root manifest yet"
+          # Copy wdpsnapshot_*.png and wdp_snapshot_*.png
+          for pattern in "wdpsnapshot_*.png" "wdp_snapshot_*.png"; do
+            rclone copy "r2:$BUCKET/wdp/" "r2:$BUCKET/" --include "$pattern"
+          done
+
+      - name: Delete entire wdp/ prefix (force cleanup)
+        run: |
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          # Delete all files under wdp/
+          rclone delete "r2:$BUCKET/wdp/" || true
+          # Remove the empty directory
+          rclone rmdir "r2:$BUCKET/wdp" || true
+
+      - name: Rebuild root snapshots.json from existing root files
+        run: |
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          echo "Listing all wdpsnapshot_*.png in root..."
+          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" > /tmp/all_snapshots.txt
+          # Also include any wdp_snapshot_*.png that might have been copied (rename them? but we want consistency)
+          rclone lsf "r2:$BUCKET/wdp_snapshot_*.png" >> /tmp/all_snapshots.txt 2>/dev/null || true
+          # Remove duplicates and sort, then build JSON array
+          sort -u /tmp/all_snapshots.txt | jq -R -s 'split("\n") | map(select(length>0))' > /tmp/manifest.json
+          echo "New manifest has $(jq length /tmp/manifest.json) entries."
+          # Upload manifest using file copy (works around stdin issues)
+          rclone copyto /tmp/manifest.json "r2:$BUCKET/snapshots.json"
+
+      - name: Verify final state
+        run: |
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          echo "✅ Root snapshots.json entries (first 10):"
+          rclone cat "r2:$BUCKET/snapshots.json" | jq -r '.[]' | head -10
           echo ""
-          echo "Root wdpsnapshot files count:"
-          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" 2>/dev/null | wc -l
+          echo "Total root snapshots: $(rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" | wc -l)"
           echo ""
-          echo "wdp/ prefix still present?"
           if rclone lsd "r2:$BUCKET/" | grep -q wdp; then
-            echo "❌ ERROR: wdp/ still exists (not empty)"
-            rclone lsf "r2:$BUCKET/wdp/"
+            echo "❌ ERROR: wdp/ still exists"
+            exit 1
           else
             echo "✅ wdp/ successfully removed"
           fi
