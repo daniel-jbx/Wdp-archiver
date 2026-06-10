@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-03-04"               # Changed to 03/04 as requested
+END_DATE="2026-03-04"
 EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
@@ -89,7 +89,6 @@ ensure_wdp_manifest() {
             echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
         fi
     else
-        # File doesn't exist – create empty array (no warning)
         echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
     fi
     rm -f "$tmp_manifest"
@@ -112,7 +111,7 @@ ensure_antarktika_manifest() {
 # Process a single release for WDP (root)
 process_wdp() {
     local tag_name="$1"
-    local tiles_dir="$2"   # directory with extracted tiles (subdirs x/y.png)
+    local tiles_dir="$2"
 
     local snap_date=$(date_from_tag "$tag_name")
     local snapshot_name="wdpsnapshot_${snap_date}.png"
@@ -136,7 +135,6 @@ process_wdp() {
     local temp_dir=$(mktemp -d)
     trap "rm -rf '$temp_dir'" RETURN
     
-    # Collect tile files for WDP
     local tile_files=()
     for y in $(seq $WDP_Y_START $WDP_Y_END); do
         for x in $(seq $WDP_X_START $WDP_X_END); do
@@ -144,7 +142,6 @@ process_wdp() {
         done
     done
     
-    # Create missing tiles as transparent 1000x1000 PNGs
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
@@ -161,7 +158,6 @@ process_wdp() {
     
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
     
-    # Update manifest
     local manifest_tmp=$(mktemp)
     rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
@@ -198,7 +194,6 @@ process_antarktika() {
     local temp_dir=$(mktemp -d)
     trap "rm -rf '$temp_dir'" RETURN
     
-    # Collect tile files for antarktika
     local tile_files=()
     for y in $(seq $ANT_Y_START $ANT_Y_END); do
         for x in $(seq $ANT_X_START $ANT_X_END); do
@@ -206,7 +201,6 @@ process_antarktika() {
         done
     done
     
-    # Create missing tiles as transparent 1000x1000 PNGs
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
             mkdir -p "$(dirname "$tf")"
@@ -223,7 +217,6 @@ process_antarktika() {
     
     rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/antarktika/$snapshot_name"
     
-    # Update manifest
     local manifest_tmp=$(mktemp)
     rclone cat "r2:$R2_BUCKET/antarktika/snapshots.json" > "$manifest_tmp"
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
@@ -234,20 +227,35 @@ process_antarktika() {
 }
 
 # ============================
-# MAIN – Process only the newest date that needs work for either dataset
+# MAIN – Process only the newest date that needs work
 # ============================
 
-# Read last completed dates from state files
+# Read and validate state files
 last_wdp=""
 if rclone cat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null > /tmp/wdp_state; then
-    last_wdp=$(cat /tmp/wdp_state)
+    content=$(cat /tmp/wdp_state)
+    if [[ -n "$content" && "$content" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        last_wdp="$content"
+        echo "WDP state file contains: $last_wdp"
+    else
+        echo "WDP state file exists but contains invalid/empty data. Ignoring."
+    fi
+else
+    echo "WDP state file not found."
 fi
+
 last_ant=""
 if rclone cat "r2:$R2_BUCKET/antarktika-backfill-state.txt" 2>/dev/null > /tmp/ant_state; then
-    last_ant=$(cat /tmp/ant_state)
+    content=$(cat /tmp/ant_state)
+    if [[ -n "$content" && "$content" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        last_ant="$content"
+        echo "Antarktika state file contains: $last_ant"
+    else
+        echo "Antarktika state file exists but contains invalid/empty data. Ignoring."
+    fi
+else
+    echo "Antarktika state file not found."
 fi
-echo "Last completed WDP date: ${last_wdp:-none}"
-echo "Last completed Antarktika date: ${last_ant:-none}"
 
 # Fetch all tags
 echo "Fetching all releases..."
@@ -284,10 +292,11 @@ if [[ ${#all_dates[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Iterate from newest to oldest, but stop after processing the first date that needs any work
+# Iterate from newest to oldest, stop after first date that needs processing
 for current_date in "${all_dates[@]}"; do
     wdp_needed=0
     ant_needed=0
+    # Need to process if no state OR current_date is newer than last processed
     if [[ -z "$last_wdp" || "$current_date" > "$last_wdp" ]]; then
         wdp_needed=1
     fi
@@ -301,7 +310,6 @@ for current_date in "${all_dates[@]}"; do
 
     echo "Processing date: $current_date (WDP needed=$wdp_needed, Ant needed=$ant_needed)"
 
-    # Get tags for this date, sorted newest first
     IFS='|' read -ra tags <<< "${day_tags[$current_date]}"
     tags=(${tags[@]/#/})
     IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
@@ -319,7 +327,6 @@ for current_date in "${all_dates[@]}"; do
 
         echo "--- Processing tag $tag ---"
 
-        # Create temporary directory for extraction
         temp_dir=$(mktemp -d)
         trap "rm -rf '$temp_dir'" RETURN
 
