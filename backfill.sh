@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-03-04"               # Changed from 2026-04-11 to 2026-03-04
+END_DATE="2026-03-04"
 EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
@@ -13,13 +13,19 @@ R2_ENDPOINT="${R2_ENDPOINT:-}"
 R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"
 R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
 
-# WDP (original)
+# Validate required R2 credentials
+if [[ -z "$R2_ENDPOINT" || -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" ]]; then
+    echo "ERROR: R2_ENDPOINT, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY must be set."
+    exit 1
+fi
+
+# WDP (original) – stored at bucket root
 WDP_X_START=1225
 WDP_X_END=1231
 WDP_Y_START=513
 WDP_Y_END=518
 
-# Antarktika
+# Antarktika – stored under antarktika/ prefix
 ANT_X_START=1279
 ANT_X_END=1284
 ANT_Y_START=1715
@@ -37,6 +43,14 @@ for tool in curl jq tar montage pngquant rclone; do
         exit 1
     fi
 done
+
+# Common R2 flags
+R2_FLAGS=(
+    --s3-endpoint="$R2_ENDPOINT"
+    --s3-access-key-id="$R2_ACCESS_KEY_ID"
+    --s3-secret-access-key="$R2_SECRET_ACCESS_KEY"
+    --s3-region="auto"
+)
 
 # ============================
 # FUNCTIONS
@@ -106,88 +120,68 @@ date_from_tag() {
     echo "$tag" | sed 's/world-//' | sed 's/T/_/' | sed 's/-//g' | sed 's/\..*//'
 }
 
-ensure_valid_manifest() {
-    local dataset="$1"
-    local prefix="${dataset}/"
+# For WDP: manifest is at root "snapshots.json"
+ensure_wdp_manifest() {
     local tmp_manifest=$(mktemp)
-    if rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-        --s3-endpoint="$R2_ENDPOINT" \
-        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-        --s3-region="auto" 2>/dev/null > "$tmp_manifest"; then
+    if rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null > "$tmp_manifest"; then
         if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
-            echo "WARNING: $dataset snapshots.json corrupted. Resetting to empty array."
-            echo '[]' | rclone copyto - ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-                --s3-endpoint="$R2_ENDPOINT" \
-                --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-                --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-                --s3-region="auto" || exit 1
+            echo "WARNING: WDP snapshots.json corrupted. Resetting to empty array."
+            echo '[]' | rclone copyto - ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
         fi
     else
-        echo '[]' | rclone copyto - ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-region="auto" || exit 1
+        # File does not exist – create empty array
+        echo '[]' | rclone copyto - ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
     fi
     rm -f "$tmp_manifest"
 }
 
-process_dataset() {
-    local dataset="$1"
-    local x_start="$2"
-    local x_end="$3"
-    local y_start="$4"
-    local y_end="$5"
-    local tag_name="$6"
-    local tiles_dir="$7"
+# For antarktika: manifest is at "antarktika/snapshots.json"
+ensure_antarktika_manifest() {
+    local tmp_manifest=$(mktemp)
+    if rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null > "$tmp_manifest"; then
+        if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
+            echo "WARNING: antarktika snapshots.json corrupted. Resetting to empty array."
+            echo '[]' | rclone copyto - ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+        fi
+    else
+        echo '[]' | rclone copyto - ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+    fi
+    rm -f "$tmp_manifest"
+}
+
+process_wdp() {
+    local tag_name="$1"
+    local tiles_dir="$2"
 
     local snap_date=$(date_from_tag "$tag_name")
-    local snapshot_name="${dataset}_snapshot_${snap_date}.png"
-    local prefix="${dataset}/"
+    local snapshot_name="wdpsnapshot_${snap_date}.png"
 
-    echo "  [$dataset] Processing $tag_name -> $snapshot_name"
+    echo "  [WDP] Processing $tag_name -> $snapshot_name"
 
-    ensure_valid_manifest "$dataset"
+    ensure_wdp_manifest
 
-    # Skip if snapshot already in manifest
-    if rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-        --s3-endpoint="$R2_ENDPOINT" \
-        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-        --s3-region="auto" 2>/dev/null | jq -r '.[]' | grep -qx "$snapshot_name"; then
-        echo "  [$dataset] Already in manifest, skipping."
+    # Skip if already in manifest
+    if rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null | jq -r '.[]' | grep -qx "$snapshot_name"; then
+        echo "  [WDP] Already in manifest, skipping."
         return 0
     fi
 
     # Skip if file exists but not in manifest (fix manifest)
-    if rclone ls ":s3:$R2_BUCKET/${prefix}" \
-        --s3-endpoint="$R2_ENDPOINT" \
-        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-        --s3-region="auto" 2>/dev/null | grep -q "$snapshot_name"; then
-        echo "  [$dataset] File exists but not in manifest. Adding to manifest."
+    if rclone ls ":s3:$R2_BUCKET/" "${R2_FLAGS[@]}" 2>/dev/null | grep -q "$snapshot_name"; then
+        echo "  [WDP] File exists but not in manifest. Adding to manifest."
         local manifest_tmp=$(mktemp)
-        rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-region="auto" > "$manifest_tmp" 2>/dev/null
+        rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
         jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-        rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-region="auto" || exit 1
+        rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
         return 0
     fi
 
     local temp_dir=$(mktemp -d)
 
-    # Collect tile files for this dataset
+    # Collect tile files for WDP
     local tile_files=()
-    for y in $(seq "$y_start" "$y_end"); do
-        for x in $(seq "$x_start" "$x_end"); do
+    for y in $(seq $WDP_Y_START $WDP_Y_END); do
+        for x in $(seq $WDP_X_START $WDP_X_END); do
             tile_files+=("$tiles_dir/$x/$y.png")
         done
     done
@@ -200,8 +194,8 @@ process_dataset() {
         fi
     done
 
-    local cols=$((x_end - x_start + 1))
-    local rows=$((y_end - y_start + 1))
+    local cols=$((WDP_X_END - WDP_X_START + 1))
+    local rows=$((WDP_Y_END - WDP_Y_START + 1))
 
     montage -background none -alpha on "${tile_files[@]}" \
         -tile ${cols}x${rows} \
@@ -210,56 +204,104 @@ process_dataset() {
 
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
 
-    rclone copyto "$temp_dir/compressed.png" ":s3:$R2_BUCKET/${prefix}$snapshot_name" \
-        --s3-endpoint="$R2_ENDPOINT" \
-        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-        --s3-region="auto" || exit 1
+    rclone copyto "$temp_dir/compressed.png" ":s3:$R2_BUCKET/$snapshot_name" "${R2_FLAGS[@]}" || exit 1
 
     # Update manifest
     local manifest_tmp=$(mktemp)
-    rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-        --s3-endpoint="$R2_ENDPOINT" \
-        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-        --s3-region="auto" > "$manifest_tmp" 2>/dev/null
+    rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-    rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/${prefix}snapshots.json" \
-        --s3-endpoint="$R2_ENDPOINT" \
-        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-        --s3-region="auto" || exit 1
+    rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
 
     rm -rf "$temp_dir"
-    echo "  [$dataset] ✓ Uploaded $snapshot_name and updated manifest."
+    echo "  [WDP] ✓ Uploaded $snapshot_name and updated manifest."
+    return 0
+}
+
+process_antarktika() {
+    local tag_name="$1"
+    local tiles_dir="$2"
+
+    local snap_date=$(date_from_tag "$tag_name")
+    local snapshot_name="antarktika_snapshot_${snap_date}.png"
+
+    echo "  [Antarktika] Processing $tag_name -> $snapshot_name"
+
+    ensure_antarktika_manifest
+
+    # Skip if already in manifest
+    if rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null | jq -r '.[]' | grep -qx "$snapshot_name"; then
+        echo "  [Antarktika] Already in manifest, skipping."
+        return 0
+    fi
+
+    # Skip if file exists but not in manifest (fix manifest)
+    if rclone ls ":s3:$R2_BUCKET/antarktika/" "${R2_FLAGS[@]}" 2>/dev/null | grep -q "$snapshot_name"; then
+        echo "  [Antarktika] File exists but not in manifest. Adding to manifest."
+        local manifest_tmp=$(mktemp)
+        rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
+        jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
+        rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+        return 0
+    fi
+
+    local temp_dir=$(mktemp -d)
+
+    # Collect tile files for antarktika
+    local tile_files=()
+    for y in $(seq $ANT_Y_START $ANT_Y_END); do
+        for x in $(seq $ANT_X_START $ANT_X_END); do
+            tile_files+=("$tiles_dir/$x/$y.png")
+        done
+    done
+
+    # Create missing tiles as transparent 1000x1000 PNGs
+    for tf in "${tile_files[@]}"; do
+        if [[ ! -f "$tf" ]]; then
+            mkdir -p "$(dirname "$tf")"
+            convert -size 1000x1000 canvas:transparent PNG32:"$tf"
+        fi
+    done
+
+    local cols=$((ANT_X_END - ANT_X_START + 1))
+    local rows=$((ANT_Y_END - ANT_Y_START + 1))
+
+    montage -background none -alpha on "${tile_files[@]}" \
+        -tile ${cols}x${rows} \
+        -geometry 1000x1000+0+0 \
+        PNG32:"$temp_dir/stitched.png"
+
+    pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
+
+    rclone copyto "$temp_dir/compressed.png" ":s3:$R2_BUCKET/antarktika/$snapshot_name" "${R2_FLAGS[@]}" || exit 1
+
+    # Update manifest
+    local manifest_tmp=$(mktemp)
+    rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
+    jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
+    rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+
+    rm -rf "$temp_dir"
+    echo "  [Antarktika] ✓ Uploaded $snapshot_name and updated manifest."
     return 0
 }
 
 # ============================
-# MAIN – Process only ONE date (the newest not fully done)
+# MAIN – Process only ONE date (newest not fully done)
 # ============================
 
-# Read last completed dates for each dataset
+# Read last completed dates for each dataset from R2
 last_wdp=""
-if rclone cat ":s3:$R2_BUCKET/wdp-backfill-state.txt" \
-    --s3-endpoint="$R2_ENDPOINT" \
-    --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-    --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-    --s3-region="auto" 2>/dev/null > /tmp/wdp_state; then
+if rclone cat ":s3:$R2_BUCKET/wdp-backfill-state.txt" "${R2_FLAGS[@]}" 2>/dev/null > /tmp/wdp_state; then
     last_wdp=$(cat /tmp/wdp_state)
 fi
 last_ant=""
-if rclone cat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" \
-    --s3-endpoint="$R2_ENDPOINT" \
-    --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-    --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-    --s3-region="auto" 2>/dev/null > /tmp/ant_state; then
+if rclone cat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" "${R2_FLAGS[@]}" 2>/dev/null > /tmp/ant_state; then
     last_ant=$(cat /tmp/ant_state)
 fi
 echo "Last completed WDP date: ${last_wdp:-none}"
 echo "Last completed Antarktika date: ${last_ant:-none}"
 
-# Fetch all tags
+# Fetch all releases
 echo "Fetching all releases..."
 all_tags=$(fetch_all_releases)
 if [[ -z "$all_tags" ]]; then
@@ -270,19 +312,17 @@ fi
 total_count=$(echo "$all_tags" | wc -l)
 echo "Total releases fetched: $total_count"
 
-# Safe debug output (avoid broken pipe)
+# Show debug info
 if [[ $total_count -gt 0 ]]; then
     echo "First 3 tags:"
     echo "$all_tags" | sed -n '1,3p'
     echo "Last 3 tags:"
     echo "$all_tags" | sed -n "$((total_count-2)),${total_count}p"
 fi
-
-# Show distinct years from tags for debugging
 echo "Years present in tags:"
 echo "$all_tags" | sed -n 's/^world-\([0-9]\{4\}\).*/\1/p' | sort -u
 
-# Group by date
+# Group by date within range
 declare -A day_tags
 for tag in $all_tags; do
     tag_date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
@@ -301,27 +341,26 @@ for tag in $all_tags; do
     fi
 done
 
-# Get all dates sorted newest first
+# Get dates sorted newest first
 all_dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
 
 if [[ ${#all_dates[@]} -eq 0 ]]; then
     echo "No dates in range $START_DATE .. $END_DATE."
-    echo "Tip: Check if the releases exist for that period. The first few tags show the available dates."
     exit 0
 fi
 
-# Process only the first (newest) date that needs any work
+# Find the first (newest) date that needs processing for either dataset
 for current_date in "${all_dates[@]}"; do
     wdp_needed=0
     ant_needed=0
-    if [[ -z "$last_wdp" || "$current_date" < "$last_wdp" ]]; then
+    if [[ -z "$last_wdp" || "$current_date" > "$last_wdp" ]]; then
         wdp_needed=1
     fi
-    if [[ -z "$last_ant" || "$current_date" < "$last_ant" ]]; then
+    if [[ -z "$last_ant" || "$current_date" > "$last_ant" ]]; then
         ant_needed=1
     fi
     if [[ $wdp_needed -eq 0 && $ant_needed -eq 0 ]]; then
-        echo "Date $current_date already fully processed (both datasets). Skipping."
+        echo "Date $current_date already fully processed. Skipping."
         continue
     fi
 
@@ -360,7 +399,7 @@ for current_date in "${all_dates[@]}"; do
             continue
         fi
 
-        # Build tile patterns for both areas
+        # Build tile patterns for needed areas
         tile_patterns=()
         if [[ $wdp_needed -eq 1 ]]; then
             for x in $(seq $WDP_X_START $WDP_X_END); do
@@ -386,9 +425,9 @@ for current_date in "${all_dates[@]}"; do
             ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
         fi
 
-        # Process WDP
+        # Process WDP if needed
         if [[ $wdp_needed -eq 1 ]]; then
-            if process_dataset "wdp" $WDP_X_START $WDP_X_END $WDP_Y_START $WDP_Y_END "$tag" "$temp_dir/tiles"; then
+            if process_wdp "$tag" "$temp_dir/tiles"; then
                 echo "  WDP success for $tag"
             else
                 wdp_success_all=0
@@ -396,9 +435,9 @@ for current_date in "${all_dates[@]}"; do
             fi
         fi
 
-        # Process antarktika
+        # Process antarktika if needed
         if [[ $ant_needed -eq 1 ]]; then
-            if process_dataset "antarktika" $ANT_X_START $ANT_X_END $ANT_Y_START $ANT_Y_END "$tag" "$temp_dir/tiles"; then
+            if process_antarktika "$tag" "$temp_dir/tiles"; then
                 echo "  Antarktika success for $tag"
             else
                 ant_success_all=0
@@ -409,28 +448,17 @@ for current_date in "${all_dates[@]}"; do
         rm -rf "$temp_dir"
     done
 
-    # Update states for this date if fully successful
-    updated=0
+    # Update state files if fully successful
     if [[ $wdp_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
-        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/wdp-backfill-state.txt" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-region="auto" || exit 1
+        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/wdp-backfill-state.txt" "${R2_FLAGS[@]}" || exit 1
         echo "✅ WDP state updated to $current_date"
-        updated=1
     fi
     if [[ $ant_needed -eq 1 && $ant_success_all -eq 1 ]]; then
-        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-region="auto" || exit 1
+        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" "${R2_FLAGS[@]}" || exit 1
         echo "✅ Antarktika state updated to $current_date"
-        updated=1
     fi
 
-    # Stop after processing this date (even if some parts failed)
+    # Stop after this date (even if some parts failed)
     echo "Finished processing date $current_date. Exiting (one day per run)."
     exit 0
 done
