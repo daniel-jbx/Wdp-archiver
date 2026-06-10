@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export RCLONE_CONFIG=/dev/null
+
 CONFIG_FILE="${1:-gif-config.json}"
 
 # -- Read configuration ------------------------------------------------
