@@ -1,5 +1,9 @@
 #!/bin/bash
-set -euo pipefail
+# Full debug mode: print all commands and stop on any error
+set -euxo pipefail
+exec 2>&1
+
+echo "=== Script started ==="
 
 # ------------------------------------------------------------
 # 1. Read configuration
@@ -20,27 +24,30 @@ max_fps=$(grep -E '^max_fps=' "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/^ *//;s/ 
 output=$(grep -E '^output=' "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/^ *//;s/ *$//')
 bucket_url=$(grep -E '^bucket_url=' "$CONFIG_FILE" | cut -d'=' -f2- | sed 's/^ *//;s/ *$//')
 
-# Default public bucket URL
+echo "bucket_url raw = '$bucket_url'"
+
+# Default bucket URL
 if [ -z "$bucket_url" ]; then
     bucket_url="https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev"
 fi
+echo "bucket_url final = '$bucket_url'"
 
 # Validate required fields
 if [ -z "$date_from" ] || [ -z "$date_to" ] || [ -z "$max_fps" ]; then
-    echo "ERROR: date_from, date_to, and max_fps must be set in $CONFIG_FILE"
+    echo "ERROR: date_from, date_to, max_fps required"
     exit 1
 fi
 
-echo "=== Starting GIF generation ==="
-echo "Date range: $date_from  →  $date_to"
-echo "Crop: x=$x_start..$x_end, y=$y_start..$y_end"
-echo "Max FPS (shortest interval): $max_fps"
-echo "Output file: $output"
-echo "Bucket URL: $bucket_url"
+echo "=== Configuration OK ==="
+echo "Date range: $date_from → $date_to"
+echo "Crop: $x_start..$x_end $y_start..$y_end"
+echo "Max FPS: $max_fps"
+echo "Output: $output"
 
 # ------------------------------------------------------------
-# 2. Install dependencies (GitHub Actions runner)
+# 2. Install dependencies
 # ------------------------------------------------------------
+echo "Installing packages..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq jq ffmpeg bc curl imagemagick
 
@@ -53,79 +60,69 @@ else
     DATE_CMD="date"
 fi
 
-from_epoch=$($DATE_CMD -d "$date_from" +%s 2>/dev/null)
-to_epoch=$($DATE_CMD -d "$date_to" +%s 2>/dev/null)
-if [ -z "$from_epoch" ] || [ -z "$to_epoch" ]; then
-    echo "ERROR: Invalid date format. Use 'YYYY-MM-DD HH:MM:SS'."
-    exit 1
-fi
-echo "from_epoch=$from_epoch  to_epoch=$to_epoch"
+from_epoch=$($DATE_CMD -d "$date_from" +%s)
+to_epoch=$($DATE_CMD -d "$date_to" +%s)
+echo "from_epoch=$from_epoch to_epoch=$to_epoch"
 
 # ------------------------------------------------------------
 # 4. Fetch snapshots.json
 # ------------------------------------------------------------
 MANIFEST_URL="$bucket_url/snapshots.json"
-echo "Fetching manifest from $MANIFEST_URL"
+echo "Fetching $MANIFEST_URL"
 curl -s -o snapshots.json "$MANIFEST_URL"
 if [ ! -s snapshots.json ]; then
-    echo "ERROR: snapshots.json is empty or could not be downloaded."
+    echo "ERROR: snapshots.json empty or not found"
     exit 1
 fi
 
-# Validate JSON
 if ! jq -e 'type == "array"' snapshots.json >/dev/null; then
-    echo "ERROR: snapshots.json is not a JSON array."
+    echo "ERROR: snapshots.json is not a JSON array"
     exit 1
 fi
 
 count=$(jq length snapshots.json)
-echo "Manifest contains $count snapshots."
-
+echo "Manifest contains $count snapshots"
 if [ "$count" -eq 0 ]; then
-    echo "ERROR: No snapshots available. Run the update-map.yml workflow first."
+    echo "ERROR: No snapshots available. Run update-map.yml first."
     exit 1
 fi
 
 # ------------------------------------------------------------
-# 5. Filter snapshots by date range
+# 5. Filter by date range
 # ------------------------------------------------------------
-filtered=()   # array of "filename:epoch"
+filtered=()
 while IFS= read -r file; do
     ts=$(echo "$file" | sed -n 's/.*wdpsnapshot_\([0-9]\{8\}_[0-9]\{6\}\)\.png/\1/p')
-    if [ -z "$ts" ]; then
-        echo "WARNING: Skipping unexpected filename: $file"
-        continue
-    fi
+    [ -z "$ts" ] && continue
     epoch=$($DATE_CMD -d "${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:9:2}:${ts:11:2}:${ts:13:2}" +%s 2>/dev/null || true)
     if [ -n "$epoch" ] && [ "$epoch" -ge "$from_epoch" ] && [ "$epoch" -le "$to_epoch" ]; then
         filtered+=("$file:$epoch")
     fi
 done < <(jq -r '.[]' snapshots.json)
 
-echo "Found ${#filtered[@]} snapshots in date range."
+echo "Found ${#filtered[@]} snapshots in date range"
 if [ ${#filtered[@]} -lt 2 ]; then
-    echo "ERROR: Need at least 2 snapshots, but only ${#filtered[@]} found."
-    echo "First snapshot in manifest: $(jq -r '.[0]' snapshots.json)"
-    echo "Last snapshot: $(jq -r '.[-1]' snapshots.json)"
+    echo "ERROR: Need at least 2 snapshots, only ${#filtered[@]} found"
+    echo "First manifest entry: $(jq -r '.[0]' snapshots.json)"
+    echo "Last manifest entry: $(jq -r '.[-1]' snapshots.json)"
     exit 1
 fi
 
-# Sort by timestamp (oldest first)
+# Sort
 IFS=$'\n' filtered=($(sort -t: -k2 -n <<<"${filtered[*]}"))
 unset IFS
 
 # ------------------------------------------------------------
-# 6. Size limit: exit if too many frames
+# 6. Size limit
 # ------------------------------------------------------------
 MAX_FRAMES=500
 if [ ${#filtered[@]} -gt $MAX_FRAMES ]; then
-    echo "ERROR: Too many frames (${#filtered[@]} > $MAX_FRAMES)."
-    echo "Narrow your date range or increase MAX_FRAMES in the script."
+    echo "ERROR: Too many frames (${#filtered[@]} > $MAX_FRAMES)"
     exit 1
 fi
 
 # ------------------------------------------------------------
-# 7. Compute proportional durations (in hundredths of a second)
+# 7. Compute proportional delays
 # ------------------------------------------------------------
 min_interval=999999999
 prev_epoch=0
@@ -136,22 +133,19 @@ for entry in "${filtered[@]}"; do
         continue
     fi
     interval=$((epoch - prev_epoch))
-    if [ $interval -lt $min_interval ]; then
-        min_interval=$interval
-    fi
+    [ $interval -lt $min_interval ] && min_interval=$interval
     prev_epoch=$epoch
 done
 
 if [ $min_interval -eq 0 ]; then
-    echo "ERROR: Minimum interval is zero (duplicate timestamps)."
+    echo "ERROR: Minimum interval is zero"
     exit 1
 fi
 
 base_duration_sec=$(echo "scale=6; 1 / $max_fps" | bc)
-echo "Shortest interval = ${min_interval}s → base duration = ${base_duration_sec}s"
+echo "Shortest interval = ${min_interval}s, base duration = ${base_duration_sec}s"
 
-# Build delays array (in hundredths)
-declare -a delays
+delays=()
 prev_epoch=0
 for entry in "${filtered[@]}"; do
     epoch="${entry#*:}"
@@ -166,10 +160,10 @@ for entry in "${filtered[@]}"; do
     delays+=($delay)
     prev_epoch=$epoch
 done
-end_pause=100   # 1 second hold on last frame
+end_pause=100
 
 # ------------------------------------------------------------
-# 8. Prepare frames: download, crop, add timestamp banner
+# 8. Prepare frames (crop + banner)
 # ------------------------------------------------------------
 TMP_DIR="frames_$$"
 mkdir -p "$TMP_DIR"
@@ -177,79 +171,62 @@ mkdir -p "$TMP_DIR"
 crop_width=$((x_end - x_start))
 crop_height=$((y_end - y_start))
 if [ $crop_width -le 0 ] || [ $crop_height -le 0 ]; then
-    echo "ERROR: Invalid crop dimensions (width=$crop_width, height=$crop_height)."
+    echo "ERROR: Invalid crop dimensions"
     exit 1
 fi
 
-# Dynamic font size: 6% of crop height (minimum 12px)
 font_size=$(echo "$crop_height * 0.06" | bc | cut -d'.' -f1)
 [ $font_size -lt 12 ] && font_size=12
 banner_height=$((font_size * 3 / 2))
-
-echo "Crop size = ${crop_width}x${crop_height}, font size = ${font_size}px, banner height = ${banner_height}px"
+echo "Crop: ${crop_width}x${crop_height}, font size: ${font_size}px, banner height: ${banner_height}px"
 
 frame_index=0
 for entry in "${filtered[@]}"; do
     file="${entry%:*}"
     ts=$(echo "$file" | sed -n 's/.*wdpsnapshot_\([0-9]\{8\}_[0-9]\{6\}\)\.png/\1/p')
     readable_ts="${ts:0:4}-${ts:4:2}-${ts:6:2} ${ts:9:2}:${ts:11:2}:${ts:13:2}"
+    echo "Frame $frame_index: $file ($readable_ts)"
     
-    echo "Processing frame $frame_index: $file ($readable_ts)"
-    
-    # Download from public bucket
     public_url="$bucket_url/$file"
-    curl -f -s -o "$TMP_DIR/$file" "$public_url" || { echo "Failed to download $file"; exit 1; }
+    curl -f -s -o "$TMP_DIR/$file" "$public_url" || { echo "Download failed"; exit 1; }
     
-    # Crop
     cropped="$TMP_DIR/cropped_${frame_index}.png"
     convert "$TMP_DIR/$file" -crop "${crop_width}x${crop_height}+${x_start}+${y_start}" +repage "$cropped"
     
-    # Create banner
     banner="$TMP_DIR/banner_${frame_index}.png"
     convert -size "${crop_width}x${banner_height}" xc:black \
-        -gravity Center \
-        -pointsize "$font_size" \
-        -fill white \
-        -annotate +0+0 "$readable_ts" \
-        "$banner"
+        -gravity Center -pointsize "$font_size" -fill white \
+        -annotate +0+0 "$readable_ts" "$banner"
     
-    # Stack banner on top
     final_frame="$TMP_DIR/frame_$(printf "%04d" $frame_index).png"
     convert "$banner" "$cropped" -append +repage "$final_frame"
     
-    # Cleanup intermediates
     rm -f "$TMP_DIR/$file" "$cropped" "$banner"
     frame_index=$((frame_index + 1))
 done
 
 # ------------------------------------------------------------
-# 9. Assemble GIF with proportional delays
+# 9. Assemble GIF
 # ------------------------------------------------------------
-echo "Assembling GIF with ${#filtered[@]} frames..."
 convert_cmd="convert -delay ${delays[0]}"
 for i in $(seq 1 $((${#delays[@]} - 1))); do
     convert_cmd+=" -delay ${delays[$i]}"
 done
 convert_cmd+=" \"$TMP_DIR\"/frame_*.png -delay $end_pause \"$TMP_DIR/frame_$(printf "%04d" $((frame_index-1))).png\" -loop 0 \"$output\""
-
 eval "$convert_cmd"
-echo "GIF created: $output ($(du -h "$output" | cut -f1))"
 
-# Cleanup
+echo "GIF created: $output ($(du -h "$output" | cut -f1))"
 rm -rf "$TMP_DIR" snapshots.json
 
 # ------------------------------------------------------------
-# 10. Commit GIF to repository (only in GitHub Actions)
+# 10. Commit to repo
 # ------------------------------------------------------------
 if [ -n "${GITHUB_ACTIONS:-}" ]; then
-    echo "Committing $output to repository root..."
     git config user.name "github-actions[bot]"
     git config user.email "github-actions[bot]@users.noreply.github.com"
     git add "$output"
-    git commit -m "Generate timelapse GIF: $date_from to $date_to" || echo "No changes to commit."
+    git commit -m "Generate timelapse GIF: $date_from to $date_to" || true
     git push
-else
-    echo "Not in GitHub Actions – skipping git commit."
 fi
 
 echo "=== Done ==="
