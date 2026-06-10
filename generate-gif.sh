@@ -83,9 +83,45 @@ if [[ $BANNER_HEIGHT -lt $(( FONT_SIZE + 4 )) ]]; then
   BANNER_HEIGHT=$(( FONT_SIZE + 4 ))
 fi
 
-i=0
-for fname in "${SNAPSHOTS[@]}"; do
-  # Extract display timestamp: YYYY-MM-DD HH:MM:SS
+# Helper function to process one frame (avoids duplication)
+process_frame() {
+  local fname="$1"
+  local idx="$2"
+  local ts_display="$3"
+  rclone copyto ":s3:${R2_BUCKET}/${fname}" "frames/${fname}" "${RCLONE_BASE[@]}"
+  convert "frames/${fname}" -crop "$CROP" +repage "processed/cropped_${idx}.png"
+  convert "processed/cropped_${idx}.png" -background "#A0BDFF" -alpha remove -alpha off "processed/cropped_${idx}.png"
+  convert -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
+    -gravity Center -pointsize "$FONT_SIZE" -fill white -annotate +0+0 "$ts_display" \
+    "processed/banner_${idx}.png"
+  convert "processed/banner_${idx}.png" "processed/cropped_${idx}.png" -append +repage "processed/frame_${idx}.png"
+}
+
+# Early estimate: process first snapshot and project total size
+total_snapshots=${#SNAPSHOTS[@]}
+first_fname="${SNAPSHOTS[0]}"
+if [[ $first_fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
+  datestr="${BASH_REMATCH[1]}"
+  timestr="${BASH_REMATCH[2]}"
+  first_ts="${datestr:0:4}-${datestr:4:2}-${datestr:6:2} ${timestr:0:2}:${timestr:2:2}:${timestr:4:2}"
+else
+  first_ts="unknown"
+fi
+
+process_frame "$first_fname" "0000" "$first_ts"
+first_size=$(stat -c%s "processed/frame_0000.png")
+estimated_total=$(( first_size * total_snapshots ))
+estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
+
+if [[ $estimated_total -gt 104857600 ]]; then
+  echo "ERROR: Estimated total size of ${total_snapshots} frames is ~${estimated_mb} MB – exceeds 100 MB limit. Aborting."
+  exit 1
+fi
+echo "Estimated total size: ~${estimated_mb} MB – processing remaining frames."
+
+# Process the rest of the snapshots
+i=1
+for fname in "${SNAPSHOTS[@]:1}"; do
   if [[ $fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
     datestr="${BASH_REMATCH[1]}"
     timestr="${BASH_REMATCH[2]}"
@@ -93,33 +129,8 @@ for fname in "${SNAPSHOTS[@]}"; do
   else
     ts_display="unknown"
   fi
-
   echo "  $fname  ->  frame_$(printf "%04d" $i).png"
-
-  # Download
-  rclone copyto ":s3:${R2_BUCKET}/${fname}" "frames/${fname}" "${RCLONE_BASE[@]}"
-
-  # Crop (use convert, not magick)
-  convert "frames/${fname}" -crop "$CROP" +repage "processed/cropped_$(printf "%04d" $i).png"
-  
-    # Fill transparent pixels with wplace blue (#A0BDFF)
-  convert "processed/cropped_$(printf "%04d" $i).png" \
-    -background "#A0BDFF" -alpha remove -alpha off \
-    "processed/cropped_$(printf "%04d" $i).png"
-
-  # Create timestamp banner
-  convert -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
-    -gravity Center \
-    -pointsize "$FONT_SIZE" \
-    -fill white \
-    -annotate +0+0 "$ts_display" \
-    "processed/banner_$(printf "%04d" $i).png"
-
-  # Stack banner on top of cropped image (vertical append)
-  convert "processed/banner_$(printf "%04d" $i).png" \
-          "processed/cropped_$(printf "%04d" $i).png" \
-          -append +repage "processed/frame_$(printf "%04d" $i).png"
-
+  process_frame "$fname" "$(printf "%04d" $i)" "$ts_display"
   i=$(( i + 1 ))
 done
 
@@ -177,6 +188,11 @@ done
 END_DELAY=$(( 2 * MAX_DELAY ))
 [[ $END_DELAY -lt 100 ]] && END_DELAY=100
 
+# -- Assemble GIF with per-frame delays and a final extended frame -----
+echo "Assembling GIF..."
+
+FRAME_COUNT=${#SNAPSHOTS[@]}
+
 # -- Check total size of frames (limit 100 MB) ---------------------------
 TOTAL_SIZE=0
 for f in processed/frame_*.png; do
@@ -189,11 +205,6 @@ if [[ $TOTAL_SIZE -gt 104857600 ]]; then
   echo "ERROR: Total size of ${FRAME_COUNT} frames is ${MB} MB – exceeds 100 MB limit. Aborting."
   exit 1
 fi
-
-# -- Assemble GIF with per-frame delays and a final extended frame -----
-echo "Assembling GIF..."
-
-FRAME_COUNT=${#SNAPSHOTS[@]}
 
 # Prepare arguments for the final convert command
 ARGS=()
