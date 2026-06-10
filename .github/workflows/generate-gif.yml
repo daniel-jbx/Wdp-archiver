@@ -1,22 +1,27 @@
-name: Generate Timelapse GIF
+name: Generate GIF
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
-  build:
+  make-gif:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout main branch
+      - name: Checkout repository (for script and config)
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install ImageMagick and rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg jq bc curl imagemagick
+          sudo apt-get install -y imagemagick
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
 
       - name: Generate GIF
-        run: bash generate-gif.sh
+        run: bash generate-gif.sh gif-config.json
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
