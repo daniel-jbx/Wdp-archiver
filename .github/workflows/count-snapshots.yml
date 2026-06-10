@@ -1,0 +1,46 @@
+name: Count snapshots per date
+
+on:
+  workflow_dispatch:
+
+jobs:
+  count:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install jq and curl
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Fetch all releases and count per date
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          AUTH_HEADER=""
+          if [[ -n "$GITHUB_TOKEN" ]]; then
+            AUTH_HEADER="-H 'Authorization: token $GITHUB_TOKEN'"
+          fi
+
+          declare -A count
+          page=1
+          while true; do
+            echo "Fetching page $page..." >&2
+            resp=$(curl -s -L $AUTH_HEADER "https://api.github.com/repos/murolem/wplace-archives/releases?page=$page&per_page=100")
+            if [[ "$(echo "$resp" | jq length)" -eq 0 ]]; then
+              break
+            fi
+            while IFS= read -r tag; do
+              # Extract date from tag (world-YYYY-MM-DD...)
+              date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
+              if [[ -n "$date" ]]; then
+                ((count[$date]++))
+              fi
+            done < <(echo "$resp" | jq -r '.[].tag_name')
+            ((page++))
+            if [[ $page -gt 200 ]]; then break; fi
+            sleep 0.5
+          done
+
+          echo "Date       | Snapshots"
+          echo "-----------|----------"
+          for date in $(printf '%s\n' "${!count[@]}" | sort); do
+            printf "%s | %d\n" "$date" "${count[$date]}"
+          done
