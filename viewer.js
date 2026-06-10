@@ -567,6 +567,14 @@
       selCtx.fillRect(h.x - HANDLE_SIZE/2, h.y - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE);
       selCtx.strokeRect(h.x - HANDLE_SIZE/2, h.y - HANDLE_SIZE/2, HANDLE_SIZE, HANDLE_SIZE);
     });
+        // Show the range format needed for gif-config.json
+    const coordsDiv = document.getElementById('coords-display');
+    if (rect) {
+      coordsDiv.style.display = 'inline-block';
+      coordsDiv.textContent = `x: [${rect.x1}, ${rect.x2}]  y: [${rect.y1}, ${rect.y2}]`;
+    } else {
+      coordsDiv.style.display = 'none';
+    }
   }
   function hitTestHandle(clientX, clientY) {
     const rect = getSelectionRect();
@@ -657,6 +665,7 @@
         dragHandle = null;
         selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
         setSelectionButtonsVisible(false);
+        document.getElementById('coords-display').style.display = 'none';
       }
     });
   }
