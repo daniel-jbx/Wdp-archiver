@@ -1,0 +1,44 @@
+name: Rebuild antarktika snapshots.json from existing files
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rclone jq
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          region = auto
+          EOF
+
+      - name: Build and upload antarktika manifest
+        run: |
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          echo "Listing all antarktika snapshots..."
+          rclone lsf "r2:$BUCKET/antarktika/antarktika_snapshot_*.png" | sort -u > /tmp/files.txt
+          cat /tmp/files.txt
+          echo "Building JSON array..."
+          jq -R -s 'split("\n") | map(select(length>0))' /tmp/files.txt > /tmp/manifest.json
+          echo "Manifest has $(jq length /tmp/manifest.json) entries."
+          rclone copyto /tmp/manifest.json "r2:$BUCKET/antarktika/snapshots.json"
+          echo "✅ Manifest uploaded."
+
+      - name: Verify
+        run: |
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          echo "First 5 entries in antarktika/snapshots.json:"
+          rclone cat "r2:$BUCKET/antarktika/snapshots.json" | jq -r '.[]' | head -5
