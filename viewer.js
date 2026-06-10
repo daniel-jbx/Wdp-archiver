@@ -91,11 +91,24 @@ const R2_BASE_URL = dataset === 'wdp'
   : 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/antarktika/';
 
 console.log(`Viewer using dataset: ${dataset}, R2 base: ${R2_BASE_URL}`);
+
+  // ---- Tile ranges for each dataset ----
+let START_COL, START_ROW, NUM_COLS, NUM_ROWS;
+if (dataset === 'wdp') {
+  START_COL = 1225;
+  START_ROW = 513;
+  NUM_COLS = 7;   // 1231-1225+1
+  NUM_ROWS = 6;   // 518-513+1
+} else {
+  START_COL = 1279;
+  START_ROW = 1715;
+  NUM_COLS = 6;   // 1284-1279+1
+  NUM_ROWS = 5;   // 1719-1715+1
+}
   
   // ---- Map constants ----
   const ZOOM = 11, TILE_SIZE = 1000;
   const TOTAL_TILES = Math.pow(2, ZOOM), WORLD_SIZE = TOTAL_TILES * TILE_SIZE;
-  const START_COL = 1225, START_ROW = 513;
 
   function worldYToLat(yPx) {
     const mcY = 1 - 2 * yPx / WORLD_SIZE;
@@ -131,8 +144,9 @@ console.log(`Viewer using dataset: ${dataset}, R2 base: ${R2_BASE_URL}`);
   // ---- Texture management ----
   const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
   console.log('Max texture size:', MAX_TEX);
-  const IMG_WIDTH = 7000, IMG_HEIGHT = 6000;
-  let SINGLE_TEXTURE = MAX_TEX >= IMG_WIDTH && MAX_TEX >= IMG_HEIGHT;
+ const IMG_WIDTH = NUM_COLS * TILE_SIZE;
+const IMG_HEIGHT = NUM_ROWS * TILE_SIZE;
+console.log(`Image dimensions: ${IMG_WIDTH}x${IMG_HEIGHT}`);
 
   let tileTextures = [];
   let singleTextureInfo = null;
