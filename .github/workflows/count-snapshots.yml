@@ -7,40 +7,56 @@ jobs:
   count:
     runs-on: ubuntu-latest
     steps:
-      - name: Install jq and curl
-        run: sudo apt-get update && sudo apt-get install -y jq curl
+      - name: Install jq and curl (optional, Python uses curl directly)
+        run: sudo apt-get update && sudo apt-get install -y curl
 
       - name: Fetch all releases and count per date
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          AUTH_HEADER=""
-          if [[ -n "$GITHUB_TOKEN" ]]; then
-            AUTH_HEADER="-H 'Authorization: token $GITHUB_TOKEN'"
-          fi
+          python3 << 'EOF'
+          import json, subprocess, sys, time
+          from collections import defaultdict
 
-          declare -A count
-          page=1
-          while true; do
-            echo "Fetching page $page..." >&2
-            resp=$(curl -s -L $AUTH_HEADER "https://api.github.com/repos/murolem/wplace-archives/releases?page=$page&per_page=100")
-            if [[ "$(echo "$resp" | jq length)" -eq 0 ]]; then
-              break
-            fi
-            while IFS= read -r tag; do
-              # Extract date from tag (world-YYYY-MM-DD...)
-              date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
-              if [[ -n "$date" ]]; then
-                ((count[$date]++))
-              fi
-            done < <(echo "$resp" | jq -r '.[].tag_name')
-            ((page++))
-            if [[ $page -gt 200 ]]; then break; fi
-            sleep 0.5
-          done
+          token = "${{ secrets.GITHUB_TOKEN }}"
+          headers = []
+          if token:
+              headers = ["-H", f"Authorization: token {token}"]
 
-          echo "Date       | Snapshots"
-          echo "-----------|----------"
-          for date in $(printf '%s\n' "${!count[@]}" | sort); do
-            printf "%s | %d\n" "$date" "${count[$date]}"
-          done
+          page = 1
+          counts = defaultdict(int)
+
+          while True:
+              print(f"Fetching page {page}...", file=sys.stderr)
+              url = f"https://api.github.com/repos/murolem/wplace-archives/releases?page={page}&per_page=100"
+              cmd = ["curl", "-s", "-L"] + headers + [url]
+              result = subprocess.run(cmd, capture_output=True, text=True)
+              if result.returncode != 0:
+                  print(f"Error: {result.stderr}", file=sys.stderr)
+                  break
+              try:
+                  data = json.loads(result.stdout)
+              except json.JSONDecodeError:
+                  print(f"Invalid JSON on page {page}", file=sys.stderr)
+                  break
+              if not data:
+                  break
+              for release in data:
+                  tag = release.get("tag_name", "")
+                  if tag.startswith("world-"):
+                      # Extract YYYY-MM-DD from tag
+                      parts = tag.split('-')
+                      if len(parts) >= 3:
+                          date = f"{parts[1]}-{parts[2]}-{parts[3][:2]}"  # world-2026-01-10...
+                          if len(date) == 10:
+                              counts[date] += 1
+              page += 1
+              if page > 200:
+                  break
+              time.sleep(0.5)
+
+          print("\nDate       | Snapshots")
+          print("-----------|----------")
+          for date in sorted(counts.keys()):
+              print(f"{date} | {counts[date]}")
+          EOF
