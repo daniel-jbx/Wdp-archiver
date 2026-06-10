@@ -30,21 +30,25 @@ jobs:
           set -euo pipefail
           BUCKET="${{ secrets.R2_BUCKET }}"
 
-          echo "Renaming wdp_snapshot_*.png -> wdpsnapshot_*.png"
+          echo "Finding all wdp_snapshot_*.png files in root..."
+          # Use rclone ls with --include to list matching files
+          rclone ls "r2:$BUCKET/" --include "wdp_snapshot_*.png" | awk '{print $2}' > /tmp/files.txt
+          cat /tmp/files.txt
 
-          rclone lsf "r2:$BUCKET/wdp_snapshot_*.png" | while read -r oldname; do
+          while read -r oldname; do
+            if [[ -z "$oldname" ]]; then continue; fi
             newname="${oldname/wdp_snapshot_/wdpsnapshot_}"
-            echo "  $oldname -> $newname"
+            echo "Renaming: $oldname -> $newname"
             rclone copyto "r2:$BUCKET/$oldname" "r2:$BUCKET/$newname"
             rclone deletefile "r2:$BUCKET/$oldname"
-          done
+          done < /tmp/files.txt
 
-          echo "Done. No changes made to snapshots.json."
+          echo "Done."
 
-      - name: Verify (optional)
+      - name: Verify
         run: |
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Remaining wdp_snapshot_*.png files (should be 0):"
-          rclone lsf "r2:$BUCKET/wdp_snapshot_*.png" | wc -l
-          echo "New wdpsnapshot_*.png files count:"
-          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" | wc -l
+          echo "Remaining wdp_snapshot_*.png files:"
+          rclone ls "r2:$BUCKET/" --include "wdp_snapshot_*.png" | wc -l
+          echo "Total wdpsnapshot_*.png files:"
+          rclone ls "r2:$BUCKET/" --include "wdpsnapshot_*.png" | wc -l
