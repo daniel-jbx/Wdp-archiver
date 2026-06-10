@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-03-04"
+END_DATE="2026-04-11"
 EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
@@ -77,7 +77,7 @@ date_from_tag() {
 }
 
 ensure_valid_manifest() {
-    local dataset="$1"   # "wdp" or "antarktika"
+    local dataset="$1"
     local prefix="${dataset}/"
     local tmp_manifest=$(mktemp)
     if rclone cat "r2:$R2_BUCKET/${prefix}snapshots.json" 2>/dev/null > "$tmp_manifest"; then
@@ -92,18 +92,17 @@ ensure_valid_manifest() {
 }
 
 process_dataset() {
-    local dataset="$1"       # "wdp" or "antarktika"
+    local dataset="$1"
     local x_start="$2"
     local x_end="$3"
     local y_start="$4"
     local y_end="$5"
     local tag_name="$6"
-    local tiles_dir="$7"     # directory containing extracted tile subdirs (*/x/y.png)
+    local tiles_dir="$7"
 
     local snap_date=$(date_from_tag "$tag_name")
     local snapshot_name="${dataset}_snapshot_${snap_date}.png"
     local prefix="${dataset}/"
-    local state_file="${dataset}-backfill-state.txt"
 
     echo "  [$dataset] Processing $tag_name -> $snapshot_name"
 
@@ -125,8 +124,8 @@ process_dataset() {
     fi
 
     local temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" RETURN
-
+    # No trap; we clean up manually at the end (return will happen after rm)
+    
     # Collect tile files for this dataset
     local tile_files=()
     for y in $(seq "$y_start" "$y_end"); do
@@ -161,6 +160,7 @@ process_dataset() {
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
     rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/${prefix}snapshots.json"
 
+    rm -rf "$temp_dir"
     echo "  [$dataset] ✓ Uploaded $snapshot_name and updated manifest."
     return 0
 }
@@ -215,10 +215,7 @@ if [[ ${#all_dates[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Determine the next date to process for each dataset independently
-# We'll iterate over dates from newest to oldest, but only process a date
-# if at least one dataset hasn't completed it yet.
-
+# Iterate over dates from newest to oldest
 for current_date in "${all_dates[@]}"; do
     wdp_needed=0
     ant_needed=0
@@ -255,11 +252,11 @@ for current_date in "${all_dates[@]}"; do
         echo "--- Processing tag $tag ---"
 
         # ---- Download and extract tiles once for both datasets ----
-        local temp_dir=$(mktemp -d)
-        trap "rm -rf '$temp_dir'" RETURN
+        # NO 'local' here – this is in the main loop
+        temp_dir=$(mktemp -d)
 
         # Fetch asset URLs (split tarballs)
-        local asset_urls=()
+        asset_urls=()
         while IFS= read -r url; do
             asset_urls+=("$url")
         done < <(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$tag" | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
@@ -273,7 +270,7 @@ for current_date in "${all_dates[@]}"; do
         fi
 
         # Build tile patterns for both areas
-        local tile_patterns=()
+        tile_patterns=()
         if [[ $wdp_needed -eq 1 ]]; then
             for x in $(seq $WDP_X_START $WDP_X_END); do
                 for y in $(seq $WDP_Y_START $WDP_Y_END); do
