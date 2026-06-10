@@ -1,4 +1,4 @@
-name: Rebuild antarktika snapshots.json from existing files
+name: Rebuild antarktika snapshots.json
 
 on:
   workflow_dispatch:
@@ -25,20 +25,25 @@ jobs:
           region = auto
           EOF
 
-      - name: Build and upload antarktika manifest
+      - name: List antarktika snapshot files
         run: |
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Listing all antarktika snapshots..."
-          rclone lsf "r2:$BUCKET/antarktika/antarktika_snapshot_*.png" | sort -u > /tmp/files.txt
+          # Use rclone ls with --include (wildcard works correctly)
+          rclone ls "r2:$BUCKET/antarktika/" --include "antarktika_snapshot_*.png" | awk '{print $2}' > /tmp/files.txt
+          echo "Found $(wc -l < /tmp/files.txt) files."
+          echo "Files:"
           cat /tmp/files.txt
-          echo "Building JSON array..."
+
+      - name: Build and upload manifest
+        run: |
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          # Create JSON array from the list
           jq -R -s 'split("\n") | map(select(length>0))' /tmp/files.txt > /tmp/manifest.json
           echo "Manifest has $(jq length /tmp/manifest.json) entries."
           rclone copyto /tmp/manifest.json "r2:$BUCKET/antarktika/snapshots.json"
-          echo "✅ Manifest uploaded."
 
       - name: Verify
         run: |
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "First 5 entries in antarktika/snapshots.json:"
-          rclone cat "r2:$BUCKET/antarktika/snapshots.json" | jq -r '.[]' | head -5
+          echo "--- antarktika/snapshots.json ---"
+          rclone cat "r2:$BUCKET/antarktika/snapshots.json" | jq -r '.[]' | head -10
