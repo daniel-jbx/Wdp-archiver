@@ -13,13 +13,13 @@ Y2=$(jq -r '.y[1]' "$CONFIG_FILE")
 SPEED=$(jq -r '.speed' "$CONFIG_FILE")
 OUTPUT_GIF=$(jq -r '.output_gif' "$CONFIG_FILE")
 
-# Validate essentials
-if [[ -z "$START" || -z "$END" || -z "$SPEED" ]]; then
+# Validate
+if [[ -z "$START" || -z "$END" || -z "$SPEED" || -z "$OUTPUT_GIF" ]]; then
   echo "Missing required fields in $CONFIG_FILE"
   exit 1
 fi
 
-# Crop geometry
+# Crop dimensions (inclusive start, exclusive end)
 WIDTH=$(( X2 - X1 ))
 HEIGHT=$(( Y2 - Y1 ))
 CROP="${WIDTH}x${HEIGHT}+${X1}+${Y1}"
@@ -30,17 +30,16 @@ CROP="${WIDTH}x${HEIGHT}+${X1}+${Y1}"
 : "${R2_ACCESS_KEY_ID:?R2_ACCESS_KEY_ID not set}"
 : "${R2_SECRET_ACCESS_KEY:?R2_SECRET_ACCESS_KEY not set}"
 
-# rclone base flags
 RCLONE_BASE=(--s3-provider="Cloudflare" --s3-endpoint="$R2_ENDPOINT"
              --s3-access-key-id="$R2_ACCESS_KEY_ID"
              --s3-secret-access-key="$R2_SECRET_ACCESS_KEY"
              --s3-no-check-bucket)
 
-# -- Fetch snapshot list ------------------------------------------------
+# -- Fetch snapshot list from R2 ---------------------------------------
 echo "Downloading snapshots.json..."
 rclone cat ":s3:${R2_BUCKET}/snapshots.json" "${RCLONE_BASE[@]}" > snapshots.json
 
-# Filter and sort filenames within the time range
+# Filter and sort snapshots by timestamp
 START_EPOCH=$(date -d"$START" +%s)
 END_EPOCH=$(date -d"$END" +%s)
 
@@ -64,24 +63,63 @@ if [[ ${#SNAPSHOTS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# -- Download and crop each snapshot ------------------------------------
-mkdir -p frames
-echo "Downloading and cropping ${#SNAPSHOTS[@]} snapshots..."
+# -- Download and crop each snapshot, then add timestamp banner -------
+mkdir -p frames processed
+echo "Downloading and processing ${#SNAPSHOTS[@]} snapshots..."
+
+# Font size proportional to crop height (minimum 10px)
+FONT_SIZE=$(( HEIGHT / 20 ))
+if [[ $FONT_SIZE -lt 10 ]]; then
+  FONT_SIZE=10
+fi
+
+# Banner height: FONT_SIZE * 1.2 (integer part) with a minimum of FONT_SIZE+4
+BANNER_HEIGHT=$(echo "$FONT_SIZE * 1.2" | bc | cut -d'.' -f1 2>/dev/null || echo "$(( (FONT_SIZE * 12) / 10 ))")
+if [[ $BANNER_HEIGHT -lt $(( FONT_SIZE + 4 )) ]]; then
+  BANNER_HEIGHT=$(( FONT_SIZE + 4 ))
+fi
+
+i=0
 for fname in "${SNAPSHOTS[@]}"; do
-  echo "  $fname"
+  # Extract display timestamp: YYYY-MM-DD HH:MM:SS
+  if [[ $fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
+    datestr="${BASH_REMATCH[1]}"
+    timestr="${BASH_REMATCH[2]}"
+    ts_display="${datestr:0:4}-${datestr:4:2}-${datestr:6:2} ${timestr:0:2}:${timestr:2:2}:${timestr:4:2}"
+  else
+    ts_display="unknown"
+  fi
+
+  echo "  $fname  ->  frame_$(printf "%04d" $i).png"
+
+  # Download
   rclone copyto ":s3:${R2_BUCKET}/${fname}" "frames/${fname}" "${RCLONE_BASE[@]}"
-  magick "frames/${fname}" -crop "$CROP" +repage "frames/crop_${fname}"
+
+  # Crop
+  magick "frames/${fname}" -crop "$CROP" +repage "processed/cropped_$(printf "%04d" $i).png"
+
+  # Create timestamp banner
+  magick -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
+    -gravity Center \
+    -pointsize "$FONT_SIZE" \
+    -fill white \
+    -annotate +0+0 "$ts_display" \
+    "processed/banner_$(printf "%04d" $i).png"
+
+  # Stack banner on top of cropped image
+  magick "processed/banner_$(printf "%04d" $i).png" \
+         "processed/cropped_$(printf "%04d" $i).png" \
+         -append +repage "processed/frame_$(printf "%04d" $i).png"
+
+  i=$(( i + 1 ))
 done
 
-# -- Compute per-frame delays -------------------------------------------
-declare -a DELAYS
+# -- Compute per-frame delays from time gaps ---------------------------
 prev_ts=0
 prev_fname=""
 diffs=()
 
-# Build array of time differences
 for fname in "${SNAPSHOTS[@]}"; do
-  # Extract timestamp again (could cache, but simple re‑extraction is fine)
   if [[ $fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
     datestr="${BASH_REMATCH[1]}"
     timestr="${BASH_REMATCH[2]}"
@@ -95,54 +133,75 @@ for fname in "${SNAPSHOTS[@]}"; do
   fi
 done
 
-# If only one snapshot, set a minimal diff to avoid division by zero
+# Handle single snapshot
 if [[ ${#diffs[@]} -eq 0 ]]; then
-  MIN_DIFF=$(( 1 ))
+  MIN_DIFF=1
+  diffs=(1)   # single frame gets 1 s base delay
 else
   # Find minimum difference
   MIN_DIFF=${diffs[0]}
   for d in "${diffs[@]}"; do
     (( d < MIN_DIFF )) && MIN_DIFF=$d
   done
+
+  # Add a duplicate of the last interval for the final frame (end pause)
+  diffs+=("${diffs[-1]}")
 fi
 
-# Fallback for last frame: duplicate the previous diff, or use MIN_DIFF
-if [[ ${#diffs[@]} -gt 0 ]]; then
-  diffs+=("${diffs[-1]}")   # repeat the last interval for the final frame
-else
-  diffs=("$MIN_DIFF")       # single frame case
-fi
-
-# Convert each diff to centiseconds using the speed factor
+# Convert each diff to centiseconds: delay_cs = (diff / MIN_DIFF) * (100 / SPEED)
+DELAYS=()
 for diff_sec in "${diffs[@]}"; do
-  # delay_seconds = (diff_sec / MIN_DIFF) * (1 / SPEED)
-  # Use bc for floating point, then convert to centiseconds (1 s = 100 cs)
   delay_cs=$(echo "scale=2; ($diff_sec / $MIN_DIFF) * (100 / $SPEED)" | bc)
-  # Round to nearest integer
   delay_cs=$(printf "%.0f" "$delay_cs")
-  # ImageMagick requires a minimum delay of 2 (0.02 s) for GIFs
-  if (( delay_cs < 2 )); then
+  # Minimum GIF delay is 2 centiseconds
+  if [[ $delay_cs -lt 2 ]]; then
     delay_cs=2
   fi
   DELAYS+=("$delay_cs")
 done
 
-# -- Assemble GIF -------------------------------------------------------
+# -- End pause: 2× max delay or 100 cs, whichever is larger ------------
+MAX_DELAY=0
+for d in "${DELAYS[@]}"; do
+  (( d > MAX_DELAY )) && MAX_DELAY=$d
+done
+END_DELAY=$(( 2 * MAX_DELAY ))
+[[ $END_DELAY -lt 100 ]] && END_DELAY=100
+
+# -- Assemble GIF with per-frame delays and a final extended frame -----
 echo "Assembling GIF..."
+
+FRAME_COUNT=${#SNAPSHOTS[@]}
 MAGICK_CMD=(magick)
 
-# Add each frame with its specific delay
-for i in "${!SNAPSHOTS[@]}"; do
-  fname="${SNAPSHOTS[$i]}"
-  MAGICK_CMD+=(-delay "${DELAYS[$i]}" "frames/crop_${fname}")
+# Add each frame with its computed delay
+for i in $(seq 0 $(( FRAME_COUNT - 1 ))); do
+  idx=$(printf "%04d" $i)
+  MAGICK_CMD+=(-delay "${DELAYS[$i]}" "processed/frame_${idx}.png")
 done
 
-# Final options: loop forever (-loop 0), optimize for size
+# Duplicate last frame for the end pause
+LAST_IDX=$(printf "%04d" $(( FRAME_COUNT - 1 )))
+cp "processed/frame_${LAST_IDX}.png" "processed/last_hold.png"
+MAGICK_CMD+=(-delay "$END_DELAY" "processed/last_hold.png")
+
+# Loop forever, optimize layers
 MAGICK_CMD+=(-loop 0 -layers Optimize "$OUTPUT_GIF")
 
 "${MAGICK_CMD[@]}"
 
-# -- Upload result to R2 ------------------------------------------------
-echo "Uploading $OUTPUT_GIF to R2..."
-rclone copyto "$OUTPUT_GIF" ":s3:${R2_BUCKET}/${OUTPUT_GIF}" "${RCLONE_BASE[@]}" --verbose
-echo "Done."
+# -- Resolve filename collision (rename if file already exists) -------
+FINAL_NAME="$OUTPUT_GIF"
+if [[ -f "$FINAL_NAME" ]]; then
+  base="${OUTPUT_GIF%.*}"
+  ext="${OUTPUT_GIF##*.}"
+  counter=1
+  while [[ -f "${base}_${counter}.${ext}" ]]; do
+    counter=$(( counter + 1 ))
+  done
+  FINAL_NAME="${base}_${counter}.${ext}"
+  mv "$OUTPUT_GIF" "$FINAL_NAME"
+  echo "Renamed GIF to avoid overwriting: $FINAL_NAME"
+fi
+
+echo "GIF saved to $FINAL_NAME"
