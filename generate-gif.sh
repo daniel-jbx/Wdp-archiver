@@ -97,6 +97,11 @@ for fname in "${SNAPSHOTS[@]}"; do
 
   # Crop (use convert, not magick)
   convert "frames/${fname}" -crop "$CROP" +repage "processed/cropped_$(printf "%04d" $i).png"
+  
+    # Fill transparent pixels with wplace blue (#A0BDFF)
+  convert "processed/cropped_$(printf "%04d" $i).png" \
+    -background "#A0BDFF" -alpha remove -alpha off \
+    "processed/cropped_$(printf "%04d" $i).png"
 
   # Create timestamp banner
   convert -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
