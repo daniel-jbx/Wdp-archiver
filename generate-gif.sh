@@ -63,7 +63,7 @@ if [[ ${#SNAPSHOTS[@]} -eq 0 ]]; then
   exit 1
 fi
 
-# -- Download and crop each snapshot, then add timestamp banner -------
+# -- Download, crop, and add timestamp banner --------------------------
 mkdir -p frames processed
 echo "Downloading and processing ${#SNAPSHOTS[@]} snapshots..."
 
@@ -95,21 +95,21 @@ for fname in "${SNAPSHOTS[@]}"; do
   # Download
   rclone copyto ":s3:${R2_BUCKET}/${fname}" "frames/${fname}" "${RCLONE_BASE[@]}"
 
-  # Crop
-  magick "frames/${fname}" -crop "$CROP" +repage "processed/cropped_$(printf "%04d" $i).png"
+  # Crop (use convert, not magick)
+  convert "frames/${fname}" -crop "$CROP" +repage "processed/cropped_$(printf "%04d" $i).png"
 
   # Create timestamp banner
-  magick -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
+  convert -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
     -gravity Center \
     -pointsize "$FONT_SIZE" \
     -fill white \
     -annotate +0+0 "$ts_display" \
     "processed/banner_$(printf "%04d" $i).png"
 
-  # Stack banner on top of cropped image
-  magick "processed/banner_$(printf "%04d" $i).png" \
-         "processed/cropped_$(printf "%04d" $i).png" \
-         -append +repage "processed/frame_$(printf "%04d" $i).png"
+  # Stack banner on top of cropped image (vertical append)
+  convert "processed/banner_$(printf "%04d" $i).png" \
+          "processed/cropped_$(printf "%04d" $i).png" \
+          -append +repage "processed/frame_$(printf "%04d" $i).png"
 
   i=$(( i + 1 ))
 done
@@ -136,7 +136,7 @@ done
 # Handle single snapshot
 if [[ ${#diffs[@]} -eq 0 ]]; then
   MIN_DIFF=1
-  diffs=(1)   # single frame gets 1 s base delay
+  diffs=(1)
 else
   # Find minimum difference
   MIN_DIFF=${diffs[0]}
@@ -172,23 +172,21 @@ END_DELAY=$(( 2 * MAX_DELAY ))
 echo "Assembling GIF..."
 
 FRAME_COUNT=${#SNAPSHOTS[@]}
-MAGICK_CMD=(magick)
 
-# Add each frame with its computed delay
+# Prepare arguments for the final convert command
+ARGS=()
 for i in $(seq 0 $(( FRAME_COUNT - 1 ))); do
   idx=$(printf "%04d" $i)
-  MAGICK_CMD+=(-delay "${DELAYS[$i]}" "processed/frame_${idx}.png")
+  ARGS+=(-delay "${DELAYS[$i]}" "processed/frame_${idx}.png")
 done
 
 # Duplicate last frame for the end pause
 LAST_IDX=$(printf "%04d" $(( FRAME_COUNT - 1 )))
 cp "processed/frame_${LAST_IDX}.png" "processed/last_hold.png"
-MAGICK_CMD+=(-delay "$END_DELAY" "processed/last_hold.png")
+ARGS+=(-delay "$END_DELAY" "processed/last_hold.png")
 
-# Loop forever, optimize layers
-MAGICK_CMD+=(-loop 0 -layers Optimize "$OUTPUT_GIF")
-
-"${MAGICK_CMD[@]}"
+# Final GIF (use convert, not magick)
+convert "${ARGS[@]}" -loop 0 -layers Optimize "$OUTPUT_GIF"
 
 # -- Resolve filename collision (rename if file already exists) -------
 FINAL_NAME="$OUTPUT_GIF"
