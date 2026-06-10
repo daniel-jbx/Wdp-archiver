@@ -5,15 +5,11 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-04-15"
-EXTRA_DATES=()
-
-# Special single-snapshot date – exact tag for midnight 2026-05-29
-SINGLE_SNAPSHOT_DATE=""
-SPECIAL_TAG=""
+END_DATE="2026-05-11"
+EXTRA_DATES=("2026-05-26" "2026-05-27" "2026-05-28")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
-STATE_FILE="backfill-state.txt"   # single line with last completed date
+STATE_FILE="backfill-state.txt"
 
 X_START=1225
 X_END=1231
@@ -177,14 +173,14 @@ process_release() {
 }
 
 # ============================
-# MAIN – State‑based progression (newest to oldest)
+# MAIN – State-based progression (newest to oldest)
 # ============================
 
 # Read last completed date from state file
 if rclone cat "r2:$R2_BUCKET/$STATE_FILE" 2>/dev/null > /tmp/state; then
     last_done=$(cat /tmp/state)
 else
-    last_done=""  # will start from the newest date
+    last_done=""
 fi
 echo "Last completed date: ${last_done:-none}"
 
@@ -213,10 +209,6 @@ for tag in $all_tags; do
         done
     fi
 done
-
-# Special date: hardcoded midnight snapshot
-day_tags["$SINGLE_SNAPSHOT_DATE"]="$SPECIAL_TAG|"
-echo "Special date $SINGLE_SNAPSHOT_DATE will process only snapshot: $SPECIAL_TAG"
 
 # Get all dates sorted newest first
 all_dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
@@ -251,10 +243,8 @@ echo "Processing date: $next_date"
 # Get tags for this date
 IFS='|' read -ra tags <<< "${day_tags[$next_date]}"
 tags=(${tags[@]/#/})  # remove empties
-if [[ "$next_date" != "$SINGLE_SNAPSHOT_DATE" ]]; then
-    # For normal dates, sort newest first within the day (optional)
-    IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
-fi
+# Sort tags descending (newest first) within the day
+IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
 unset IFS
 
 echo "Found ${#tags[@]} snapshots for $next_date."
