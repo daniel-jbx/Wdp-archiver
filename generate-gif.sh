@@ -219,7 +219,12 @@ cp "processed/frame_${LAST_IDX}.png" "processed/last_hold.png"
 ARGS+=(-delay "$END_DELAY" "processed/last_hold.png")
 
 # Final GIF (use convert, not magick)
-convert "${ARGS[@]}" -loop 0 -layers Optimize "$OUTPUT_GIF"
+convert "${ARGS[@]}" -loop 0 "$OUTPUT_GIF"
+if command -v gifsicle &>/dev/null; then
+  gifsicle --batch -O3 "$OUTPUT_GIF"
+else
+  echo "gifsicle not found – skipping optimisation (file may be larger)"
+fi
 
 # -- Resolve filename collision (rename if file already exists) -------
 FINAL_NAME="$OUTPUT_GIF"
