@@ -80,6 +80,7 @@ date_from_tag() {
     echo "$tag" | sed 's/world-//' | sed 's/T/_/' | sed 's/-//g' | sed 's/\..*//'
 }
 
+# Reliable manifest update: download → add → upload
 append_to_manifest() {
     local manifest_path="$1"
     local snapshot_name="$2"
@@ -98,6 +99,17 @@ append_to_manifest() {
     rm -rf "$tmp_dir"
 }
 
+# Reliable state file write (content -> temp file -> copyto)
+write_state_file() {
+    local state_path="$1"
+    local content="$2"
+    local tmp_file=$(mktemp)
+    echo "$content" > "$tmp_file"
+    rclone copyto "$tmp_file" "r2:$R2_BUCKET/$state_path"
+    rm -f "$tmp_file"
+}
+
+# Process WDP (snapshots at root, manifest at root)
 process_wdp() {
     local tag_name="$1"
     local tiles_dir="$2"
@@ -142,6 +154,7 @@ process_wdp() {
     return 0
 }
 
+# Process antarktika (snapshots under antarktika/, manifest at antarktika/snapshots.json)
 process_antarktika() {
     local tag_name="$1"
     local tiles_dir="$2"
@@ -190,7 +203,7 @@ process_antarktika() {
 # MAIN
 # ============================
 
-# Read state files
+# Read state files (using rclone cat, which works for reading)
 last_wdp=""
 if rclone cat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null > /tmp/wdp_state; then
     content=$(cat /tmp/wdp_state)
@@ -301,7 +314,6 @@ for tag in "${tags[@]}"; do
     rclone stat "r2:$R2_BUCKET/$wdp_snapshot" &>/dev/null && wdp_exists=1
     rclone stat "r2:$R2_BUCKET/antarktika/$ant_snapshot" &>/dev/null && ant_exists=1
 
-    # Debug output
     echo "--- Tag $tag: WDP exists=$wdp_exists, Ant exists=$ant_exists ---"
 
     if [[ $wdp_exists -eq 1 && $ant_exists -eq 1 ]]; then
@@ -374,13 +386,13 @@ for tag in "${tags[@]}"; do
     rm -rf "$temp_dir"
 done
 
-# Update state files only if all needed tags succeeded
+# Update state files using reliable write_state_file function
 if [[ $wdp_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
-    echo "$next_date" | rclone rcat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null || true
+    write_state_file "wdp-backfill-state.txt" "$next_date"
     echo "✅ WDP state -> $next_date"
 fi
 if [[ $ant_needed -eq 1 && $ant_success_all -eq 1 ]]; then
-    echo "$next_date" | rclone rcat "r2:$R2_BUCKET/antarktika-backfill-state.txt" 2>/dev/null || true
+    write_state_file "antarktika-backfill-state.txt" "$next_date"
     echo "✅ Antarktika state -> $next_date"
 fi
 
