@@ -25,3 +25,11 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          
+      - name: Commit and push GIF
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add *.gif
+          git diff --staged --quiet || git commit -m "Add generated GIF"
+          git push
