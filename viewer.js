@@ -217,7 +217,11 @@
   }
 
   function drawScene() {
-    gl.clearColor(0.627, 0.741, 1.0, 1.0);
+    if (dataset === 'antarktika') {
+  gl.clearColor(0.9725, 0.9569, 0.9412, 1.0); // #F8F4F0
+} else {
+  gl.clearColor(0.627, 0.741, 1.0, 1.0); // original blue
+}
     gl.clear(gl.COLOR_BUFFER_BIT);
 
     const cssW = window.innerWidth, cssH = window.innerHeight;
