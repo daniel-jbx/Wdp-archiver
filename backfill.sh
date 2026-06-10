@@ -32,7 +32,7 @@ for tool in curl jq tar montage pngquant rclone; do
     if ! command -v "$tool" &>/dev/null; then
         echo "Missing required tool: $tool"
         exit 1
-    done
+    fi
 done
 
 # ============================
