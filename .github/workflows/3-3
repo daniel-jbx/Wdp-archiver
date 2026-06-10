@@ -1,0 +1,42 @@
+name: Reset backfill state to 2026-03-03
+
+on:
+  workflow_dispatch:
+
+jobs:
+  reset:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: sudo apt-get update && sudo apt-get install -y rclone
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          region = auto
+          EOF
+
+      - name: Reset WDP state
+        run: |
+          echo "2026-03-03" | rclone rcat "r2:${{ secrets.R2_BUCKET }}/wdp-backfill-state.txt"
+          echo "✅ WDP state reset to 2026-03-03"
+
+      - name: Reset Antarktika state
+        run: |
+          echo "2026-03-03" | rclone rcat "r2:${{ secrets.R2_BUCKET }}/antarktika-backfill-state.txt"
+          echo "✅ Antarktika state reset to 2026-03-03"
+
+      - name: Verify states
+        run: |
+          echo "Current WDP state:"
+          rclone cat "r2:${{ secrets.R2_BUCKET }}/wdp-backfill-state.txt"
+          echo ""
+          echo "Current Antarktika state:"
+          rclone cat "r2:${{ secrets.R2_BUCKET }}/antarktika-backfill-state.txt"
