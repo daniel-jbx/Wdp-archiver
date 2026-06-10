@@ -5,10 +5,13 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-03-04"
+END_DATE="2026-03-04"               # Changed from 2026-04-11 to 2026-03-04
 EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
+R2_ENDPOINT="${R2_ENDPOINT:-}"
+R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"
+R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
 
 # WDP (original)
 WDP_X_START=1225
@@ -107,13 +110,25 @@ ensure_valid_manifest() {
     local dataset="$1"
     local prefix="${dataset}/"
     local tmp_manifest=$(mktemp)
-    if rclone cat "r2:$R2_BUCKET/${prefix}snapshots.json" 2>/dev/null > "$tmp_manifest"; then
+    if rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+        --s3-endpoint="$R2_ENDPOINT" \
+        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+        --s3-region="auto" 2>/dev/null > "$tmp_manifest"; then
         if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
             echo "WARNING: $dataset snapshots.json corrupted. Resetting to empty array."
-            echo '[]' | rclone copyto - "r2:$R2_BUCKET/${prefix}snapshots.json"
+            echo '[]' | rclone copyto - ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+                --s3-endpoint="$R2_ENDPOINT" \
+                --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+                --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+                --s3-region="auto" || exit 1
         fi
     else
-        echo '[]' | rclone copyto - "r2:$R2_BUCKET/${prefix}snapshots.json"
+        echo '[]' | rclone copyto - ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-region="auto" || exit 1
     fi
     rm -f "$tmp_manifest"
 }
@@ -136,22 +151,39 @@ process_dataset() {
     ensure_valid_manifest "$dataset"
 
     # Skip if snapshot already in manifest
-    if rclone cat "r2:$R2_BUCKET/${prefix}snapshots.json" | jq -r '.[]' | grep -qx "$snapshot_name"; then
+    if rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+        --s3-endpoint="$R2_ENDPOINT" \
+        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+        --s3-region="auto" 2>/dev/null | jq -r '.[]' | grep -qx "$snapshot_name"; then
         echo "  [$dataset] Already in manifest, skipping."
         return 0
     fi
+
     # Skip if file exists but not in manifest (fix manifest)
-    if rclone ls "r2:$R2_BUCKET/${prefix}" | grep -q "$snapshot_name"; then
+    if rclone ls ":s3:$R2_BUCKET/${prefix}" \
+        --s3-endpoint="$R2_ENDPOINT" \
+        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+        --s3-region="auto" 2>/dev/null | grep -q "$snapshot_name"; then
         echo "  [$dataset] File exists but not in manifest. Adding to manifest."
         local manifest_tmp=$(mktemp)
-        rclone cat "r2:$R2_BUCKET/${prefix}snapshots.json" > "$manifest_tmp"
+        rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-region="auto" > "$manifest_tmp" 2>/dev/null
         jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-        rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/${prefix}snapshots.json"
+        rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-region="auto" || exit 1
         return 0
     fi
 
     local temp_dir=$(mktemp -d)
-    
+
     # Collect tile files for this dataset
     local tile_files=()
     for y in $(seq "$y_start" "$y_end"); do
@@ -178,13 +210,25 @@ process_dataset() {
 
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
 
-    rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/${prefix}$snapshot_name"
+    rclone copyto "$temp_dir/compressed.png" ":s3:$R2_BUCKET/${prefix}$snapshot_name" \
+        --s3-endpoint="$R2_ENDPOINT" \
+        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+        --s3-region="auto" || exit 1
 
     # Update manifest
     local manifest_tmp=$(mktemp)
-    rclone cat "r2:$R2_BUCKET/${prefix}snapshots.json" > "$manifest_tmp"
+    rclone cat ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+        --s3-endpoint="$R2_ENDPOINT" \
+        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+        --s3-region="auto" > "$manifest_tmp" 2>/dev/null
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-    rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/${prefix}snapshots.json"
+    rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/${prefix}snapshots.json" \
+        --s3-endpoint="$R2_ENDPOINT" \
+        --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+        --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+        --s3-region="auto" || exit 1
 
     rm -rf "$temp_dir"
     echo "  [$dataset] ✓ Uploaded $snapshot_name and updated manifest."
@@ -192,16 +236,24 @@ process_dataset() {
 }
 
 # ============================
-# MAIN
+# MAIN – Process only ONE date (the newest not fully done)
 # ============================
 
 # Read last completed dates for each dataset
 last_wdp=""
-if rclone cat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null > /tmp/wdp_state; then
+if rclone cat ":s3:$R2_BUCKET/wdp-backfill-state.txt" \
+    --s3-endpoint="$R2_ENDPOINT" \
+    --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+    --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+    --s3-region="auto" 2>/dev/null > /tmp/wdp_state; then
     last_wdp=$(cat /tmp/wdp_state)
 fi
 last_ant=""
-if rclone cat "r2:$R2_BUCKET/antarktika-backfill-state.txt" 2>/dev/null > /tmp/ant_state; then
+if rclone cat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" \
+    --s3-endpoint="$R2_ENDPOINT" \
+    --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+    --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+    --s3-region="auto" 2>/dev/null > /tmp/ant_state; then
     last_ant=$(cat /tmp/ant_state)
 fi
 echo "Last completed WDP date: ${last_wdp:-none}"
@@ -258,7 +310,7 @@ if [[ ${#all_dates[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Iterate over dates
+# Process only the first (newest) date that needs any work
 for current_date in "${all_dates[@]}"; do
     wdp_needed=0
     ant_needed=0
@@ -269,7 +321,7 @@ for current_date in "${all_dates[@]}"; do
         ant_needed=1
     fi
     if [[ $wdp_needed -eq 0 && $ant_needed -eq 0 ]]; then
-        echo "Date $current_date already fully processed (both datasets)."
+        echo "Date $current_date already fully processed (both datasets). Skipping."
         continue
     fi
 
@@ -294,7 +346,7 @@ for current_date in "${all_dates[@]}"; do
 
         temp_dir=$(mktemp -d)
 
-        # Fetch asset URLs
+        # Fetch asset URLs (split tarballs)
         asset_urls=()
         while IFS= read -r url; do
             asset_urls+=("$url")
@@ -357,15 +409,30 @@ for current_date in "${all_dates[@]}"; do
         rm -rf "$temp_dir"
     done
 
-    # Update states
+    # Update states for this date if fully successful
+    updated=0
     if [[ $wdp_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
-        echo "$current_date" | rclone rcat "r2:$R2_BUCKET/wdp-backfill-state.txt"
+        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/wdp-backfill-state.txt" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-region="auto" || exit 1
         echo "✅ WDP state updated to $current_date"
+        updated=1
     fi
     if [[ $ant_needed -eq 1 && $ant_success_all -eq 1 ]]; then
-        echo "$current_date" | rclone rcat "r2:$R2_BUCKET/antarktika-backfill-state.txt"
+        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-region="auto" || exit 1
         echo "✅ Antarktika state updated to $current_date"
+        updated=1
     fi
+
+    # Stop after processing this date (even if some parts failed)
+    echo "Finished processing date $current_date. Exiting (one day per run)."
+    exit 0
 done
 
-echo "Backfill completed."
+echo "All dates in range are already fully processed. Nothing to do."
