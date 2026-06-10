@@ -115,9 +115,9 @@ process_wdp() {
     local snapshot_name="wdpsnapshot_${snap_date}.png"
     echo "  [WDP] $tag_name -> $snapshot_name"
 
-    # Skip if already uploaded (just update manifest)
+    # Check if already uploaded
     if rclone ls "r2:$R2_BUCKET/" 2>/dev/null | grep -q "$snapshot_name"; then
-        echo "  [WDP] Already exists. Updating manifest."
+        echo "  [WDP] Already exists. Updating manifest (just in case)."
         append_to_manifest "snapshots.json" "$snapshot_name"
         return 0
     fi
@@ -207,7 +207,7 @@ process_antarktika() {
 }
 
 # ============================
-# MAIN – Process only the newest date older than last completed
+# MAIN – Process only the newest date that needs work, and skip tags that are already complete
 # ============================
 
 # Read and validate state files
@@ -272,133 +272,165 @@ if [[ ${#all_dates[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Find the next date to process (the newest date that is older than last_completed for either dataset)
-next_date=""
-for d in "${all_dates[@]}"; do
-    wdp_need=0
-    ant_need=0
-    if [[ -z "$last_wdp" || "$d" < "$last_wdp" ]]; then
-        wdp_need=1
+# Find the next date to process (newest date that is not fully done for both datasets)
+# We will check per tag later, but we still use state files as a first filter to avoid scanning many dates unnecessarily.
+for current_date in "${all_dates[@]}"; do
+    # Use state files to decide if we need to look at this date at all
+    wdp_date_needed=0
+    ant_date_needed=0
+    if [[ -z "$last_wdp" || "$current_date" > "$last_wdp" ]]; then
+        wdp_date_needed=1
     fi
-    if [[ -z "$last_ant" || "$d" < "$last_ant" ]]; then
-        ant_need=1
+    if [[ -z "$last_ant" || "$current_date" > "$last_ant" ]]; then
+        ant_date_needed=1
     fi
-    if [[ $wdp_need -eq 1 || $ant_need -eq 1 ]]; then
-        next_date="$d"
-        break
-    fi
-done
-
-if [[ -z "$next_date" ]]; then
-    echo "All dates in range are already fully processed for both datasets."
-    exit 0
-fi
-
-echo "Next date to process: $next_date"
-
-# Determine which datasets still need this date
-wdp_needed=0
-ant_needed=0
-if [[ -z "$last_wdp" || "$next_date" < "$last_wdp" ]]; then
-    wdp_needed=1
-fi
-if [[ -z "$last_ant" || "$next_date" < "$last_ant" ]]; then
-    ant_needed=1
-fi
-
-echo "Processing date: $next_date (WDP needed=$wdp_needed, Ant needed=$ant_needed)"
-
-IFS='|' read -ra tags <<< "${day_tags[$next_date]}"
-tags=(${tags[@]/#/})
-IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
-unset IFS
-
-echo "Found ${#tags[@]} snapshots for $next_date."
-
-wdp_success_all=1
-ant_success_all=1
-
-for tag in "${tags[@]}"; do
-    if [[ -z "$tag" ]]; then
+    if [[ $wdp_date_needed -eq 0 && $ant_date_needed -eq 0 ]]; then
+        echo "Date $current_date already fully processed according to state files. Skipping."
         continue
     fi
 
-    echo "--- Processing tag $tag ---"
+    echo "Processing date: $current_date (needs WDP=$wdp_date_needed, needs Ant=$ant_date_needed)"
 
-    temp_dir=$(mktemp -d)
-    trap "rm -rf '$temp_dir'" RETURN
+    IFS='|' read -ra tags <<< "${day_tags[$current_date]}"
+    tags=(${tags[@]/#/})
+    IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
+    unset IFS
 
-    # Fetch asset URLs (split tarballs)
-    asset_urls=()
-    while IFS= read -r url; do
-        asset_urls+=("$url")
-    done < <(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$tag" | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
+    echo "Found ${#tags[@]} snapshots for $current_date."
 
-    if [[ ${#asset_urls[@]} -eq 0 ]]; then
-        echo "  ERROR: No split tarballs found for $tag. Skipping this tag for both datasets."
-        wdp_success_all=0
-        ant_success_all=0
+    wdp_success_all=1
+    ant_success_all=1
+    any_work_done=0
+
+    for tag in "${tags[@]}"; do
+        if [[ -z "$tag" ]]; then
+            continue
+        fi
+
+        # Determine for this specific tag whether each snapshot already exists
+        local snap_date=$(date_from_tag "$tag")
+        local wdp_snapshot="wdpsnapshot_${snap_date}.png"
+        local ant_snapshot="antarktika_snapshot_${snap_date}.png"
+        local wdp_exists=0
+        local ant_exists=0
+
+        if rclone ls "r2:$R2_BUCKET/$wdp_snapshot" &>/dev/null; then
+            wdp_exists=1
+        fi
+        if rclone ls "r2:$R2_BUCKET/antarktika/$ant_snapshot" &>/dev/null; then
+            ant_exists=1
+        fi
+
+        # If both already exist, skip this tag entirely
+        if [[ $wdp_exists -eq 1 && $ant_exists -eq 1 ]]; then
+            echo "--- Tag $tag already fully processed (both snapshots exist). Skipping."
+            continue
+        fi
+
+        echo "--- Processing tag $tag (WDP exists=$wdp_exists, Ant exists=$ant_exists) ---"
+
+        # Build list of tile patterns based on what is missing
+        tile_patterns=()
+        if [[ $wdp_exists -eq 0 ]]; then
+            for x in $(seq $WDP_X_START $WDP_X_END); do
+                for y in $(seq $WDP_Y_START $WDP_Y_END); do
+                    tile_patterns+=("*/$x/$y.png")
+                done
+            done
+        fi
+        if [[ $ant_exists -eq 0 ]]; then
+            for x in $(seq $ANT_X_START $ANT_X_END); do
+                for y in $(seq $ANT_Y_START $ANT_Y_END); do
+                    tile_patterns+=("*/$x/$y.png")
+                done
+            done
+        fi
+
+        if [[ ${#tile_patterns[@]} -eq 0 ]]; then
+            # Should not happen because we already checked both exist
+            continue
+        fi
+
+        temp_dir=$(mktemp -d)
+        trap "rm -rf '$temp_dir'" RETURN
+
+        # Fetch asset URLs (split tarballs)
+        asset_urls=()
+        while IFS= read -r url; do
+            asset_urls+=("$url")
+        done < <(curl -s -L "${AUTH_HEADER[@]}" "https://api.github.com/repos/murolem/wplace-archives/releases/tags/$tag" | jq -r '.assets[].browser_download_url' | grep '\.tar\.gz\.')
+
+        if [[ ${#asset_urls[@]} -eq 0 ]]; then
+            echo "  ERROR: No split tarballs found for $tag. Skipping this tag."
+            # If this tag fails, we cannot mark the entire date as successful.
+            # But we still need to track success for each dataset separately.
+            if [[ $wdp_exists -eq 0 ]]; then
+                wdp_success_all=0
+            fi
+            if [[ $ant_exists -eq 0 ]]; then
+                ant_success_all=0
+            fi
+            rm -rf "$temp_dir"
+            continue
+        fi
+
+        # Extract tiles (only once for all needed patterns)
+        if [[ ${#tile_patterns[@]} -gt 0 ]]; then
+            mkdir -p "$temp_dir/tiles"
+            (
+                for url in "${asset_urls[@]}"; do
+                    curl -L -s --fail "$url"
+                done
+            ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
+        fi
+
+        # Process WDP if missing
+        if [[ $wdp_exists -eq 0 ]]; then
+            if process_wdp "$tag" "$temp_dir/tiles"; then
+                echo "  WDP success for $tag"
+            else
+                wdp_success_all=0
+                echo "  WDP failed for $tag"
+            fi
+        else
+            # Already exists, but we should ensure manifest includes it
+            append_to_manifest "snapshots.json" "$wdp_snapshot"
+        fi
+
+        # Process antarktika if missing
+        if [[ $ant_exists -eq 0 ]]; then
+            if process_antarktika "$tag" "$temp_dir/tiles"; then
+                echo "  Antarktika success for $tag"
+            else
+                ant_success_all=0
+                echo "  Antarktika failed for $tag"
+            fi
+        else
+            append_to_manifest "antarktika/snapshots.json" "$ant_snapshot"
+        fi
+
         rm -rf "$temp_dir"
-        continue
+        any_work_done=1
+    done
+
+    # Update state files only if the entire date succeeded for a dataset (all tags for that dataset processed)
+    # But note: we might have skipped some tags because they already existed; that's fine.
+    # We consider a date fully processed for a dataset if all tags in the date either already existed or were successfully processed.
+    # We already tracked wdp_success_all and ant_success_all; they are set to 0 only if a needed tag failed.
+    # However, if a tag was skipped because both existed, it does not affect the success flag.
+    # So we can update state files if the success flag is still 1 (meaning no failures for needed tags).
+    if [[ $wdp_date_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
+        echo "$current_date" | rclone rcat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null || true
+        echo "✅ WDP state updated to $current_date"
+    fi
+    if [[ $ant_date_needed -eq 1 && $ant_success_all -eq 1 ]]; then
+        echo "$current_date" | rclone rcat "r2:$R2_BUCKET/antarktika-backfill-state.txt" 2>/dev/null || true
+        echo "✅ Antarktika state updated to $current_date"
     fi
 
-    # Build tile patterns only for needed datasets
-    tile_patterns=()
-    if [[ $wdp_needed -eq 1 ]]; then
-        for x in $(seq $WDP_X_START $WDP_X_END); do
-            for y in $(seq $WDP_Y_START $WDP_Y_END); do
-                tile_patterns+=("*/$x/$y.png")
-            done
-        done
-    fi
-    if [[ $ant_needed -eq 1 ]]; then
-        for x in $(seq $ANT_X_START $ANT_X_END); do
-            for y in $(seq $ANT_Y_START $ANT_Y_END); do
-                tile_patterns+=("*/$x/$y.png")
-            done
-        done
-    fi
-
-    if [[ ${#tile_patterns[@]} -gt 0 ]]; then
-        mkdir -p "$temp_dir/tiles"
-        (
-            for url in "${asset_urls[@]}"; do
-                curl -L -s --fail "$url"
-            done
-        ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
-    fi
-
-    # Process WDP if needed
-    if [[ $wdp_needed -eq 1 ]]; then
-        if process_wdp "$tag" "$temp_dir/tiles"; then
-            echo "  WDP success for $tag"
-        else
-            wdp_success_all=0
-            echo "  WDP failed for $tag"
-        fi
-    fi
-
-    # Process antarktika if needed
-    if [[ $ant_needed -eq 1 ]]; then
-        if process_antarktika "$tag" "$temp_dir/tiles"; then
-            echo "  Antarktika success for $tag"
-        else
-            ant_success_all=0
-            echo "  Antarktika failed for $tag"
-        fi
-    fi
-
-    rm -rf "$temp_dir"
+    # After processing this date, exit (one day per run)
+    echo "Finished processing date $current_date. Exiting (one day per run)."
+    exit 0
 done
 
-# Update state files if all tags for the date succeeded for that dataset
-if [[ $wdp_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
-    echo "$next_date" | rclone rcat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null || true
-    echo "✅ WDP state updated to $next_date"
-fi
-if [[ $ant_needed -eq 1 && $ant_success_all -eq 1 ]]; then
-    echo "$next_date" | rclone rcat "r2:$R2_BUCKET/antarktika-backfill-state.txt" 2>/dev/null || true
-    echo "✅ Antarktika state updated to $next_date"
-fi
-
-echo "Finished processing date $next_date. Exiting (one day per run)."
+echo "All dates in range are already fully processed. Nothing to do."
