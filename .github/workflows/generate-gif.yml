@@ -10,14 +10,14 @@ jobs:
       - name: Checkout repository (for script and config)
         uses: actions/checkout@v4
 
-      - name: Install ImageMagick and rclone
+      - name: Install ImageMagick, rclone, bc, jq, gifsicle
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick
+          sudo apt-get install -y imagemagick bc jq gifsicle
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
           rm rclone-current-linux-amd64.deb
-
+          
       - name: Generate GIF
         run: bash generate-gif.sh gif-config.json
         env:
