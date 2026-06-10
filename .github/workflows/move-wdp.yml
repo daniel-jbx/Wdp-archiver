@@ -1,16 +1,16 @@
-name: Move WDP snapshots from wdp/ to root
+name: Rename wdp_snapshot_*.png to wdpsnapshot_*.png (no JSON)
 
 on:
   workflow_dispatch:
 
 jobs:
-  move-wdp:
+  rename:
     runs-on: ubuntu-latest
     steps:
-      - name: Install rclone and jq
+      - name: Install rclone
         run: |
           sudo apt-get update
-          sudo apt-get install -y rclone jq
+          sudo apt-get install -y rclone
 
       - name: Configure rclone for R2
         run: |
@@ -25,46 +25,26 @@ jobs:
           region = auto
           EOF
 
-      - name: Copy ALL snapshot files to root (both name patterns)
+      - name: Rename files (copy + delete)
         run: |
+          set -euo pipefail
           BUCKET="${{ secrets.R2_BUCKET }}"
-          # Copy wdpsnapshot_*.png and wdp_snapshot_*.png
-          for pattern in "wdpsnapshot_*.png" "wdp_snapshot_*.png"; do
-            rclone copy "r2:$BUCKET/wdp/" "r2:$BUCKET/" --include "$pattern"
+
+          echo "Renaming wdp_snapshot_*.png -> wdpsnapshot_*.png"
+
+          rclone lsf "r2:$BUCKET/wdp_snapshot_*.png" | while read -r oldname; do
+            newname="${oldname/wdp_snapshot_/wdpsnapshot_}"
+            echo "  $oldname -> $newname"
+            rclone copyto "r2:$BUCKET/$oldname" "r2:$BUCKET/$newname"
+            rclone deletefile "r2:$BUCKET/$oldname"
           done
 
-      - name: Delete entire wdp/ prefix (force cleanup)
-        run: |
-          BUCKET="${{ secrets.R2_BUCKET }}"
-          # Delete all files under wdp/
-          rclone delete "r2:$BUCKET/wdp/" || true
-          # Remove the empty directory
-          rclone rmdir "r2:$BUCKET/wdp" || true
+          echo "Done. No changes made to snapshots.json."
 
-      - name: Rebuild root snapshots.json from existing root files
+      - name: Verify (optional)
         run: |
           BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "Listing all wdpsnapshot_*.png in root..."
-          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" > /tmp/all_snapshots.txt
-          # Also include any wdp_snapshot_*.png that might have been copied (rename them? but we want consistency)
-          rclone lsf "r2:$BUCKET/wdp_snapshot_*.png" >> /tmp/all_snapshots.txt 2>/dev/null || true
-          # Remove duplicates and sort, then build JSON array
-          sort -u /tmp/all_snapshots.txt | jq -R -s 'split("\n") | map(select(length>0))' > /tmp/manifest.json
-          echo "New manifest has $(jq length /tmp/manifest.json) entries."
-          # Upload manifest using file copy (works around stdin issues)
-          rclone copyto /tmp/manifest.json "r2:$BUCKET/snapshots.json"
-
-      - name: Verify final state
-        run: |
-          BUCKET="${{ secrets.R2_BUCKET }}"
-          echo "✅ Root snapshots.json entries (first 10):"
-          rclone cat "r2:$BUCKET/snapshots.json" | jq -r '.[]' | head -10
-          echo ""
-          echo "Total root snapshots: $(rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" | wc -l)"
-          echo ""
-          if rclone lsd "r2:$BUCKET/" | grep -q wdp; then
-            echo "❌ ERROR: wdp/ still exists"
-            exit 1
-          else
-            echo "✅ wdp/ successfully removed"
-          fi
+          echo "Remaining wdp_snapshot_*.png files (should be 0):"
+          rclone lsf "r2:$BUCKET/wdp_snapshot_*.png" | wc -l
+          echo "New wdpsnapshot_*.png files count:"
+          rclone lsf "r2:$BUCKET/wdpsnapshot_*.png" | wc -l
