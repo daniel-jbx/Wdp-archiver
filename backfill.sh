@@ -39,28 +39,55 @@ done
 # FUNCTIONS
 # ============================
 
+# Fetch a URL with retries on 5xx errors
+fetch_with_retry() {
+    local url="$1"
+    local max_retries=3
+    local retry_delay=2
+    local attempt=1
+    local response_file=$(mktemp)
+    local http_code
+
+    while [[ $attempt -le $max_retries ]]; do
+        http_code=$(curl -s -w "%{http_code}" -L "${AUTH_HEADER[@]}" "$url" -o "$response_file")
+        if [[ "$http_code" == "200" ]]; then
+            cat "$response_file"
+            rm "$response_file"
+            return 0
+        elif [[ "$http_code" -ge 500 && "$http_code" -le 599 ]]; then
+            echo "WARNING: HTTP $http_code on attempt $attempt/$max_retries. Retrying in ${retry_delay}s..." >&2
+            sleep $retry_delay
+            retry_delay=$((retry_delay * 2))
+            ((attempt++))
+        else
+            echo "ERROR: HTTP $http_code (non‑retryable)." >&2
+            rm "$response_file"
+            return 1
+        fi
+    done
+    echo "ERROR: Failed to fetch $url after $max_retries attempts." >&2
+    rm "$response_file"
+    return 1
+}
+
 fetch_all_releases() {
     local page=1
     local all_entries=()
     while true; do
         echo "Fetching releases page $page..." >&2
         local url="https://api.github.com/repos/murolem/wplace-archives/releases?page=$page&per_page=100"
-        local response_file=$(mktemp)
-        local http_code
-        http_code=$(curl -s -w "%{http_code}" -L "${AUTH_HEADER[@]}" "$url" -o "$response_file")
-        if [[ "$http_code" != "200" ]]; then
-            echo "WARNING: GitHub API returned HTTP $http_code on page $page. Stopping." >&2
-            rm "$response_file"
+        local response
+        if ! response=$(fetch_with_retry "$url"); then
+            echo "WARNING: Could not fetch page $page. Stopping pagination." >&2
             break
         fi
-        if ! jq -e 'type == "array" and length > 0' "$response_file" >/dev/null 2>&1; then
-            rm "$response_file"
+        if ! jq -e 'type == "array" and length > 0' <<<"$response" >/dev/null 2>&1; then
+            echo "No more releases (page $page empty)." >&2
             break
         fi
         while IFS= read -r tag; do
             all_entries+=("$tag")
-        done < <(jq -r '.[].tag_name' "$response_file")
-        rm "$response_file"
+        done < <(jq -r '.[].tag_name' <<<"$response")
         ((page++))
         if [[ $page -gt 200 ]]; then
             echo "WARNING: Reached page 200 limit, stopping." >&2
@@ -124,7 +151,6 @@ process_dataset() {
     fi
 
     local temp_dir=$(mktemp -d)
-    # No trap; we clean up manually at the end (return will happen after rm)
     
     # Collect tile files for this dataset
     local tile_files=()
@@ -166,7 +192,7 @@ process_dataset() {
 }
 
 # ============================
-# MAIN – Process both datasets together
+# MAIN
 # ============================
 
 # Read last completed dates for each dataset
@@ -181,7 +207,7 @@ fi
 echo "Last completed WDP date: ${last_wdp:-none}"
 echo "Last completed Antarktika date: ${last_ant:-none}"
 
-# Fetch all tags and group by date
+# Fetch all tags
 echo "Fetching all releases..."
 all_tags=$(fetch_all_releases)
 if [[ -z "$all_tags" ]]; then
@@ -189,6 +215,17 @@ if [[ -z "$all_tags" ]]; then
     exit 1
 fi
 
+echo "Total releases fetched: $(echo "$all_tags" | wc -l)"
+echo "First 3 tags:"
+echo "$all_tags" | head -3
+echo "Last 3 tags:"
+echo "$all_tags" | tail -3
+
+# Show distinct years from tags for debugging
+echo "Years present in tags:"
+echo "$all_tags" | sed -n 's/^world-\([0-9]\{4\}\).*/\1/p' | sort -u
+
+# Group by date
 declare -A day_tags
 for tag in $all_tags; do
     tag_date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
@@ -211,11 +248,12 @@ done
 all_dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
 
 if [[ ${#all_dates[@]} -eq 0 ]]; then
-    echo "No dates in range."
+    echo "No dates in range $START_DATE .. $END_DATE."
+    echo "Tip: Check if the releases exist for that period. The first few tags show the available dates."
     exit 0
 fi
 
-# Iterate over dates from newest to oldest
+# Iterate over dates
 for current_date in "${all_dates[@]}"; do
     wdp_needed=0
     ant_needed=0
@@ -233,14 +271,12 @@ for current_date in "${all_dates[@]}"; do
     echo "Processing date: $current_date (WDP needed=$wdp_needed, Ant needed=$ant_needed)"
 
     IFS='|' read -ra tags <<< "${day_tags[$current_date]}"
-    tags=(${tags[@]/#/})  # remove empties
-    # Sort tags descending (newest first) within the day
+    tags=(${tags[@]/#/})
     IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
     unset IFS
 
     echo "Found ${#tags[@]} snapshots for $current_date."
 
-    # Process each tag of this date
     wdp_success_all=1
     ant_success_all=1
 
@@ -251,11 +287,9 @@ for current_date in "${all_dates[@]}"; do
 
         echo "--- Processing tag $tag ---"
 
-        # ---- Download and extract tiles once for both datasets ----
-        # NO 'local' here – this is in the main loop
         temp_dir=$(mktemp -d)
 
-        # Fetch asset URLs (split tarballs)
+        # Fetch asset URLs
         asset_urls=()
         while IFS= read -r url; do
             asset_urls+=("$url")
@@ -295,7 +329,7 @@ for current_date in "${all_dates[@]}"; do
             ) | tar -xz --strip-components=1 -C "$temp_dir/tiles" --wildcards "${tile_patterns[@]}" 2>/dev/null || true
         fi
 
-        # Process WDP if needed
+        # Process WDP
         if [[ $wdp_needed -eq 1 ]]; then
             if process_dataset "wdp" $WDP_X_START $WDP_X_END $WDP_Y_START $WDP_Y_END "$tag" "$temp_dir/tiles"; then
                 echo "  WDP success for $tag"
@@ -305,7 +339,7 @@ for current_date in "${all_dates[@]}"; do
             fi
         fi
 
-        # Process antarktika if needed
+        # Process antarktika
         if [[ $ant_needed -eq 1 ]]; then
             if process_dataset "antarktika" $ANT_X_START $ANT_X_END $ANT_Y_START $ANT_Y_END "$tag" "$temp_dir/tiles"; then
                 echo "  Antarktika success for $tag"
@@ -318,7 +352,7 @@ for current_date in "${all_dates[@]}"; do
         rm -rf "$temp_dir"
     done
 
-    # After processing all tags of the date, update state files for datasets that succeeded fully
+    # Update states
     if [[ $wdp_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
         echo "$current_date" | rclone rcat "r2:$R2_BUCKET/wdp-backfill-state.txt"
         echo "✅ WDP state updated to $current_date"
