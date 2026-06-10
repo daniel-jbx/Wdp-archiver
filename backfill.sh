@@ -5,7 +5,7 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-04-11"
+END_DATE="2026-03-04"
 EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
