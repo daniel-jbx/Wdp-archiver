@@ -73,10 +73,6 @@ if [ ! -s snapshots.json ]; then
     exit 1
 fi
 
-echo "Manifest content (first 500 chars):"
-head -c 500 snapshots.json
-echo ""
-
 # Validate JSON
 if ! jq empty snapshots.json 2>/dev/null; then
     echo "ERROR: snapshots.json is not valid JSON."
@@ -149,7 +145,9 @@ if [ $min_interval -eq 0 ]; then
     exit 1
 fi
 
-base_duration=$(echo "scale=6; 1 / $max_fps" | bc)
+# Calculate base duration (shortest interval frame duration) with leading zero
+base_duration_raw=$(echo "scale=6; 1 / $max_fps" | bc)
+base_duration=$(printf "%0.6f" "$base_duration_raw")
 echo "min_interval=$min_interval seconds, base_duration=$base_duration seconds"
 
 # --- Download images and create concat script ---
@@ -165,7 +163,9 @@ for entry in "${filtered_snapshots[@]}"; do
         continue
     fi
     interval=$((epoch - prev_epoch))
-    duration=$(echo "scale=6; ($interval / $min_interval) * $base_duration" | bc)
+    # Calculate duration with proper leading zero
+    duration_raw=$(echo "scale=6; ($interval / $min_interval) * $base_duration" | bc)
+    duration=$(printf "%0.6f" "$duration_raw")
     concat_script+="file '$file'\n"
     concat_script+="duration $duration\n"
     echo "Downloading $file ..."
@@ -201,12 +201,6 @@ ffmpeg_exit=$?
 
 if [ $ffmpeg_exit -eq 0 ]; then
     echo "SUCCESS: GIF created as $output"
-    # Optionally upload to repository (uncomment if needed)
-    # git config user.name "github-actions[bot]"
-    # git config user.email "github-actions[bot]@users.noreply.github.com"
-    # git add "$output"
-    # git commit -m "Generate timelapse GIF"
-    # git push
 else
     echo "ERROR: ffmpeg failed with exit code $ffmpeg_exit"
     exit $ffmpeg_exit
