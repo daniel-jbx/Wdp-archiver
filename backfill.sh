@@ -5,31 +5,26 @@ set -euo pipefail
 # CONFIGURATION
 # ============================
 START_DATE="2026-01-10"
-END_DATE="2026-03-04"
+END_DATE="2026-03-04"               # Changed to 03/04 as requested
 EXTRA_DATES=("")
 
 R2_BUCKET="${R2_BUCKET:-wdp-archiver}"
-R2_ENDPOINT="${R2_ENDPOINT:-}"
-R2_ACCESS_KEY_ID="${R2_ACCESS_KEY_ID:-}"
-R2_SECRET_ACCESS_KEY="${R2_SECRET_ACCESS_KEY:-}"
-
-# Validate required R2 credentials
-if [[ -z "$R2_ENDPOINT" || -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" ]]; then
-    echo "ERROR: R2_ENDPOINT, R2_ACCESS_KEY_ID, and R2_SECRET_ACCESS_KEY must be set."
-    exit 1
-fi
 
 # WDP (original) – stored at bucket root
 WDP_X_START=1225
 WDP_X_END=1231
 WDP_Y_START=513
 WDP_Y_END=518
+WDP_TILE_COLS=$((WDP_X_END - WDP_X_START + 1))
+WDP_TILE_ROWS=$((WDP_Y_END - WDP_Y_START + 1))
 
 # Antarktika – stored under antarktika/ prefix
 ANT_X_START=1279
 ANT_X_END=1284
 ANT_Y_START=1715
 ANT_Y_END=1719
+ANT_TILE_COLS=$((ANT_X_END - ANT_X_START + 1))
+ANT_TILE_ROWS=$((ANT_Y_END - ANT_Y_START + 1))
 
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 AUTH_HEADER=()
@@ -44,48 +39,9 @@ for tool in curl jq tar montage pngquant rclone; do
     fi
 done
 
-# Common R2 flags
-R2_FLAGS=(
-    --s3-endpoint="$R2_ENDPOINT"
-    --s3-access-key-id="$R2_ACCESS_KEY_ID"
-    --s3-secret-access-key="$R2_SECRET_ACCESS_KEY"
-    --s3-region="auto"
-)
-
 # ============================
 # FUNCTIONS
 # ============================
-
-# Fetch a URL with retries on 5xx errors
-fetch_with_retry() {
-    local url="$1"
-    local max_retries=3
-    local retry_delay=2
-    local attempt=1
-    local response_file=$(mktemp)
-    local http_code
-
-    while [[ $attempt -le $max_retries ]]; do
-        http_code=$(curl -s -w "%{http_code}" -L "${AUTH_HEADER[@]}" "$url" -o "$response_file")
-        if [[ "$http_code" == "200" ]]; then
-            cat "$response_file"
-            rm "$response_file"
-            return 0
-        elif [[ "$http_code" -ge 500 && "$http_code" -le 599 ]]; then
-            echo "WARNING: HTTP $http_code on attempt $attempt/$max_retries. Retrying in ${retry_delay}s..." >&2
-            sleep $retry_delay
-            retry_delay=$((retry_delay * 2))
-            ((attempt++))
-        else
-            echo "ERROR: HTTP $http_code (non‑retryable)." >&2
-            rm "$response_file"
-            return 1
-        fi
-    done
-    echo "ERROR: Failed to fetch $url after $max_retries attempts." >&2
-    rm "$response_file"
-    return 1
-}
 
 fetch_all_releases() {
     local page=1
@@ -93,18 +49,22 @@ fetch_all_releases() {
     while true; do
         echo "Fetching releases page $page..." >&2
         local url="https://api.github.com/repos/murolem/wplace-archives/releases?page=$page&per_page=100"
-        local response
-        if ! response=$(fetch_with_retry "$url"); then
-            echo "WARNING: Could not fetch page $page. Stopping pagination." >&2
+        local response_file=$(mktemp)
+        local http_code
+        http_code=$(curl -s -w "%{http_code}" -L "${AUTH_HEADER[@]}" "$url" -o "$response_file")
+        if [[ "$http_code" != "200" ]]; then
+            echo "WARNING: GitHub API returned HTTP $http_code on page $page. Stopping." >&2
+            rm "$response_file"
             break
         fi
-        if ! jq -e 'type == "array" and length > 0' <<<"$response" >/dev/null 2>&1; then
-            echo "No more releases (page $page empty)." >&2
+        if ! jq -e 'type == "array" and length > 0' "$response_file" >/dev/null 2>&1; then
+            rm "$response_file"
             break
         fi
         while IFS= read -r tag; do
             all_entries+=("$tag")
-        done < <(jq -r '.[].tag_name' <<<"$response")
+        done < <(jq -r '.[].tag_name' "$response_file")
+        rm "$response_file"
         ((page++))
         if [[ $page -gt 200 ]]; then
             echo "WARNING: Reached page 200 limit, stopping." >&2
@@ -120,64 +80,62 @@ date_from_tag() {
     echo "$tag" | sed 's/world-//' | sed 's/T/_/' | sed 's/-//g' | sed 's/\..*//'
 }
 
-# For WDP: manifest is at root "snapshots.json"
+# Ensure WDP manifest exists and is valid (at root)
 ensure_wdp_manifest() {
     local tmp_manifest=$(mktemp)
-    if rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null > "$tmp_manifest"; then
+    if rclone cat "r2:$R2_BUCKET/snapshots.json" 2>/dev/null > "$tmp_manifest"; then
         if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
             echo "WARNING: WDP snapshots.json corrupted. Resetting to empty array."
-            echo '[]' | rclone copyto - ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+            echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
         fi
     else
-        # File does not exist – create empty array
-        echo '[]' | rclone copyto - ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+        # File doesn't exist – create empty array (no warning)
+        echo '[]' | rclone copyto - "r2:$R2_BUCKET/snapshots.json"
     fi
     rm -f "$tmp_manifest"
 }
 
-# For antarktika: manifest is at "antarktika/snapshots.json"
+# Ensure antarktika manifest exists and is valid (under antarktika/)
 ensure_antarktika_manifest() {
     local tmp_manifest=$(mktemp)
-    if rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null > "$tmp_manifest"; then
+    if rclone cat "r2:$R2_BUCKET/antarktika/snapshots.json" 2>/dev/null > "$tmp_manifest"; then
         if ! jq -e 'type == "array"' "$tmp_manifest" >/dev/null 2>&1; then
             echo "WARNING: antarktika snapshots.json corrupted. Resetting to empty array."
-            echo '[]' | rclone copyto - ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+            echo '[]' | rclone copyto - "r2:$R2_BUCKET/antarktika/snapshots.json"
         fi
     else
-        echo '[]' | rclone copyto - ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+        echo '[]' | rclone copyto - "r2:$R2_BUCKET/antarktika/snapshots.json"
     fi
     rm -f "$tmp_manifest"
 }
 
+# Process a single release for WDP (root)
 process_wdp() {
     local tag_name="$1"
-    local tiles_dir="$2"
+    local tiles_dir="$2"   # directory with extracted tiles (subdirs x/y.png)
 
     local snap_date=$(date_from_tag "$tag_name")
     local snapshot_name="wdpsnapshot_${snap_date}.png"
-
+    
     echo "  [WDP] Processing $tag_name -> $snapshot_name"
-
+    
     ensure_wdp_manifest
-
-    # Skip if already in manifest
-    if rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null | jq -r '.[]' | grep -qx "$snapshot_name"; then
+    if rclone cat "r2:$R2_BUCKET/snapshots.json" | jq -r '.[]' | grep -qx "$snapshot_name"; then
         echo "  [WDP] Already in manifest, skipping."
         return 0
     fi
-
-    # Skip if file exists but not in manifest (fix manifest)
-    if rclone ls ":s3:$R2_BUCKET/" "${R2_FLAGS[@]}" 2>/dev/null | grep -q "$snapshot_name"; then
+    if rclone ls "r2:$R2_BUCKET/" | grep -q "$snapshot_name"; then
         echo "  [WDP] File exists but not in manifest. Adding to manifest."
         local manifest_tmp=$(mktemp)
-        rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
+        rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
         jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-        rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+        rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/snapshots.json"
         return 0
     fi
-
+    
     local temp_dir=$(mktemp -d)
-
+    trap "rm -rf '$temp_dir'" RETURN
+    
     # Collect tile files for WDP
     local tile_files=()
     for y in $(seq $WDP_Y_START $WDP_Y_END); do
@@ -185,7 +143,7 @@ process_wdp() {
             tile_files+=("$tiles_dir/$x/$y.png")
         done
     done
-
+    
     # Create missing tiles as transparent 1000x1000 PNGs
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
@@ -193,59 +151,53 @@ process_wdp() {
             convert -size 1000x1000 canvas:transparent PNG32:"$tf"
         fi
     done
-
-    local cols=$((WDP_X_END - WDP_X_START + 1))
-    local rows=$((WDP_Y_END - WDP_Y_START + 1))
-
+    
     montage -background none -alpha on "${tile_files[@]}" \
-        -tile ${cols}x${rows} \
+        -tile ${WDP_TILE_COLS}x${WDP_TILE_ROWS} \
         -geometry 1000x1000+0+0 \
         PNG32:"$temp_dir/stitched.png"
-
+    
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
-
-    rclone copyto "$temp_dir/compressed.png" ":s3:$R2_BUCKET/$snapshot_name" "${R2_FLAGS[@]}" || exit 1
-
+    
+    rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/$snapshot_name"
+    
     # Update manifest
     local manifest_tmp=$(mktemp)
-    rclone cat ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
+    rclone cat "r2:$R2_BUCKET/snapshots.json" > "$manifest_tmp"
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-    rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/snapshots.json" "${R2_FLAGS[@]}" || exit 1
-
-    rm -rf "$temp_dir"
+    rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/snapshots.json"
+    
     echo "  [WDP] ✓ Uploaded $snapshot_name and updated manifest."
     return 0
 }
 
+# Process a single release for antarktika (under antarktika/ prefix)
 process_antarktika() {
     local tag_name="$1"
     local tiles_dir="$2"
 
     local snap_date=$(date_from_tag "$tag_name")
     local snapshot_name="antarktika_snapshot_${snap_date}.png"
-
+    
     echo "  [Antarktika] Processing $tag_name -> $snapshot_name"
-
+    
     ensure_antarktika_manifest
-
-    # Skip if already in manifest
-    if rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" 2>/dev/null | jq -r '.[]' | grep -qx "$snapshot_name"; then
+    if rclone cat "r2:$R2_BUCKET/antarktika/snapshots.json" | jq -r '.[]' | grep -qx "$snapshot_name"; then
         echo "  [Antarktika] Already in manifest, skipping."
         return 0
     fi
-
-    # Skip if file exists but not in manifest (fix manifest)
-    if rclone ls ":s3:$R2_BUCKET/antarktika/" "${R2_FLAGS[@]}" 2>/dev/null | grep -q "$snapshot_name"; then
+    if rclone ls "r2:$R2_BUCKET/antarktika/" | grep -q "$snapshot_name"; then
         echo "  [Antarktika] File exists but not in manifest. Adding to manifest."
         local manifest_tmp=$(mktemp)
-        rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
+        rclone cat "r2:$R2_BUCKET/antarktika/snapshots.json" > "$manifest_tmp"
         jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-        rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
+        rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/antarktika/snapshots.json"
         return 0
     fi
-
+    
     local temp_dir=$(mktemp -d)
-
+    trap "rm -rf '$temp_dir'" RETURN
+    
     # Collect tile files for antarktika
     local tile_files=()
     for y in $(seq $ANT_Y_START $ANT_Y_END); do
@@ -253,7 +205,7 @@ process_antarktika() {
             tile_files+=("$tiles_dir/$x/$y.png")
         done
     done
-
+    
     # Create missing tiles as transparent 1000x1000 PNGs
     for tf in "${tile_files[@]}"; do
         if [[ ! -f "$tf" ]]; then
@@ -261,47 +213,43 @@ process_antarktika() {
             convert -size 1000x1000 canvas:transparent PNG32:"$tf"
         fi
     done
-
-    local cols=$((ANT_X_END - ANT_X_START + 1))
-    local rows=$((ANT_Y_END - ANT_Y_START + 1))
-
+    
     montage -background none -alpha on "${tile_files[@]}" \
-        -tile ${cols}x${rows} \
+        -tile ${ANT_TILE_COLS}x${ANT_TILE_ROWS} \
         -geometry 1000x1000+0+0 \
         PNG32:"$temp_dir/stitched.png"
-
+    
     pngquant --quality=80-100 --speed=1 --force 64 "$temp_dir/stitched.png" --output "$temp_dir/compressed.png"
-
-    rclone copyto "$temp_dir/compressed.png" ":s3:$R2_BUCKET/antarktika/$snapshot_name" "${R2_FLAGS[@]}" || exit 1
-
+    
+    rclone copyto "$temp_dir/compressed.png" "r2:$R2_BUCKET/antarktika/$snapshot_name"
+    
     # Update manifest
     local manifest_tmp=$(mktemp)
-    rclone cat ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" > "$manifest_tmp" 2>/dev/null
+    rclone cat "r2:$R2_BUCKET/antarktika/snapshots.json" > "$manifest_tmp"
     jq --arg name "$snapshot_name" '. += [$name]' "$manifest_tmp" > "$manifest_tmp.new"
-    rclone copyto "$manifest_tmp.new" ":s3:$R2_BUCKET/antarktika/snapshots.json" "${R2_FLAGS[@]}" || exit 1
-
-    rm -rf "$temp_dir"
+    rclone copyto "$manifest_tmp.new" "r2:$R2_BUCKET/antarktika/snapshots.json"
+    
     echo "  [Antarktika] ✓ Uploaded $snapshot_name and updated manifest."
     return 0
 }
 
 # ============================
-# MAIN – Process only ONE date (newest not fully done)
+# MAIN – Process only the newest date that needs work for either dataset
 # ============================
 
-# Read last completed dates for each dataset from R2
+# Read last completed dates from state files
 last_wdp=""
-if rclone cat ":s3:$R2_BUCKET/wdp-backfill-state.txt" "${R2_FLAGS[@]}" 2>/dev/null > /tmp/wdp_state; then
+if rclone cat "r2:$R2_BUCKET/wdp-backfill-state.txt" 2>/dev/null > /tmp/wdp_state; then
     last_wdp=$(cat /tmp/wdp_state)
 fi
 last_ant=""
-if rclone cat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" "${R2_FLAGS[@]}" 2>/dev/null > /tmp/ant_state; then
+if rclone cat "r2:$R2_BUCKET/antarktika-backfill-state.txt" 2>/dev/null > /tmp/ant_state; then
     last_ant=$(cat /tmp/ant_state)
 fi
 echo "Last completed WDP date: ${last_wdp:-none}"
 echo "Last completed Antarktika date: ${last_ant:-none}"
 
-# Fetch all releases
+# Fetch all tags
 echo "Fetching all releases..."
 all_tags=$(fetch_all_releases)
 if [[ -z "$all_tags" ]]; then
@@ -309,20 +257,7 @@ if [[ -z "$all_tags" ]]; then
     exit 1
 fi
 
-total_count=$(echo "$all_tags" | wc -l)
-echo "Total releases fetched: $total_count"
-
-# Show debug info
-if [[ $total_count -gt 0 ]]; then
-    echo "First 3 tags:"
-    echo "$all_tags" | sed -n '1,3p'
-    echo "Last 3 tags:"
-    echo "$all_tags" | sed -n "$((total_count-2)),${total_count}p"
-fi
-echo "Years present in tags:"
-echo "$all_tags" | sed -n 's/^world-\([0-9]\{4\}\).*/\1/p' | sort -u
-
-# Group by date within range
+# Group tags by date and filter by range
 declare -A day_tags
 for tag in $all_tags; do
     tag_date=$(echo "$tag" | sed -n 's/^world-\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*$/\1/p')
@@ -341,7 +276,7 @@ for tag in $all_tags; do
     fi
 done
 
-# Get dates sorted newest first
+# Get all dates sorted newest first
 all_dates=($(printf '%s\n' "${!day_tags[@]}" | sort -r))
 
 if [[ ${#all_dates[@]} -eq 0 ]]; then
@@ -349,7 +284,7 @@ if [[ ${#all_dates[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Find the first (newest) date that needs processing for either dataset
+# Iterate from newest to oldest, but stop after processing the first date that needs any work
 for current_date in "${all_dates[@]}"; do
     wdp_needed=0
     ant_needed=0
@@ -360,12 +295,13 @@ for current_date in "${all_dates[@]}"; do
         ant_needed=1
     fi
     if [[ $wdp_needed -eq 0 && $ant_needed -eq 0 ]]; then
-        echo "Date $current_date already fully processed. Skipping."
+        echo "Date $current_date already fully processed for both datasets. Skipping."
         continue
     fi
 
     echo "Processing date: $current_date (WDP needed=$wdp_needed, Ant needed=$ant_needed)"
 
+    # Get tags for this date, sorted newest first
     IFS='|' read -ra tags <<< "${day_tags[$current_date]}"
     tags=(${tags[@]/#/})
     IFS=$'\n' tags=($(printf '%s\n' "${tags[@]}" | sort -r))
@@ -383,7 +319,9 @@ for current_date in "${all_dates[@]}"; do
 
         echo "--- Processing tag $tag ---"
 
+        # Create temporary directory for extraction
         temp_dir=$(mktemp -d)
+        trap "rm -rf '$temp_dir'" RETURN
 
         # Fetch asset URLs (split tarballs)
         asset_urls=()
@@ -399,7 +337,7 @@ for current_date in "${all_dates[@]}"; do
             continue
         fi
 
-        # Build tile patterns for needed areas
+        # Build tile patterns only for needed datasets
         tile_patterns=()
         if [[ $wdp_needed -eq 1 ]]; then
             for x in $(seq $WDP_X_START $WDP_X_END); do
@@ -448,17 +386,17 @@ for current_date in "${all_dates[@]}"; do
         rm -rf "$temp_dir"
     done
 
-    # Update state files if fully successful
+    # Update state files if all tags for the date succeeded for that dataset
     if [[ $wdp_needed -eq 1 && $wdp_success_all -eq 1 ]]; then
-        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/wdp-backfill-state.txt" "${R2_FLAGS[@]}" || exit 1
+        echo "$current_date" | rclone rcat "r2:$R2_BUCKET/wdp-backfill-state.txt"
         echo "✅ WDP state updated to $current_date"
     fi
     if [[ $ant_needed -eq 1 && $ant_success_all -eq 1 ]]; then
-        echo "$current_date" | rclone rcat ":s3:$R2_BUCKET/antarktika-backfill-state.txt" "${R2_FLAGS[@]}" || exit 1
+        echo "$current_date" | rclone rcat "r2:$R2_BUCKET/antarktika-backfill-state.txt"
         echo "✅ Antarktika state updated to $current_date"
     fi
 
-    # Stop after this date (even if some parts failed)
+    # After processing this date, exit (one day per run)
     echo "Finished processing date $current_date. Exiting (one day per run)."
     exit 0
 done
