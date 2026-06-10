@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export RCLONE_CONFIG=/dev/null
-
 CONFIG_FILE="${1:-gif-config.json}"
 
 # -- Read configuration ------------------------------------------------
@@ -36,6 +34,7 @@ RCLONE_BASE=(--s3-provider="Cloudflare" --s3-endpoint="$R2_ENDPOINT"
              --s3-access-key-id="$R2_ACCESS_KEY_ID"
              --s3-secret-access-key="$R2_SECRET_ACCESS_KEY"
              --s3-no-check-bucket)
+             --log-level ERROR)
 
 # -- Fetch snapshot list from R2 ---------------------------------------
 echo "Downloading snapshots.json..."
@@ -174,6 +173,19 @@ for d in "${DELAYS[@]}"; do
 done
 END_DELAY=$(( 2 * MAX_DELAY ))
 [[ $END_DELAY -lt 100 ]] && END_DELAY=100
+
+# -- Check total size of frames (limit 100 MB) ---------------------------
+TOTAL_SIZE=0
+for f in processed/frame_*.png; do
+  SIZE=$(stat -c%s "$f")
+  TOTAL_SIZE=$(( TOTAL_SIZE + SIZE ))
+done
+
+if [[ $TOTAL_SIZE -gt 104857600 ]]; then
+  MB=$(echo "scale=1; $TOTAL_SIZE / 1048576" | bc)
+  echo "ERROR: Total size of ${FRAME_COUNT} frames is ${MB} MB – exceeds 100 MB limit. Aborting."
+  exit 1
+fi
 
 # -- Assemble GIF with per-frame delays and a final extended frame -----
 echo "Assembling GIF..."
