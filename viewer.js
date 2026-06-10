@@ -81,6 +81,17 @@
   gl.enableVertexAttribArray(aTexLoc);
   gl.vertexAttribPointer(aTexLoc, 2, gl.FLOAT, false, 16, 8);
 
+  // ---- Dataset detection ----
+let dataset = 'wdp';   // default
+if (window.location.pathname.includes('/antarktika/')) {
+  dataset = 'antarktika';
+}
+const R2_BASE_URL = dataset === 'wdp'
+  ? 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/'
+  : 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/antarktika/';
+
+console.log(`Viewer using dataset: ${dataset}, R2 base: ${R2_BASE_URL}`);
+  
   // ---- Map constants ----
   const ZOOM = 11, TILE_SIZE = 1000;
   const TOTAL_TILES = Math.pow(2, ZOOM), WORLD_SIZE = TOTAL_TILES * TILE_SIZE;
@@ -244,15 +255,16 @@
   }
 
   // ---- Parse timestamp ----
-  function getEpoch(filename) {
-    const m = filename.match(/(\d{8})_(\d{6})/);
-    if (!m) return 0;
-    const ds = m[1], ts = m[2];
-    return Date.UTC(
-      parseInt(ds.slice(0,4)), parseInt(ds.slice(4,6))-1, parseInt(ds.slice(6,8)),
-      parseInt(ts.slice(0,2)), parseInt(ts.slice(2,4)), parseInt(ts.slice(4,6))
-    ) / 1000;
-  }
+function getEpoch(filename) {
+  // Supports both wdpsnapshot_20260304_234138.png and antarktika_snapshot_20260304_234138.png
+  const m = filename.match(/(\d{8})_(\d{6})/);
+  if (!m) return 0;
+  const ds = m[1], ts = m[2];
+  return Date.UTC(
+    parseInt(ds.slice(0,4)), parseInt(ds.slice(4,6))-1, parseInt(ds.slice(6,8)),
+    parseInt(ts.slice(0,2)), parseInt(ts.slice(2,4)), parseInt(ts.slice(4,6))
+  ) / 1000;
+}
 
   // ---- Filtering ----
   let currentInterval = parseInt(intervalSelect.value, 10);
@@ -372,7 +384,7 @@ function buildFilteredList(anchorName = null) {
     timestampLabelTop.textContent = m
       ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}`
       : filename;
-    currentImage.src = 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/' + filename;
+    currentImage.src = R2_BASE_URL + filename;
   }
 
   currentImage.onload = () => {
@@ -390,7 +402,7 @@ function buildFilteredList(anchorName = null) {
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
   // ---- Initial snapshot loading with date picker + time dropdown ----
-  fetch('https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/snapshots.json')
+  fetch(R2_BASE_URL + 'snapshots.json')
     .then(r => r.json())
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
@@ -400,7 +412,10 @@ function buildFilteredList(anchorName = null) {
       const snapshotsByDate = new Map(); // key: YYYY-MM-DD, value: array of {filename, timeStr}
       
       for (const filename of allSnapshots) {
-        const match = filename.match(/wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/);
+        const pattern = dataset === 'wdp'
+  ? /wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/
+  : /antarktika_snapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/;
+const match = filename.match(pattern);
         if (match) {
           const year = match[1], month = match[2], day = match[3];
           const hour = match[4], minute = match[5], second = match[6];
@@ -596,18 +611,18 @@ function buildFilteredList(anchorName = null) {
 
   // ---- Full snapshot download ----
   const dlSnapshot = document.getElementById('dl-snapshot');
-  if (dlSnapshot) {
-    dlSnapshot.addEventListener('click', () => {
-      if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
-      const filename = filteredSnapshots[currentFilteredIndex];
-      const a = document.createElement('a');
-      a.href = 'https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/' + filename;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-    });
-  }
+if (dlSnapshot) {
+  dlSnapshot.addEventListener('click', () => {
+    if (currentFilteredIndex < 0 || currentFilteredIndex >= filteredSnapshots.length) return;
+    const filename = filteredSnapshots[currentFilteredIndex];
+    const a = document.createElement('a');
+    a.href = R2_BASE_URL + filename;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  });
+}
 
   // ---- Selection mode ----
   const selCanvas = document.getElementById('sel-canvas');
@@ -923,26 +938,26 @@ function buildFilteredList(anchorName = null) {
       const m = (filteredSnapshots[currentFilteredIndex] || '').match(/(\d{8}_\d{6})/);
       const ts = m ? m[0] : Date.now();
 
-      const overlay = {
-        id: `wdp_custom_${ts}`,
-        schemaVersion: "1",
-        name: `custom_${ts}.png`,
-        opacity: 1,
-        image: { dataUrl: cropData.dataUrl, width: cropData.width, height: cropData.height },
-        bounds,
-        colorMetric: "lab",
-        dithering: false,
-        order: 0,
-        locked: false,
-        hasPlaced: true,
-        visible: true
-      };
+     const overlay = {
+  id: `${dataset}_custom_${ts}`,
+  schemaVersion: "1",
+  name: `custom_${ts}.png`,
+  opacity: 1,
+  image: { dataUrl: cropData.dataUrl, width: cropData.width, height: cropData.height },
+  bounds,
+  colorMetric: "lab",
+  dithering: false,
+  order: 0,
+  locked: false,
+  hasPlaced: true,
+  visible: true
+};
 
       const blob = new Blob([JSON.stringify(overlay)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `wdp_custom_${ts}.wplace`;
+      a.download = `${dataset}_custom_${ts}.wplace`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
