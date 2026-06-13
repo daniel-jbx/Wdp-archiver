@@ -3,8 +3,15 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>WDP timeline viewer</title>
+  <title>WDP timeline viewer – with pixel diff</title>
   <link rel="stylesheet" href="viewer.css">
+  <style>
+    /* additional styles for diff mode */
+    #diffBtn.active { background-color: #4caf50; }
+    #canvas.diff-mode { cursor: crosshair; }
+    #doneBtn { background-color: #e74c3c; margin-left: 10px; }
+    .diff-nav-info { font-size: 12px; margin-left: 10px; color: #ffaa00; }
+  </style>
 </head>
 <body>
   <canvas id="canvas"></canvas>
@@ -32,6 +39,8 @@
       <button class="dl-btn" id="dl-select-toggle">select area</button>
       <button class="dl-btn" id="dl-select-png" style="display:none;">download png</button>
       <button class="dl-btn" id="dl-select-overlay" style="display:none;">download overlay</button>
+      <button class="dl-btn" id="diffBtn">diff</button>
+      <button class="dl-btn" id="doneBtn" style="display:none;">done</button>
       <span id="coords-display"
             style="display:none;
                    background:rgba(0,0,0,0.7);
