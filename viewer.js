@@ -53,6 +53,10 @@
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
       this.program = this._buildProgram();
+      if (!this.program) {
+  document.body.innerHTML = 'WebGL shader compilation failed';
+  return;
+}
       this.aPos = gl.getAttribLocation(this.program, 'a_position');
       this.aTex = gl.getAttribLocation(this.program, 'a_texCoord');
       this.uMatrix = gl.getUniformLocation(this.program, 'u_matrix');
