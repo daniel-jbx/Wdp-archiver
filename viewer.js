@@ -261,6 +261,20 @@
         gl.uniform1i(uTextureLoc, 0);
         gl.drawArrays(gl.TRIANGLES, 0, 6);
       }
+          // Draw pixel marker when in diff mode and a pixel is selected (and not in area selection mode)
+    if (diffMode && selectedPixel && !selectionMode) {
+      const clientPt = imgToClient(selectedPixel.x, selectedPixel.y);
+      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+      selCtx.beginPath();
+      selCtx.arc(clientPt.x, clientPt.y, 8, 0, 2 * Math.PI);
+      selCtx.fillStyle = 'red';
+      selCtx.fill();
+      selCtx.strokeStyle = 'white';
+      selCtx.lineWidth = 2;
+      selCtx.stroke();
+    } else if (!diffMode && !selectionMode) {
+      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    }
     }
   }
 
