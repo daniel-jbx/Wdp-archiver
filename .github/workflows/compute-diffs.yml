@@ -3,7 +3,7 @@ name: Compute Snapshot Diffs
 on:
   push:
     paths:
-      - 'snapshots.json'          # if you keep it in Git
+      - 'snapshots.json'
   workflow_dispatch:
 
 jobs:
@@ -13,13 +13,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq imagemagick curl
           curl https://rclone.org/install.sh | sudo bash
 
-      - name: Configure rclone for R2
+      - name: Configure rclone for Cloudflare R2
         run: |
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
@@ -37,7 +37,7 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Python packages
+      - name: Install Python dependencies
         run: pip install pillow numpy
 
       - name: Compute missing diffs
@@ -45,11 +45,11 @@ jobs:
           set -euo pipefail
           BUCKET="r2:${{ secrets.R2_BUCKET }}"
 
-          # Download snapshots.json from R2 (or from Git if you prefer)
+          # Download snapshots.json from R2
           rclone cat "$BUCKET/snapshots.json" > snapshots.json
           TOTAL=$(jq '. | length' snapshots.json)
 
-          # Load existing diffs.json from R2 (if any)
+          # Download existing diffs.json (if any)
           if rclone ls "$BUCKET/diffs.json" &>/dev/null; then
             rclone cat "$BUCKET/diffs.json" > diffs.json
             EXISTING=$(jq '. | length' diffs.json)
@@ -98,15 +98,16 @@ jobs:
 
               os.remove("prev.png")
               os.remove("curr.png")
+              print(f"Computed diff {i+1}/{needed}")
 
           with open("diffs.json", "w") as f:
               json.dump(diffs, f)
           EOF
 
-          # Upload updated diffs.json to R2
+          # Upload updated diffs.json back to R2
           rclone copyto diffs.json "$BUCKET/diffs.json"
 
-          # Optional: also commit to Git (if you want a backup in main)
+          # Optional: also commit to Git (uncomment if you want a backup in the repo)
           # git config user.name "github-actions"
           # git config user.email "actions@github.com"
           # git add diffs.json
