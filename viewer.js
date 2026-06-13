@@ -787,7 +787,7 @@ function drawScene() {
   function enterDiffMode() {
     diffMode = true;
     diffBtn.classList.add('diff-active');
-    diffBtn.textContent = '✔️ Done';
+    diffBtn.textContent = 'done';
     canvas.classList.add('diff-mode');
     // Disable interval and date picker (they disappear visually but we hide them)
     intervalSelect.disabled = true;
@@ -808,7 +808,7 @@ function drawScene() {
   function exitDiffMode() {
     diffMode = false;
     diffBtn.classList.remove('diff-active');
-    diffBtn.textContent = '🔍 Diff';
+    diffBtn.textContent = 'diff';
     canvas.classList.remove('diff-mode');
     intervalSelect.disabled = false;
     intervalSelect.style.display = '';
