@@ -828,6 +828,8 @@
     draw();
   });
 
+  window.dispatchEvent(new Event('resize'));
+
   fetch(BASE_URL + 'snapshots.json')
     .then(r => r.json())
     .then(files => {
