@@ -195,7 +195,7 @@
       this.renderer = renderer;
       this.w = w; this.h = h;
       this.scale = 1; this.offX = 0; this.offY = 0;
-      this.minScale = 0.1; this.maxScale = 10;
+      this.minScale = 0.1; this.maxScale = 100;
       this.dragging = false; this.dragStartX = 0; this.dragStartY = 0;
       this.dragOffX = 0; this.dragOffY = 0; this.dragOccurred = false;
       this.pinching = false; this.pinchDist = 0; this.pinchScale = 1;
