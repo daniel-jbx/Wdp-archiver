@@ -174,18 +174,14 @@
       this.w = w; this.h = h;
       this.scale = 1; this.offX = 0; this.offY = 0;
       this.minScale = 0.1; this.maxScale = 10;
-      // drag state
       this.dragging = false; this.dragStartX = 0; this.dragStartY = 0;
       this.dragOffX = 0; this.dragOffY = 0; this.dragOccurred = false;
-      // pinch
       this.pinching = false; this.pinchDist = 0; this.pinchScale = 1;
       this.pinchCx = 0; this.pinchCy = 0;
-      // tap
       this.tapStartX = 0; this.tapStartY = 0; this.wasDragged = false;
-      // callbacks set by controller
       this.onTapLeft  = null;
       this.onTapRight = null;
-      this.onClick    = null;   // diff mode pixel selection
+      this.onClick    = null;
     }
 
     reset(img) {
@@ -206,7 +202,6 @@
 
     updateSize(w, h) { this.w = w; this.h = h; }
 
-    // event handlers (to be attached manually)
     onPointerDown(e, clientX, clientY) {
       if (e.touches && e.touches.length === 2) {
         this.dragging = false;
@@ -264,7 +259,6 @@
         if (e.changedTouches && e.changedTouches.length === 1 && !this.pinching) {
           const tx = e.changedTouches[0].clientX;
           if (!this.wasDragged && Math.hypot(tx - this.tapStartX, e.changedTouches[0].clientY - this.tapStartY) <= 5) {
-            // tap - decide left/right
             if (tx < window.innerWidth/2) { if (this.onTapLeft) this.onTapLeft(); }
             else { if (this.onTapRight) this.onTapRight(); }
           }
@@ -292,12 +286,10 @@
     constructor(selCtx, viewport) {
       this.ctx = selCtx;
       this.vp = viewport;
-      this.mode = false;          // selection active?
-      this.start = null;          // {x,y} image coords
-      this.end = null;
-      this.dragging = false;
-      this.handle = null;         // which handle is being dragged
-      this.HANDLE = 8;            // handle size in screen px
+      this.mode = false;
+      this.start = null; this.end = null;
+      this.dragging = false; this.handle = null;
+      this.HANDLE = 8;
     }
 
     getRect() {
@@ -338,7 +330,6 @@
         ctx.fillRect(h.x - this.HANDLE/2, h.y - this.HANDLE/2, this.HANDLE, this.HANDLE);
         ctx.strokeRect(h.x - this.HANDLE/2, h.y - this.HANDLE/2, this.HANDLE, this.HANDLE);
       });
-      // coords display
       coordsDiv.style.display = 'inline-block';
       coordsDiv.textContent = `x: [${r.x1}, ${r.x2}]  y: [${r.y1}, ${r.y2}]`;
     }
@@ -368,7 +359,7 @@
       const img = this._clamp(this.vp.clientToImg(clientX, clientY));
       if (this.start && this.end && this.getRect()) {
         this.handle = this.hitHandle(clientX, clientY);
-        if (this.handle) return; // handle drag
+        if (this.handle) return;
       }
       this.dragging = true;
       this.start = img; this.end = null; this.handle = null;
@@ -431,12 +422,11 @@
       this.all = allSnapshots;
       this.filtered = [];
       this.currentIndex = -1;
-      this.intervalSec = 3600; // default 1 hr
-      this.customList = null;  // for diff mode
+      this.intervalSec = 3600;
+      this.customList = null;
       this._sliderMap = {};
     }
 
-    // Use custom list (diff mode) – pass null to return to normal filtering
     setCustomList(list) {
       this.customList = list;
       this._rebuild();
@@ -447,7 +437,6 @@
       if (!this.customList) this._rebuild();
     }
 
-    // Called when date/time picker selects a specific snapshot
     rebuildWithAnchor(anchorName) {
       this._buildFiltered(anchorName);
     }
@@ -460,13 +449,8 @@
       if (this.customList) {
         this.filtered = this.customList;
         this._updateSlider();
-        if (anchorName) {
-          let idx = this.filtered.indexOf(anchorName);
-          if (idx === -1) idx = this.filtered.length - 1;
-          this.load(idx);
-        } else {
-          this.load(this.currentIndex >= 0 ? this.currentIndex : this.filtered.length-1);
-        }
+        const idx = anchorName ? this.filtered.indexOf(anchorName) : -1;
+        this.load(idx >= 0 ? idx : this.filtered.length - 1);
         return;
       }
       const interval = this.intervalSec;
@@ -488,7 +472,6 @@
       for (let k = Math.ceil((minEp-anchorEp)/interval); k <= Math.floor((maxEp-anchorEp)/interval); k++) {
         if (k === 0) continue;
         const target = anchorEp + k * interval;
-        // binary search
         let l=0, r=cands.length-1;
         while(l<=r){ let m=(l+r)>>1; if(cands[m].ep<target) l=m+1; else r=m-1; }
         let best = null, bestDiff=Infinity;
@@ -517,7 +500,6 @@
       if (!name) return;
       const m = name.match(/(\d{8})_(\d{6})/);
       tsLabel.textContent = m ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}` : name;
-      // trigger image load (set by app)
       if (this.onLoadSnapshot) this.onLoadSnapshot(name);
     }
 
@@ -532,13 +514,12 @@
       this.vp = viewport;
       this.active = false;
       this.locked = false;
-      this.pixel = null; // {x,y}
+      this.pixel = null;
     }
 
     toggle(on) {
       this.active = on;
       if (on) {
-        diffBtn.classList.add('diff-active');
         diffBtn.textContent = 'done';
         canvas.classList.add('diff-mode');
         interval.disabled = true; interval.style.display = 'none';
@@ -550,8 +531,8 @@
         tsLabel.style.borderRadius = '4px';
         this.pixel = null;
         this.locked = false;
+        dlToggle.style.display = 'none';                // hide select area
       } else {
-        diffBtn.classList.remove('diff-active');
         diffBtn.textContent = 'diff';
         canvas.classList.remove('diff-mode');
         interval.disabled = false; interval.style.display = '';
@@ -559,29 +540,34 @@
         if (timeSel) { timeSel.disabled = false; timeSel.style.display = ''; }
         tsLabel.style.background = '';
         tsLabel.style.padding = '';
-        this.fc.setCustomList(null); // restore normal timeline
+        this.fc.setCustomList(null);
+        dlToggle.style.display = '';                    // show select area
       }
     }
 
-    selectPixel(clientX, clientY) {
+  selectPixel(clientX, clientY) {
       if (!this.active || this.locked) return false;
       const p = this.vp.clientToImg(clientX, clientY);
       if (p.x < 0 || p.x >= IMG_W || p.y < 0 || p.y >= IMG_H) return false;
+
+      // Always set the marker immediately
       this.pixel = p;
-      // check changes
+      draw();
+
       const key = `${p.x},${p.y}`;
       const idxs = this.diffs[key] || [];
       if (idxs.length === 0) {
-        alert('This pixel never changed across snapshots.');
-        this.pixel = null;
-        return false;
+          // No diff – keep marker, show alert, but do not lock
+          alert('This pixel never changed across snapshots.');
+          return false;
       }
+
+      // Pixel changed – lock it
       this.locked = true;
-      // build custom list with snapshot 0 + change indices
       const changedSnaps = [0, ...idxs].map(i => this.fc.all[i]).filter(Boolean);
       this.fc.setCustomList(changedSnaps);
       return true;
-    }
+  }
 
     drawMarker(ctx) {
       if (!this.pixel || !this.active) return;
@@ -606,6 +592,7 @@
   let diffMgr = null;
   const currentImage = new Image();
   currentImage.crossOrigin = 'anonymous';
+  let initialLoadDone = false;
 
   filterCtrl.onLoadSnapshot = (name) => {
     currentImage.src = BASE_URL + name;
@@ -613,8 +600,9 @@
 
   currentImage.onload = () => {
     renderer.setImage(currentImage);
-    if (filterCtrl.currentIndex === parseInt(slider.value)) {
+    if (!initialLoadDone) {
       viewport.reset(currentImage);
+      initialLoadDone = true;
     }
     draw();
   };
@@ -641,7 +629,7 @@
   };
   viewport.onClick = (x,y) => {
     if (diffMgr && diffMgr.active) {
-      if (diffMgr.selectPixel(x,y)) draw();
+      if (diffMgr.(x,y)) draw();
     }
   };
 
@@ -690,7 +678,6 @@
       draw();
     }, {passive:false});
 
-    // Selection canvas events (only when selection mode active)
     selCanvas.addEventListener('mousedown', e => {
       if (!selection.mode) return;
       e.preventDefault();
@@ -718,7 +705,6 @@
     selCanvas.addEventListener('touchend', () => { if (selection.mode) selection.dragEnd(); });
   }
 
-  // Download buttons
   dlSnap.addEventListener('click', () => {
     const name = filterCtrl.currentName();
     if (!name) return;
@@ -726,19 +712,23 @@
     a.href = BASE_URL + name; a.download = name;
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
   });
+
   dlToggle.addEventListener('click', () => {
     selection.toggle(!selection.mode);
     if (selection.mode) {
       dlToggle.textContent = 'done';
       selCanvas.style.pointerEvents = 'auto';
+      diffBtn.style.display = 'none';       // hide diff when selecting
     } else {
       dlToggle.textContent = 'select area';
       selCanvas.style.pointerEvents = 'none';
       selection.clear();
       dlPng.style.display = dlOverlay.style.display = 'none';
       coordsDiv.style.display = 'none';
+      diffBtn.style.display = '';           // show diff again
     }
   });
+
   dlPng.addEventListener('click', () => {
     const data = selection.getCroppedData(currentImage);
     if (!data) return;
@@ -746,6 +736,7 @@
     a.href = data.dataUrl; a.download = 'selection.png';
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
   });
+
   dlOverlay.addEventListener('click', () => {
     const data = selection.getCroppedData(currentImage);
     if (!data) return;
@@ -766,20 +757,17 @@
     URL.revokeObjectURL(url);
   });
 
-  // Keyboard
   window.addEventListener('keydown', e => {
     if (e.key === 'ArrowLeft') { e.preventDefault(); if (filterCtrl.currentIndex>0) filterCtrl.load(filterCtrl.currentIndex-1); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); if (filterCtrl.currentIndex<filterCtrl.filtered.length-1) filterCtrl.load(filterCtrl.currentIndex+1); }
     else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); viewport.reset(currentImage); draw(); }
   });
 
-  // Interval select
   interval.addEventListener('change', () => {
     if (diffMgr && diffMgr.active) return;
     filterCtrl.setInterval(parseInt(interval.value));
   });
 
-  // Date / time picker (populate after snapshots loaded)
   function setupDateTimePickers(snaps) {
     const byDate = new Map();
     for (const f of snaps) {
@@ -823,10 +811,8 @@
     });
   }
 
-  // Slider
   slider.addEventListener('input', () => filterCtrl.load(parseInt(slider.value)));
 
-  // Resize
   window.addEventListener('resize', () => {
     const dpr = window.devicePixelRatio || 1;
     const w = window.innerWidth, h = window.innerHeight;
@@ -838,7 +824,6 @@
     draw();
   });
 
-  // Init: load snapshots & diffs
   fetch(BASE_URL + 'snapshots.json')
     .then(r => r.json())
     .then(files => {
@@ -851,9 +836,7 @@
       diffMgr = new DiffManager(diffs, filterCtrl, viewport);
       diffBtn.addEventListener('click', () => diffMgr.toggle(!diffMgr.active));
       addEvents();
-      // initial draw after first image loads (done via onload)
-      const initialName = filterCtrl.currentName() || filterCtrl.filtered[0];
-      if (initialName) filterCtrl.load(filterCtrl.filtered.indexOf(initialName));
+      // Initial load – already handled by date/time picker above
     })
     .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e); });
 })();
