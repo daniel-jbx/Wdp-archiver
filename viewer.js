@@ -629,7 +629,7 @@
   };
   viewport.onClick = (x,y) => {
     if (diffMgr && diffMgr.active) {
-      if (diffMgr.(x,y)) draw();
+      if (diffMgr.selectPixel(x,y)) draw();
     }
   };
 
