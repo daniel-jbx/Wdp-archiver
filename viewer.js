@@ -44,153 +44,159 @@
   }
 
   // ── Renderer (WebGL) ───────────────────────────────────────
-  class Renderer {
-    constructor(canvas) {
-      this.gl = canvas.getContext('webgl', { antialias: false }) ||
-                canvas.getContext('experimental-webgl', { antialias: false });
-      if (!this.gl) { document.body.innerHTML = 'WebGL not supported'; return; }
-      const gl = this.gl;
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-      this.program = this._buildProgram();
-      if (!this.program) {
-  document.body.innerHTML = 'WebGL shader compilation failed';
-  return;
-}
-      this.aPos = gl.getAttribLocation(this.program, 'a_position');
-      this.aTex = gl.getAttribLocation(this.program, 'a_texCoord');
-      this.uMatrix = gl.getUniformLocation(this.program, 'u_matrix');
-      this.uTex = gl.getUniformLocation(this.program, 'u_texture');
-      this.quadBuf = gl.createBuffer();
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
-      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0,0,0, 1,0,1,0, 0,1,0,1, 1,0,1,0, 0,1,0,1, 1,1,1,1]), gl.STATIC_DRAW);
-      gl.enableVertexAttribArray(this.aPos);
-      gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 16, 0);
-      gl.enableVertexAttribArray(this.aTex);
-      gl.vertexAttribPointer(this.aTex, 2, gl.FLOAT, false, 16, 8);
-      this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
-      this.tiles = [];
-      this.single = null;
+class Renderer {
+  constructor(canvas) {
+    this.gl = canvas.getContext('webgl', { antialias: false }) ||
+              canvas.getContext('experimental-webgl', { antialias: false });
+    if (!this.gl) {
+      document.body.innerHTML = 'WebGL not supported';
+      return;
+    }
+    const gl = this.gl;
+
+    // Build the shader program FIRST, with full error checking
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs,
+      'attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;uniform mat3 u_matrix;void main(){vec3 p=u_matrix*vec3(a_position,1.0);gl_Position=vec4(p.xy,0.0,1.0);v_texCoord=a_texCoord;}');
+    gl.compileShader(vs);
+    if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
+      console.error('Vertex shader error:', gl.getShaderInfoLog(vs));
+      gl.deleteShader(vs);
+      document.body.innerHTML = 'Vertex shader failed';
+      return;
     }
 
-_compile(type, src) {
-  const shader = this.gl.createShader(type);
-  this.gl.shaderSource(shader, src);
-  this.gl.compileShader(shader);
-  if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
-    console.error('Shader compile error:', this.gl.getShaderInfoLog(shader));
-    this.gl.deleteShader(shader);
-    return null;
-  }
-  return shader;
-}
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs,
+      'precision mediump float;varying vec2 v_texCoord;uniform sampler2D u_texture;void main(){gl_FragColor=texture2D(u_texture,v_texCoord);}');
+    gl.compileShader(fs);
+    if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
+      console.error('Fragment shader error:', gl.getShaderInfoLog(fs));
+      gl.deleteShader(fs);
+      gl.deleteShader(vs);
+      document.body.innerHTML = 'Fragment shader failed';
+      return;
+    }
 
-_buildProgram() {
-  const vs = this._compile(this.gl.VERTEX_SHADER,
-    'attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;uniform mat3 u_matrix;void main(){vec3 p=u_matrix*vec3(a_position,1.0);gl_Position=vec4(p.xy,0.0,1.0);v_texCoord=a_texCoord;}');
-  const fs = this._compile(this.gl.FRAGMENT_SHADER,
-    'precision mediump float;varying vec2 v_texCoord;uniform sampler2D u_texture;void main(){gl_FragColor=texture2D(u_texture,v_texCoord);}');
-  if (!vs || !fs) {
-    console.error('Failed to compile one or both shaders');
-    return null;
-  }
-  const p = this.gl.createProgram();
-  this.gl.attachShader(p, vs);
-  this.gl.attachShader(p, fs);
-  this.gl.linkProgram(p);
-  if (!this.gl.getProgramParameter(p, this.gl.LINK_STATUS)) {
-    console.error('Program link error:', this.gl.getProgramInfoLog(p));
-    this.gl.deleteProgram(p);
-    return null;
-  }
-  return p;
-}
+    const program = gl.createProgram();
+    gl.attachShader(program, vs);
+    gl.attachShader(program, fs);
+    gl.linkProgram(program);
+    if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+      console.error('Program link error:', gl.getProgramInfoLog(program));
+      gl.deleteProgram(program);
+      gl.deleteShader(fs);
+      gl.deleteShader(vs);
+      document.body.innerHTML = 'Shader link failed';
+      return;
+    }
 
-    setImage(img) {
-      const gl = this.gl;
-      this._cleanup();
-      if (img.width <= this.maxTex && img.height <= this.maxTex) {
+    // Only now set up the rest
+    this.program = program;
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+
+    this.aPos = gl.getAttribLocation(program, 'a_position');
+    this.aTex = gl.getAttribLocation(program, 'a_texCoord');
+    this.uMatrix = gl.getUniformLocation(program, 'u_matrix');
+    this.uTex = gl.getUniformLocation(program, 'u_texture');
+
+    this.quadBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0,0,0, 1,0,1,0, 0,1,0,1, 1,0,1,0, 0,1,0,1, 1,1,1,1]), gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(this.aPos);
+    gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(this.aTex);
+    gl.vertexAttribPointer(this.aTex, 2, gl.FLOAT, false, 16, 8);
+
+    this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
+    this.tiles = [];
+    this.single = null;
+  }
+
+  // ---- Rest of methods (setImage, _cleanup, draw) remain exactly as you had them ----
+  setImage(img) {
+    const gl = this.gl;
+    this._cleanup();
+    if (img.width <= this.maxTex && img.height <= this.maxTex) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      if (gl.getError() === gl.NO_ERROR) {
+        this.single = { tex, w:img.width, h:img.height };
+        return;
+      }
+      gl.deleteTexture(tex);
+    }
+    const tileSize = Math.min(this.maxTex, 2048);
+    const off = document.createElement('canvas');
+    const ctx = off.getContext('2d');
+    for (let y=0; y<img.height; y+=tileSize) {
+      for (let x=0; x<img.width; x+=tileSize) {
+        const w = Math.min(tileSize, img.width-x), h = Math.min(tileSize, img.height-y);
+        off.width = w; off.height = h;
+        ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
         const tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-        if (gl.getError() === gl.NO_ERROR) {
-          this.single = { tex, w:img.width, h:img.height };
-          return;
-        }
-        gl.deleteTexture(tex);
-      }
-      // tile fallback
-      const tileSize = Math.min(this.maxTex, 2048);
-      const off = document.createElement('canvas');
-      const ctx = off.getContext('2d');
-      for (let y=0; y<img.height; y+=tileSize) {
-        for (let x=0; x<img.width; x+=tileSize) {
-          const w = Math.min(tileSize, img.width-x), h = Math.min(tileSize, img.height-y);
-          off.width = w; off.height = h;
-          ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
-          const tex = gl.createTexture();
-          gl.bindTexture(gl.TEXTURE_2D, tex);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, off);
-          if (gl.getError() === gl.NO_ERROR) this.tiles.push({ tex, x, y, w, h });
-        }
-      }
-    }
-
-    _cleanup() {
-      this.tiles.forEach(t => this.gl.deleteTexture(t.tex));
-      if (this.single) this.gl.deleteTexture(this.single.tex);
-      this.tiles = []; this.single = null;
-    }
-
-    draw(offX, offY, scale, cssW, cssH) {
-      const gl = this.gl;
-      // Viewport uses the physical drawing buffer size
-      gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-      // Projection uses CSS pixel dimensions (same as original)
-      const proj = new Float32Array([2/cssW, 0, 0, 0, -2/cssH, 0, -1, 1, 1]);
-      const pan  = new Float32Array([1, 0, 0, 0, 1, 0, offX, offY, 1]);
-      const zoom = new Float32Array([scale, 0, 0, 0, scale, 0, 0, 0, 1]);
-      const matMul = (a, b, out) => {
-        for (let c=0; c<3; c++) {
-          let b0=b[c*3], b1=b[c*3+1], b2=b[c*3+2];
-          for (let r=0; r<3; r++) out[c*3+r] = a[r]*b0 + a[3+r]*b1 + a[6+r]*b2;
-        }
-      };
-      const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9);
-      matMul(pan, zoom, tmp1);
-      matMul(proj, tmp1, tmp2);
-      if (this.single) {
-        gl.bindTexture(gl.TEXTURE_2D, this.single.tex);
-        const imgScale = new Float32Array([this.single.w, 0, 0, 0, this.single.h, 0, 0, 0, 1]);
-        const final = new Float32Array(9);
-        matMul(tmp2, imgScale, final);
-        gl.uniformMatrix3fv(this.uMatrix, false, final);
-        gl.uniform1i(this.uTex, 0);
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-      } else {
-        gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
-        for (const t of this.tiles) {
-          gl.bindTexture(gl.TEXTURE_2D, t.tex);
-          const tileScale = new Float32Array([t.w, 0, 0, 0, t.h, 0, t.x, t.y, 1]);
-          const final = new Float32Array(9);
-          matMul(tmp2, tileScale, final);
-          gl.uniformMatrix3fv(this.uMatrix, false, final);
-          gl.uniform1i(this.uTex, 0);
-          gl.drawArrays(gl.TRIANGLES, 0, 6);
-        }
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, off);
+        if (gl.getError() === gl.NO_ERROR) this.tiles.push({ tex, x, y, w, h });
       }
     }
   }
 
+  _cleanup() {
+    this.tiles.forEach(t => this.gl.deleteTexture(t.tex));
+    if (this.single) this.gl.deleteTexture(this.single.tex);
+    this.tiles = []; this.single = null;
+  }
+
+  draw(offX, offY, scale, cssW, cssH) {
+    const gl = this.gl;
+    gl.useProgram(this.program);
+    gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+    const proj = new Float32Array([2/cssW, 0, 0, 0, -2/cssH, 0, -1, 1, 1]);
+    const pan  = new Float32Array([1, 0, 0, 0, 1, 0, offX, offY, 1]);
+    const zoom = new Float32Array([scale, 0, 0, 0, scale, 0, 0, 0, 1]);
+    const matMul = (a, b, out) => {
+      for (let c = 0; c < 3; c++) {
+        let b0 = b[c*3], b1 = b[c*3+1], b2 = b[c*3+2];
+        for (let r = 0; r < 3; r++) out[c*3+r] = a[r]*b0 + a[3+r]*b1 + a[6+r]*b2;
+      }
+    };
+    const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9);
+    matMul(pan, zoom, tmp1);
+    matMul(proj, tmp1, tmp2);
+    if (this.single) {
+      gl.bindTexture(gl.TEXTURE_2D, this.single.tex);
+      const imgScale = new Float32Array([this.single.w, 0, 0, 0, this.single.h, 0, 0, 0, 1]);
+      const final = new Float32Array(9);
+      matMul(tmp2, imgScale, final);
+      gl.uniformMatrix3fv(this.uMatrix, false, final);
+      gl.uniform1i(this.uTex, 0);
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+      gl.drawArrays(gl.TRIANGLES, 0, 6);
+    } else {
+      gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
+      for (const t of this.tiles) {
+        gl.bindTexture(gl.TEXTURE_2D, t.tex);
+        const tileScale = new Float32Array([t.w, 0, 0, 0, t.h, 0, t.x, t.y, 1]);
+        const final = new Float32Array(9);
+        matMul(tmp2, tileScale, final);
+        gl.uniformMatrix3fv(this.uMatrix, false, final);
+        gl.uniform1i(this.uTex, 0);
+        gl.drawArrays(gl.TRIANGLES, 0, 6);
+      }
+    }
+  }
+}
   // ── Viewport (pan/zoom) ────────────────────────────────────
   class Viewport {
     constructor(renderer, w, h) {
