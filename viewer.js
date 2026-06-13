@@ -141,7 +141,7 @@
   let mouseDragOccurred = false;
   let isPinching = false;
     // ---- DIFF MODE GLOBALS ----
-  let diffs = [];               // array of [x1,y1, x2,y2, ...] per snapshot pair
+  let diffs = {};               // array of [x1,y1, x2,y2, ...] per snapshot pair
   let diffMode = false;
   let selectedPixel = null;     // { x, y }
   let pixelLocked = false;
@@ -493,7 +493,7 @@ function drawScene() {
         })
         .catch(e => {
           console.warn('No diffs.json found – diff mode will be disabled', e);
-          diffs = [];
+          diffs ={};
         })
         .then(() => {
           // ------ Build date picker and time select (original code) ------
@@ -624,7 +624,11 @@ function drawScene() {
     offsetY = dragOffsetY + (e.clientY - dragStartY);
     drawScene();
   });
-  window.addEventListener('mouseup', () => { if (selectionMode) return; dragging = false; canvas.style.cursor = 'grab'; });
+    window.addEventListener('mouseup', () => {
+    if (selectionMode) return;
+    dragging = false;
+    canvas.style.cursor = diffMode ? 'crosshair' : 'grab';
+  });
 
   canvas.addEventListener('touchstart', e => { if (selectionMode) return; e.preventDefault(); const t = e.touches; if (t.length === 1) { dragging = true; dragStartX = t[0].clientX; dragStartY = t[0].clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; wasDragged = false; touchStartTapX = t[0].clientX; touchStartTapY = t[0].clientY; } else if (t.length === 2) { dragging = false; isPinching = true; const dx = t[1].clientX - t[0].clientX; const dy = t[1].clientY - t[0].clientY; initialPinchDistance = Math.hypot(dx, dy); initialScale = scale; initialPinchCenter = { x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 }; } }, { passive: false });
   canvas.addEventListener('touchmove', e => { if (selectionMode) return; e.preventDefault(); const t = e.touches; if (t.length === 1 && dragging) { offsetX = dragOffsetX + (t[0].clientX - dragStartX); offsetY = dragOffsetY + (t[0].clientY - dragStartY); if (Math.hypot(t[0].clientX - touchStartTapX, t[0].clientY - touchStartTapY) > 5) wasDragged = true; drawScene(); } else if (t.length === 2) { const dx = t[1].clientX - t[0].clientX; const dy = t[1].clientY - t[0].clientY; const nd = Math.hypot(dx, dy); if (initialPinchDistance > 0) { const ns = initialScale * (nd / initialPinchDistance); scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, ns)); const cx = (t[0].clientX + t[1].clientX) / 2; const cy = (t[0].clientY + t[1].clientY) / 2; const sc = scale / initialScale; offsetX = cx - sc * (initialPinchCenter.x - offsetX); offsetY = cy - sc * (initialPinchCenter.y - offsetY); initialPinchCenter = { x: cx, y: cy }; initialScale = scale; initialPinchDistance = nd; drawScene(); } } }, { passive: false });
