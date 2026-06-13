@@ -1,0 +1,114 @@
+name: Compute Snapshot Diffs
+
+on:
+  push:
+    paths:
+      - 'snapshots.json'          # if you keep it in Git
+  workflow_dispatch:
+
+jobs:
+  compute-diffs:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq imagemagick curl
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone for R2
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          no_check_bucket = true
+          EOF
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python packages
+        run: pip install pillow numpy
+
+      - name: Compute missing diffs
+        run: |
+          set -euo pipefail
+          BUCKET="r2:${{ secrets.R2_BUCKET }}"
+
+          # Download snapshots.json from R2 (or from Git if you prefer)
+          rclone cat "$BUCKET/snapshots.json" > snapshots.json
+          TOTAL=$(jq '. | length' snapshots.json)
+
+          # Load existing diffs.json from R2 (if any)
+          if rclone ls "$BUCKET/diffs.json" &>/dev/null; then
+            rclone cat "$BUCKET/diffs.json" > diffs.json
+            EXISTING=$(jq '. | length' diffs.json)
+          else
+            echo "[]" > diffs.json
+            EXISTING=0
+          fi
+
+          NEEDED=$((TOTAL - 1))
+          if [ $EXISTING -ge $NEEDED ]; then
+            echo "No new diffs needed."
+            exit 0
+          fi
+
+          python3 <<EOF
+          import json, subprocess, os
+          from PIL import Image
+          import numpy as np
+
+          with open("snapshots.json") as f:
+              snapshots = json.load(f)
+          with open("diffs.json") as f:
+              diffs = json.load(f)
+
+          existing = len(diffs)
+          needed = len(snapshots) - 1
+
+          for i in range(existing, needed):
+              prev_name = snapshots[i]
+              curr_name = snapshots[i+1]
+
+              # Download both PNGs from R2
+              subprocess.run(["rclone", "copyto", f"$BUCKET/{prev_name}", "prev.png"], check=True)
+              subprocess.run(["rclone", "copyto", f"$BUCKET/{curr_name}", "curr.png"], check=True)
+
+              # Load and compare
+              prev = np.array(Image.open("prev.png").convert("RGBA"))
+              curr = np.array(Image.open("curr.png").convert("RGBA"))
+              diff_mask = np.any(curr != prev, axis=2)
+              changed = np.argwhere(diff_mask)   # (y, x)
+
+              flat = []
+              for y, x in changed:
+                  flat.extend([int(x), int(y)])
+              diffs.append(flat)
+
+              os.remove("prev.png")
+              os.remove("curr.png")
+
+          with open("diffs.json", "w") as f:
+              json.dump(diffs, f)
+          EOF
+
+          # Upload updated diffs.json to R2
+          rclone copyto diffs.json "$BUCKET/diffs.json"
+
+          # Optional: also commit to Git (if you want a backup in main)
+          # git config user.name "github-actions"
+          # git config user.email "actions@github.com"
+          # git add diffs.json
+          # git commit -m "Update diffs.json" || true
+          # git push
