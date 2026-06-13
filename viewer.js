@@ -130,22 +130,26 @@
       this.tiles = []; this.single = null;
     }
 
-    draw(offX, offY, scale, w, h) {
+    draw(offX, offY, scale, cssW, cssH) {
       const gl = this.gl;
-      gl.useProgram(this.program);
-      gl.viewport(0,0,w,h);
-      const proj = new Float32Array([2/w,0,0, 0,-2/h,0, -1,1,1]);
-      const pan  = new Float32Array([1,0,0, 0,1,0, offX,offY,1]);
-      const zoom = new Float32Array([scale,0,0, 0,scale,0, 0,0,1]);
-      const matMul = (a,b,out) => {
-        for (let c=0;c<3;c++){ let b0=b[c*3],b1=b[c*3+1],b2=b[c*3+2];
-          for (let r=0;r<3;r++) out[c*3+r]=a[r]*b0+a[3+r]*b1+a[6+r]*b2; } };
+      // Viewport uses the physical drawing buffer size
+      gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
+      // Projection uses CSS pixel dimensions (same as original)
+      const proj = new Float32Array([2/cssW, 0, 0, 0, -2/cssH, 0, -1, 1, 1]);
+      const pan  = new Float32Array([1, 0, 0, 0, 1, 0, offX, offY, 1]);
+      const zoom = new Float32Array([scale, 0, 0, 0, scale, 0, 0, 0, 1]);
+      const matMul = (a, b, out) => {
+        for (let c=0; c<3; c++) {
+          let b0=b[c*3], b1=b[c*3+1], b2=b[c*3+2];
+          for (let r=0; r<3; r++) out[c*3+r] = a[r]*b0 + a[3+r]*b1 + a[6+r]*b2;
+        }
+      };
       const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9);
       matMul(pan, zoom, tmp1);
       matMul(proj, tmp1, tmp2);
       if (this.single) {
         gl.bindTexture(gl.TEXTURE_2D, this.single.tex);
-        const imgScale = new Float32Array([this.single.w,0,0, 0,this.single.h,0, 0,0,1]);
+        const imgScale = new Float32Array([this.single.w, 0, 0, 0, this.single.h, 0, 0, 0, 1]);
         const final = new Float32Array(9);
         matMul(tmp2, imgScale, final);
         gl.uniformMatrix3fv(this.uMatrix, false, final);
@@ -156,7 +160,7 @@
         gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
         for (const t of this.tiles) {
           gl.bindTexture(gl.TEXTURE_2D, t.tex);
-          const tileScale = new Float32Array([t.w,0,0, 0,t.h,0, t.x,t.y,1]);
+          const tileScale = new Float32Array([t.w, 0, 0, 0, t.h, 0, t.x, t.y, 1]);
           const final = new Float32Array(9);
           matMul(tmp2, tileScale, final);
           gl.uniformMatrix3fv(this.uMatrix, false, final);
@@ -545,7 +549,7 @@
       }
     }
 
-  selectPixel(clientX, clientY) {
+    selectPixel(clientX, clientY) {
       if (!this.active || this.locked) return false;
       const p = this.vp.clientToImg(clientX, clientY);
       if (p.x < 0 || p.x >= IMG_W || p.y < 0 || p.y >= IMG_H) return false;
@@ -567,7 +571,7 @@
       const changedSnaps = [0, ...idxs].map(i => this.fc.all[i]).filter(Boolean);
       this.fc.setCustomList(changedSnaps);
       return true;
-  }
+    }
 
     drawMarker(ctx) {
       if (!this.pixel || !this.active) return;
@@ -612,7 +616,7 @@
     const bg = dataset === 'antarktika' ? [0.9725,0.9569,0.9412,1] : [0.627,0.741,1.0,1];
     renderer.gl.clearColor(...bg);
     renderer.gl.clear(renderer.gl.COLOR_BUFFER_BIT);
-    renderer.draw(viewport.offX, viewport.offY, viewport.scale, renderer.gl.canvas.width, renderer.gl.canvas.height);
+    renderer.draw(viewport.offX, viewport.offY, viewport.scale, window.innerWidth, window.innerHeight);
     if (!selection.mode && diffMgr && diffMgr.active) {
       diffMgr.drawMarker(selCtx);
     } else if (!selection.mode && !(diffMgr && diffMgr.active)) {
