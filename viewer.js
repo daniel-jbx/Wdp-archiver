@@ -69,22 +69,38 @@
       this.single = null;
     }
 
-    _compile(type, src) {
-      const s = this.gl.createShader(type);
-      this.gl.shaderSource(s, src);
-      this.gl.compileShader(s);
-      return s;
-    }
-    _buildProgram() {
-      const vs = this._compile(this.gl.VERTEX_SHADER,
-        'attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;uniform mat3 u_matrix;void main(){vec3 p=u_matrix*vec3(a_position,1.0);gl_Position=vec4(p.xy,0.0,1.0);v_texCoord=a_texCoord;}');
-      const fs = this._compile(this.gl.FRAGMENT_SHADER,
-        'precision mediump float;varying vec2 v_texCoord;uniform sampler2D u_texture;void main(){gl_FragColor=texture2D(u_texture,v_texCoord);}');
-      const p = this.gl.createProgram();
-      this.gl.attachShader(p, vs); this.gl.attachShader(p, fs);
-      this.gl.linkProgram(p);
-      return p;
-    }
+_compile(type, src) {
+  const shader = this.gl.createShader(type);
+  this.gl.shaderSource(shader, src);
+  this.gl.compileShader(shader);
+  if (!this.gl.getShaderParameter(shader, this.gl.COMPILE_STATUS)) {
+    console.error('Shader compile error:', this.gl.getShaderInfoLog(shader));
+    this.gl.deleteShader(shader);
+    return null;
+  }
+  return shader;
+}
+
+_buildProgram() {
+  const vs = this._compile(this.gl.VERTEX_SHADER,
+    'attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;uniform mat3 u_matrix;void main(){vec3 p=u_matrix*vec3(a_position,1.0);gl_Position=vec4(p.xy,0.0,1.0);v_texCoord=a_texCoord;}');
+  const fs = this._compile(this.gl.FRAGMENT_SHADER,
+    'precision mediump float;varying vec2 v_texCoord;uniform sampler2D u_texture;void main(){gl_FragColor=texture2D(u_texture,v_texCoord);}');
+  if (!vs || !fs) {
+    console.error('Failed to compile one or both shaders');
+    return null;
+  }
+  const p = this.gl.createProgram();
+  this.gl.attachShader(p, vs);
+  this.gl.attachShader(p, fs);
+  this.gl.linkProgram(p);
+  if (!this.gl.getProgramParameter(p, this.gl.LINK_STATUS)) {
+    console.error('Program link error:', this.gl.getProgramInfoLog(p));
+    this.gl.deleteProgram(p);
+    return null;
+  }
+  return p;
+}
 
     setImage(img) {
       const gl = this.gl;
