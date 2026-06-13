@@ -3,6 +3,8 @@
   const slider = document.getElementById('slider');
   const timestampLabelTop = document.getElementById('timestamp-label-top');
   const intervalSelect = document.getElementById('interval-select');
+  let datePicker = null;
+  let timeSelect = null;
 
   // ---- WebGL context ----
   const gl = canvas.getContext('webgl', { antialias: false }) ||
@@ -505,8 +507,8 @@
           for (const snaps of snapshotsByDate.values()) {
             snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
           }
-          const datePicker = document.getElementById('date-picker');
-          const timeSelect = document.getElementById('time-select');
+          datePicker = document.getElementById('date-picker');
+          timeSelect = document.getElementById('time-select');
           if (!datePicker || !timeSelect) {
             console.error('Date picker or time select missing');
             buildFilteredList(null);
