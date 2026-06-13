@@ -267,15 +267,32 @@ function drawScene() {
 
   // Draw pixel marker when in diff mode and a pixel is selected (and not in area selection mode)
   if (diffMode && selectedPixel && !selectionMode) {
-    const clientPt = imgToClient(selectedPixel.x, selectedPixel.y);
+    const px = selectedPixel.x;
+    const py = selectedPixel.y;
+    // Calculate screen coordinates of the pixel's top-left corner
+    const screenX = px * scale + offsetX;
+    const screenY = py * scale + offsetY;
+    // Width/height of one image pixel on screen
+    const w = scale;
+    const h = scale;
+
+    // Ensure at least 1px wide (scale can be <1)
+    const drawW = Math.max(1, w);
+    const drawH = Math.max(1, h);
+
     selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    selCtx.save();
+    // Disable antialiasing for sharp pixel borders
+    selCtx.imageSmoothingEnabled = false;
     selCtx.beginPath();
-    selCtx.arc(clientPt.x, clientPt.y, 8, 0, 2 * Math.PI);
-    selCtx.fillStyle = 'red';
-    selCtx.fill();
-    selCtx.strokeStyle = 'white';
-    selCtx.lineWidth = 2;
-    selCtx.stroke();
+    // Draw a 1px outline rectangle around the pixel
+    selCtx.strokeStyle = 'red';
+    selCtx.lineWidth = 1;
+    selCtx.strokeRect(screenX, screenY, drawW, drawH);
+    // Optionally, fill with a semi‑transparent red
+    selCtx.fillStyle = 'rgba(255, 0, 0, 0.3)';
+    selCtx.fillRect(screenX, screenY, drawW, drawH);
+    selCtx.restore();
   } else if (!diffMode && !selectionMode) {
     selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
   }
@@ -302,29 +319,18 @@ function drawScene() {
     ) / 1000;
   }
 
-    // ---- DIFF HELPER FUNCTIONS ----
+  // ---- DIFF HELPER FUNCTIONS (inverted index) ----
   function getPixelChangeIndices(px, py) {
-    // Returns array of snapshot indices (into allSnapshots) where pixel changed
-    if (!diffs.length || allSnapshots.length === 0) return [];
-    const indices = [0]; // first snapshot always included
-    let next = 0;
-    while (true) {
-      let found = -1;
-      for (let i = next; i < diffs.length; i++) {
-        const changes = diffs[i];
-        for (let j = 0; j < changes.length; j += 2) {
-          if (changes[j] === px && changes[j+1] === py) {
-            found = i + 1;
-            break;
-          }
-        }
-        if (found !== -1) break;
-      }
-      if (found === -1 || found === next) break;
-      indices.push(found);
-      next = found;
+    // diffs is now an object: { "x,y": [snapshotIndices] }
+    if (!diffs || typeof diffs !== 'object') return [];
+    const key = `${px},${py}`;
+    const indices = diffs[key];
+    if (!indices || !indices.length) return [];
+    // Include snapshot 0 if the pixel ever appears (first snapshot)
+    if (!indices.includes(0)) {
+      return [0, ...indices];
     }
-    return [...new Set(indices)].sort((a,b) => a-b);
+    return indices;
   }
 
   function applyDiffFilter() {
