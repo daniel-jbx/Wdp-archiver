@@ -1,8 +1,8 @@
-name: Compute Snapshot Diffs
+name: Compute Snapshot Diffs (Inverted Index)
 
 on:
   workflow_run:
-    workflows: ["update-map"]          # change to your actual update workflow name
+    workflows: ["update-map"]
     types:
       - completed
   push:
@@ -17,13 +17,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y jq imagemagick curl
           curl https://rclone.org/install.sh | sudo bash
 
-      - name: Configure rclone for Cloudflare R2
+      - name: Configure rclone for R2
         run: |
           mkdir -p ~/.config/rclone
           cat > ~/.config/rclone/rclone.conf <<EOF
@@ -41,39 +41,27 @@ jobs:
         with:
           python-version: '3.10'
 
-      - name: Install Python dependencies
+      - name: Install Python packages
         run: pip install pillow numpy
 
-      - name: Compute missing diffs
+      - name: Compute inverted index diffs
         run: |
           set -euo pipefail
           BUCKET="r2:${{ secrets.R2_BUCKET }}"
 
-          # Download snapshots.json from R2
+          # Download snapshots.json
           rclone cat "$BUCKET/snapshots.json" > snapshots.json
           TOTAL=$(jq '. | length' snapshots.json)
 
-          # Attempt to download existing diffs.json (if it exists and is not empty)
-          EXISTING=0
-          if rclone cat "$BUCKET/diffs.json" > diffs.json 2>/dev/null; then
-            if [ -s diffs.json ]; then
-              EXISTING=$(jq '. | length' diffs.json 2>/dev/null || echo 0)
-            else
-              EXISTING=0
-            fi
-          else
-            echo "[]" > diffs.json
-            EXISTING=0
-          fi
+          # Load existing diffs.json (if any) – we'll overwrite, but for incremental we'd merge.
+          # For simplicity on first run, we start fresh. To enable incremental, we'd need to compute only new snapshots.
+          # Since this workflow runs after each update-map, we'll compute from scratch each time.
+          # If you want incremental, we can modify later.
+          echo "{}" > diffs.json
 
           NEEDED=$((TOTAL - 1))
           if [ $NEEDED -le 0 ]; then
-            echo "Not enough snapshots to compute diffs (need at least 2)."
-            exit 0
-          fi
-
-          if [ $EXISTING -ge $NEEDED ]; then
-            echo "No new diffs needed."
+            echo "Not enough snapshots (need at least 2)."
             exit 0
           fi
 
@@ -84,40 +72,46 @@ jobs:
 
           with open("snapshots.json") as f:
               snapshots = json.load(f)
-          with open("diffs.json") as f:
-              content = f.read().strip()
-              diffs = json.loads(content) if content else []
 
-          existing = len(diffs)
-          needed = len(snapshots) - 1
+          # Load existing diffs if they exist (for incremental, but here we start empty)
+          try:
+              with open("diffs.json") as f:
+                  diffs = json.load(f)
+          except:
+              diffs = {}
 
-          for i in range(existing, needed):
+          # We'll compute diffs for all snapshot pairs.
+          # To be incremental, we could compare existing keys vs new snapshots.
+          # For simplicity, we rebuild from scratch each run (still only runs after updates).
+          for i in range(len(snapshots) - 1):
               prev_name = snapshots[i]
               curr_name = snapshots[i+1]
 
-              print(f"Downloading {prev_name} and {curr_name}...")
+              print(f"Processing {prev_name} -> {curr_name} (pair {i+1}/{len(snapshots)-1})")
               subprocess.run(["rclone", "copyto", f"$BUCKET/{prev_name}", "prev.png"], check=True)
               subprocess.run(["rclone", "copyto", f"$BUCKET/{curr_name}", "curr.png"], check=True)
 
-              print(f"Comparing {prev_name} -> {curr_name}")
               prev = np.array(Image.open("prev.png").convert("RGBA"))
               curr = np.array(Image.open("curr.png").convert("RGBA"))
               diff_mask = np.any(curr != prev, axis=2)
               changed = np.argwhere(diff_mask)   # (y, x)
 
-              flat = []
+              # Record the snapshot index (i+1) for each changed pixel
               for y, x in changed:
-                  flat.extend([int(x), int(y)])
-              diffs.append(flat)
+                  key = f"{int(x)},{int(y)}"
+                  if key not in diffs:
+                      diffs[key] = []
+                  # Only add if not already the last index (avoid duplicates if same pixel changes in consecutive pairs)
+                  if not diffs[key] or diffs[key][-1] != i+1:
+                      diffs[key].append(i+1)
 
               os.remove("prev.png")
               os.remove("curr.png")
-              print(f"Done diff {i+1}/{needed}")
 
           with open("diffs.json", "w") as f:
               json.dump(diffs, f)
           EOF
 
-          # Upload updated diffs.json back to R2
+          # Upload diffs.json (optionally gzip compress)
           rclone copyto diffs.json "$BUCKET/diffs.json"
-          echo "diffs.json uploaded successfully."
+          echo "diffs.json uploaded successfully (inverted index)."
