@@ -223,62 +223,63 @@
     console.log('Created', tileTextures.length, 'tiles.');
   }
 
-  function drawScene() {
-    if (dataset === 'antarktika') {
-  gl.clearColor(0.9725, 0.9569, 0.9412, 1.0); // #F8F4F0
-} else {
-  gl.clearColor(0.627, 0.741, 1.0, 1.0); // original blue
-}
-    gl.clear(gl.COLOR_BUFFER_BIT);
+function drawScene() {
+  if (dataset === 'antarktika') {
+    gl.clearColor(0.9725, 0.9569, 0.9412, 1.0); // #F8F4F0
+  } else {
+    gl.clearColor(0.627, 0.741, 1.0, 1.0); // original blue
+  }
+  gl.clear(gl.COLOR_BUFFER_BIT);
 
-    const cssW = window.innerWidth, cssH = window.innerHeight;
-    if (SINGLE_TEXTURE && singleTextureInfo) {
-      gl.bindTexture(gl.TEXTURE_2D, singleTextureInfo.tex);
-      const proj = new Float32Array([2/cssW,0,0, 0,-2/cssH,0, -1,1,1]);
-      const pan = new Float32Array([1,0,0, 0,1,0, offsetX,offsetY,1]);
-      const zoom = new Float32Array([scale,0,0, 0,scale,0, 0,0,1]);
-      const imgScale = new Float32Array([IMG_WIDTH,0,0, 0,IMG_HEIGHT,0, 0,0,1]);
-      const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
-      mat3mul(pan, zoom, tmp1);
-      mat3mul(proj, tmp1, tmp2);
-      mat3mul(tmp2, imgScale, combined);
+  const cssW = window.innerWidth, cssH = window.innerHeight;
+  if (SINGLE_TEXTURE && singleTextureInfo) {
+    gl.bindTexture(gl.TEXTURE_2D, singleTextureInfo.tex);
+    const proj = new Float32Array([2/cssW,0,0, 0,-2/cssH,0, -1,1,1]);
+    const pan = new Float32Array([1,0,0, 0,1,0, offsetX,offsetY,1]);
+    const zoom = new Float32Array([scale,0,0, 0,scale,0, 0,0,1]);
+    const imgScale = new Float32Array([IMG_WIDTH,0,0, 0,IMG_HEIGHT,0, 0,0,1]);
+    const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
+    mat3mul(pan, zoom, tmp1);
+    mat3mul(proj, tmp1, tmp2);
+    mat3mul(tmp2, imgScale, combined);
+    gl.uniformMatrix3fv(uMatrixLoc, false, combined);
+    gl.uniform1i(uTextureLoc, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    gl.drawArrays(gl.TRIANGLES, 0, 6);
+  } else if (tileTextures.length > 0) {
+    const proj = new Float32Array([2/cssW,0,0, 0,-2/cssH,0, -1,1,1]);
+    const pan = new Float32Array([1,0,0, 0,1,0, offsetX,offsetY,1]);
+    const zoom = new Float32Array([scale,0,0, 0,scale,0, 0,0,1]);
+    const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
+    mat3mul(pan, zoom, tmp1);
+    mat3mul(proj, tmp1, tmp2);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+    for (const tile of tileTextures) {
+      gl.bindTexture(gl.TEXTURE_2D, tile.tex);
+      const tileScale = new Float32Array([tile.w,0,0, 0,tile.h,0, tile.x,tile.y,1]);
+      mat3mul(tmp2, tileScale, combined);
       gl.uniformMatrix3fv(uMatrixLoc, false, combined);
       gl.uniform1i(uTextureLoc, 0);
-      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
       gl.drawArrays(gl.TRIANGLES, 0, 6);
-    } else if (tileTextures.length > 0) {
-      const proj = new Float32Array([2/cssW,0,0, 0,-2/cssH,0, -1,1,1]);
-      const pan = new Float32Array([1,0,0, 0,1,0, offsetX,offsetY,1]);
-      const zoom = new Float32Array([scale,0,0, 0,scale,0, 0,0,1]);
-      const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9), combined = new Float32Array(9);
-      mat3mul(pan, zoom, tmp1);
-      mat3mul(proj, tmp1, tmp2);
-
-      gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
-      for (const tile of tileTextures) {
-        gl.bindTexture(gl.TEXTURE_2D, tile.tex);
-        const tileScale = new Float32Array([tile.w,0,0, 0,tile.h,0, tile.x,tile.y,1]);
-        mat3mul(tmp2, tileScale, combined);
-        gl.uniformMatrix3fv(uMatrixLoc, false, combined);
-        gl.uniform1i(uTextureLoc, 0);
-        gl.drawArrays(gl.TRIANGLES, 0, 6);
-      }
-          // Draw pixel marker when in diff mode and a pixel is selected (and not in area selection mode)
-    if (diffMode && selectedPixel && !selectionMode) {
-      const clientPt = imgToClient(selectedPixel.x, selectedPixel.y);
-      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-      selCtx.beginPath();
-      selCtx.arc(clientPt.x, clientPt.y, 8, 0, 2 * Math.PI);
-      selCtx.fillStyle = 'red';
-      selCtx.fill();
-      selCtx.strokeStyle = 'white';
-      selCtx.lineWidth = 2;
-      selCtx.stroke();
-    } else if (!diffMode && !selectionMode) {
-      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-    }
     }
   }
+
+  // Draw pixel marker when in diff mode and a pixel is selected (and not in area selection mode)
+  if (diffMode && selectedPixel && !selectionMode) {
+    const clientPt = imgToClient(selectedPixel.x, selectedPixel.y);
+    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    selCtx.beginPath();
+    selCtx.arc(clientPt.x, clientPt.y, 8, 0, 2 * Math.PI);
+    selCtx.fillStyle = 'red';
+    selCtx.fill();
+    selCtx.strokeStyle = 'white';
+    selCtx.lineWidth = 2;
+    selCtx.stroke();
+  } else if (!diffMode && !selectionMode) {
+    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+  }
+}
 
   function resetView() {
     if (!currentImage.complete || currentImage.naturalWidth === 0) return;
