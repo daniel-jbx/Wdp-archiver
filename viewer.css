@@ -81,6 +81,14 @@ body, html {
   border-radius: 4px; cursor: pointer; white-space: nowrap;
 }
 
+#diff-btn.diff-active {
+  background: #4CAF50;
+  border-color: white;
+}
+#canvas.diff-mode {
+  cursor: crosshair;
+}
+
 #controls {
   position: absolute; bottom: 20px; left: 5%; right: 5%;
   background: rgba(0,0,0,0.75); border-radius: 8px;
