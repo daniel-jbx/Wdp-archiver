@@ -711,16 +711,6 @@
     if (img.x > x1 && img.x < x2 && img.y > y1 && img.y < y2) return 'move';
     return null;
   }
-  function clientToImg(clientX, clientY) {
-    const imgX = Math.round((clientX - offsetX) / scale);
-    const imgY = Math.round((clientY - offsetY) / scale);
-    return { x: imgX, y: imgY };
-  }
-  function imgToClient(imgX, imgY) {
-    const clientX = imgX * scale + offsetX;
-    const clientY = imgY * scale + offsetY;
-    return { x: clientX, y: clientY };
-  }
   function constrainToImage(imgPt) {
     return {
       x: Math.max(0, Math.min(imgPt.x, IMG_WIDTH)),
