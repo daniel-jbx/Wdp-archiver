@@ -453,79 +453,95 @@
   };
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
-  // ---- Fetch snapshots ----
+   // ---- Fetch snapshots and diffs ----
   fetch(R2_BASE_URL + 'snapshots.json')
     .then(r => r.json())
     .then(files => {
       if (!files.length) { timestampLabelTop.textContent = 'No snapshots found.'; return; }
       allSnapshots = files;
 
-      const snapshotsByDate = new Map();
-      for (const filename of allSnapshots) {
-        const pattern = dataset === 'wdp'
-          ? /wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/
-          : /antarktika_snapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/;
-        const match = filename.match(pattern);
-        if (match) {
-          const year = match[1], month = match[2], day = match[3];
-          const hour = match[4], minute = match[5], second = match[6];
-          const dateKey = `${year}-${month}-${day}`;
-          const timeStr = `${hour}:${minute}:${second}`;
-          if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
-          snapshotsByDate.get(dateKey).push({ filename, timeStr });
-        }
-      }
-      for (const snaps of snapshotsByDate.values()) {
-        snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
-      }
-      const datePicker = document.getElementById('date-picker');
-      const timeSelect = document.getElementById('time-select');
-      if (!datePicker || !timeSelect) {
-        console.error('Date picker or time select missing');
-        buildFilteredList(null);
-        return;
-      }
-      const dates = Array.from(snapshotsByDate.keys()).sort();
-      if (dates.length) {
-        datePicker.min = dates[0];
-        datePicker.max = dates[dates.length - 1];
-        datePicker.value = dates[dates.length - 1];
-      }
-      function updateTimeSelect(dateValue) {
-        const snaps = snapshotsByDate.get(dateValue);
-        if (!snaps || snaps.length === 0) {
-          timeSelect.style.display = 'none';
-          return;
-        }
-        timeSelect.style.display = 'inline-block';
-        timeSelect.innerHTML = '<option value="">Select time...</option>';
-        for (const snap of snaps) {
-          const opt = document.createElement('option');
-          opt.value = snap.filename;
-          opt.textContent = snap.timeStr;
-          timeSelect.appendChild(opt);
-        }
-      }
-      datePicker.addEventListener('change', () => {
-        updateTimeSelect(datePicker.value);
-        timeSelect.value = '';
-      });
-      timeSelect.addEventListener('change', () => {
-        const filename = timeSelect.value;
-        if (filename) buildFilteredList(filename);
-      });
-      if (datePicker.value) {
-        updateTimeSelect(datePicker.value);
-        const snaps = snapshotsByDate.get(datePicker.value);
-        if (snaps && snaps.length) {
-          timeSelect.value = snaps[snaps.length - 1].filename;
-          buildFilteredList(timeSelect.value);
-        } else {
-          buildFilteredList(null);
-        }
-      } else {
-        buildFilteredList(null);
-      }
+      // Load diffs.json (if available)
+      return fetch(R2_BASE_URL + 'diffs.json')
+        .then(r => r.json())
+        .then(diffData => {
+          diffs = diffData;
+          console.log(`Loaded ${diffs.length} diff entries`);
+        })
+        .catch(e => {
+          console.warn('No diffs.json found – diff mode will be disabled', e);
+          diffs = [];
+        })
+        .then(() => {
+          // ------ Build date picker and time select (original code) ------
+          const snapshotsByDate = new Map();
+          for (const filename of allSnapshots) {
+            const pattern = dataset === 'wdp'
+              ? /wdpsnapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/
+              : /antarktika_snapshot_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.png/;
+            const match = filename.match(pattern);
+            if (match) {
+              const year = match[1], month = match[2], day = match[3];
+              const hour = match[4], minute = match[5], second = match[6];
+              const dateKey = `${year}-${month}-${day}`;
+              const timeStr = `${hour}:${minute}:${second}`;
+              if (!snapshotsByDate.has(dateKey)) snapshotsByDate.set(dateKey, []);
+              snapshotsByDate.get(dateKey).push({ filename, timeStr });
+            }
+          }
+          for (const snaps of snapshotsByDate.values()) {
+            snaps.sort((a, b) => a.timeStr.localeCompare(b.timeStr));
+          }
+          const datePicker = document.getElementById('date-picker');
+          const timeSelect = document.getElementById('time-select');
+          if (!datePicker || !timeSelect) {
+            console.error('Date picker or time select missing');
+            buildFilteredList(null);
+            return;
+          }
+          const dates = Array.from(snapshotsByDate.keys()).sort();
+          if (dates.length) {
+            datePicker.min = dates[0];
+            datePicker.max = dates[dates.length - 1];
+            datePicker.value = dates[dates.length - 1];
+          }
+          function updateTimeSelect(dateValue) {
+            const snaps = snapshotsByDate.get(dateValue);
+            if (!snaps || snaps.length === 0) {
+              timeSelect.style.display = 'none';
+              return;
+            }
+            timeSelect.style.display = 'inline-block';
+            timeSelect.innerHTML = '<option value="">Select time...</option>';
+            for (const snap of snaps) {
+              const opt = document.createElement('option');
+              opt.value = snap.filename;
+              opt.textContent = snap.timeStr;
+              timeSelect.appendChild(opt);
+            }
+          }
+          datePicker.addEventListener('change', () => {
+            if (diffMode) return;   // do nothing while diff mode is active
+            updateTimeSelect(datePicker.value);
+            timeSelect.value = '';
+          });
+          timeSelect.addEventListener('change', () => {
+            if (diffMode) return;   // do nothing while diff mode is active
+            const filename = timeSelect.value;
+            if (filename) buildFilteredList(filename);
+          });
+          if (datePicker.value) {
+            updateTimeSelect(datePicker.value);
+            const snaps = snapshotsByDate.get(datePicker.value);
+            if (snaps && snaps.length) {
+              timeSelect.value = snaps[snaps.length - 1].filename;
+              buildFilteredList(timeSelect.value);
+            } else {
+              buildFilteredList(null);
+            }
+          } else {
+            buildFilteredList(null);
+          }
+        });
     })
     .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
 
