@@ -489,7 +489,7 @@ function drawScene() {
         .then(r => r.json())
         .then(diffData => {
           diffs = diffData;
-          console.log(`Loaded ${diffs.length} diff entries`);
+          console.log(`Loaded ${Object.keys(diffs).length} diff entries`);
         })
         .catch(e => {
           console.warn('No diffs.json found – diff mode will be disabled', e);
