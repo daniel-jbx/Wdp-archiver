@@ -304,137 +304,150 @@
   }
 
   // ── Selection Manager ──────────────────────────────────────
-  class SelectionManager {
-    constructor(selCtx, viewport) {
-      this.ctx = selCtx;
-      this.vp = viewport;
-      this.mode = false;
-      this.start = null; this.end = null;
-      this.dragging = false; this.handle = null;
-      this.HANDLE = 8;
-    }
+class SelectionManager {
+  constructor(selCtx, viewport) {
+    this.ctx = selCtx;
+    this.vp = viewport;
+    this.mode = false;
+    this.start = null; this.end = null;
+    this.dragging = false; this.handle = null;
+    this.HANDLE = 8;
+  }
 
-    getRect() {
-      if (!this.start || !this.end) return null;
-      return {
-        x1: Math.min(this.start.x, this.end.x),
-        y1: Math.min(this.start.y, this.end.y),
-        x2: Math.max(this.start.x, this.end.x),
-        y2: Math.max(this.start.y, this.end.y)
-      };
-    }
+  getRect() {
+    if (!this.start || !this.end) return null;
+    return {
+      x1: Math.min(this.start.x, this.end.x),
+      y1: Math.min(this.start.y, this.end.y),
+      x2: Math.max(this.start.x, this.end.x),
+      y2: Math.max(this.start.y, this.end.y)
+    };
+  }
 
-    toggle(on) {
-      this.mode = on;
-      if (!on) { this.start = this.end = null; this.handle = null; this.clear(); }
-    }
-
-    clear() { this.ctx.clearRect(0, 0, this.ctx.canvas.width, this.ctx.canvas.height); }
-
-    draw() {
-      this.clear();
-      const r = this.getRect();
-      if (!r) return;
-      const s = this.vp.imgToClient(r.x1, r.y1);
-      const e = this.vp.imgToClient(r.x2, r.y2);
-      let x = Math.round(Math.min(s.x, e.x)), y = Math.round(Math.min(s.y, e.y));
-      let w = Math.round(Math.abs(e.x - s.x)), h = Math.round(Math.abs(e.y - s.y));
-      if (w < 1) w = 1; if (h < 1) h = 1;
-      const ctx = this.ctx;
-      ctx.fillStyle = 'rgba(255,255,0,0.1)'; ctx.fillRect(x, y, w, h);
-      ctx.strokeStyle = '#FF0'; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
-      const handles = [
-        {x,y},{x:x+w,y},{x,y:y+h},{x:x+w,y:y+h},
-        {x:x+w/2,y},{x:x+w/2,y:y+h},{x,y:y+h/2},{x:x+w,y:y+h/2}
-      ];
-      ctx.fillStyle = '#FFF'; ctx.strokeStyle = '#000';
-      handles.forEach(h => {
-        ctx.fillRect(h.x - this.HANDLE/2, h.y - this.HANDLE/2, this.HANDLE, this.HANDLE);
-        ctx.strokeRect(h.x - this.HANDLE/2, h.y - this.HANDLE/2, this.HANDLE, this.HANDLE);
-      });
-      coordsDiv.style.display = 'inline-block';
-      coordsDiv.textContent = `x: [${r.x1}, ${r.x2}]  y: [${r.y1}, ${r.y2}]`;
-    }
-
-    _clamp(p) { return { x: Math.max(0, Math.min(p.x, IMG_W)), y: Math.max(0, Math.min(p.y, IMG_H)) }; }
-
-    hitHandle(clientX, clientY) {
-      const r = this.getRect();
-      if (!r) return null;
-      const img = this.vp.clientToImg(clientX, clientY);
-      const thresh = this.HANDLE / this.vp.scale;
-      const {x1,y1,x2,y2} = r;
-      const near = (a,b) => Math.abs(img.x - a) <= thresh && Math.abs(img.y - b) <= thresh;
-      if (near(x1,y1)) return 'tl'; if (near(x2,y1)) return 'tr';
-      if (near(x1,y2)) return 'bl'; if (near(x2,y2)) return 'br';
-      if (Math.abs(img.x-x1)<=thresh && img.y>y1 && img.y<y2) return 'left';
-      if (Math.abs(img.x-x2)<=thresh && img.y>y1 && img.y<y2) return 'right';
-      if (Math.abs(img.y-y1)<=thresh && img.x>x1 && img.x<x2) return 'top';
-      if (Math.abs(img.y-y2)<=thresh && img.x>x1 && img.x<x2) return 'bottom';
-      if (img.x>x1 && img.x<x2 && img.y>y1 && img.y<y2) return 'move';
-      return null;
-    }
-
-    dragStart(clientX, clientY) {
-      const img = this._clamp(this.vp.clientToImg(clientX, clientY));
-      if (this.start && this.end && this.getRect()) {
-        this.handle = this.hitHandle(clientX, clientY);
-        if (this.handle) return;
-      }
-      this.dragging = true;
-      this.start = img; this.end = null; this.handle = null;
-    }
-    dragMove(clientX, clientY) {
-      const img = this._clamp(this.vp.clientToImg(clientX, clientY));
-      if (this.handle) this._dragHandle(img);
-      else if (this.dragging) this.end = img;
-      this.draw();
-    }
-    dragEnd() {
-      this.dragging = false;
-      if (this.start && this.end) {
-        const r = this.getRect();
-        if (r && r.x2 - r.x1 < 1 && r.y2 - r.y1 < 1) {
-          this.start = this.end = null;
-          dlPng.style.display = dlOverlay.style.display = 'none';
-        }
-      }
+  toggle(on) {
+    this.mode = on;
+    if (!on) {
+      this.start = this.end = null;
       this.handle = null;
-      this.draw();
-    }
-    _dragHandle(img) {
-      const r = this.getRect();
-      if (!r) return;
-      const {x1,y1,x2,y2} = r;
-      switch(this.handle) {
-        case 'tl': this.start={x:img.x,y:img.y}; this.end={x:x2,y:y2}; break;
-        case 'tr': this.start={x:x1,y:img.y}; this.end={x:img.x,y:y2}; break;
-        case 'bl': this.start={x:img.x,y:y1}; this.end={x:x2,y:img.y}; break;
-        case 'br': this.start={x:x1,y:y1}; this.end={x:img.x,y:img.y}; break;
-        case 'top': this.start={x:x1,y:img.y}; this.end={x:x2,y:y2}; break;
-        case 'bottom': this.start={x:x1,y:y1}; this.end={x:x2,y:img.y}; break;
-        case 'left': this.start={x:img.x,y:y1}; this.end={x:x2,y:y2}; break;
-        case 'right': this.start={x:x1,y:y1}; this.end={x:img.x,y:y2}; break;
-        case 'move': {
-          const dx = img.x - (x1+x2)/2, dy = img.y - (y1+y2)/2;
-          const w = x2-x1, h = y2-y1;
-          let nx1 = Math.max(0, Math.min(x1+dx, IMG_W-w)), ny1 = Math.max(0, Math.min(y1+dy, IMG_H-h));
-          this.start = {x:nx1, y:ny1}; this.end = {x:nx1+w, y:ny1+h};
-          break;
-        }
-      }
-    }
-
-    getCroppedData(img) {
-      const r = this.getRect();
-      if (!r || r.x2-r.x1 < 1 || r.y2-r.y1 < 1) return null;
-      const w = r.x2 - r.x1, h = r.y2 - r.y1;
-      const off = document.createElement('canvas');
-      off.width = w; off.height = h;
-      off.getContext('2d').drawImage(img, r.x1, r.y1, w, h, 0, 0, w, h);
-      return { dataUrl: off.toDataURL(), w, h, x: r.x1, y: r.y1 };
+      this.clear();
+      dlPng.style.display = dlOverlay.style.display = 'none';
     }
   }
+
+  clear() { this.ctx.clearRect(0, 0, this.ctx.canvas.width, this.ctx.canvas.height); }
+
+  draw() {
+    this.clear();
+    const r = this.getRect();
+    if (!r) return;
+    const s = this.vp.imgToClient(r.x1, r.y1);
+    const e = this.vp.imgToClient(r.x2, r.y2);
+    let x = Math.round(Math.min(s.x, e.x)), y = Math.round(Math.min(s.y, e.y));
+    let w = Math.round(Math.abs(e.x - s.x)), h = Math.round(Math.abs(e.y - s.y));
+    if (w < 1) w = 1; if (h < 1) h = 1;
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(255,255,0,0.1)'; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#FF0'; ctx.lineWidth = 1; ctx.strokeRect(x, y, w, h);
+    const handles = [
+      {x,y},{x:x+w,y},{x,y:y+h},{x:x+w,y:y+h},
+      {x:x+w/2,y},{x:x+w/2,y:y+h},{x,y:y+h/2},{x:x+w,y:y+h/2}
+    ];
+    ctx.fillStyle = '#FFF'; ctx.strokeStyle = '#000';
+    handles.forEach(h => {
+      ctx.fillRect(h.x - this.HANDLE/2, h.y - this.HANDLE/2, this.HANDLE, this.HANDLE);
+      ctx.strokeRect(h.x - this.HANDLE/2, h.y - this.HANDLE/2, this.HANDLE, this.HANDLE);
+    });
+    coordsDiv.style.display = 'inline-block';
+    coordsDiv.textContent = `x: [${r.x1}, ${r.x2}]  y: [${r.y1}, ${r.y2}]`;
+  }
+
+  _clamp(p) { return { x: Math.max(0, Math.min(p.x, IMG_W)), y: Math.max(0, Math.min(p.y, IMG_H)) }; }
+
+  hitHandle(clientX, clientY) {
+    const r = this.getRect();
+    if (!r) return null;
+    const img = this.vp.clientToImg(clientX, clientY);
+    const thresh = this.HANDLE / this.vp.scale;
+    const {x1,y1,x2,y2} = r;
+    const near = (a,b) => Math.abs(img.x - a) <= thresh && Math.abs(img.y - b) <= thresh;
+    if (near(x1,y1)) return 'tl'; if (near(x2,y1)) return 'tr';
+    if (near(x1,y2)) return 'bl'; if (near(x2,y2)) return 'br';
+    if (Math.abs(img.x-x1)<=thresh && img.y>y1 && img.y<y2) return 'left';
+    if (Math.abs(img.x-x2)<=thresh && img.y>y1 && img.y<y2) return 'right';
+    if (Math.abs(img.y-y1)<=thresh && img.x>x1 && img.x<x2) return 'top';
+    if (Math.abs(img.y-y2)<=thresh && img.x>x1 && img.x<x2) return 'bottom';
+    if (img.x>x1 && img.x<x2 && img.y>y1 && img.y<y2) return 'move';
+    return null;
+  }
+
+  dragStart(clientX, clientY) {
+    const img = this._clamp(this.vp.clientToImg(clientX, clientY));
+    if (this.start && this.end && this.getRect()) {
+      this.handle = this.hitHandle(clientX, clientY);
+      if (this.handle) return; // resizing an existing selection – keep buttons visible
+    }
+    // Starting a new selection – hide any previous download buttons
+    dlPng.style.display = dlOverlay.style.display = 'none';
+    this.dragging = true;
+    this.start = img; this.end = null; this.handle = null;
+  }
+  dragMove(clientX, clientY) {
+    const img = this._clamp(this.vp.clientToImg(clientX, clientY));
+    if (this.handle) this._dragHandle(img);
+    else if (this.dragging) this.end = img;
+    this.draw();
+  }
+  dragEnd() {
+    this.dragging = false;
+    if (this.start && this.end) {
+      const r = this.getRect();
+      if (r) {
+        if (r.x2 - r.x1 < 1 && r.y2 - r.y1 < 1) {
+          // selection is just a single point – hide buttons
+          this.start = this.end = null;
+          dlPng.style.display = dlOverlay.style.display = 'none';
+        } else {
+          // valid selection – show download buttons
+          dlPng.style.display = dlOverlay.style.display = 'inline-block';
+        }
+      }
+    }
+    this.handle = null;
+    this.draw();
+  }
+  _dragHandle(img) {
+    const r = this.getRect();
+    if (!r) return;
+    const {x1,y1,x2,y2} = r;
+    switch(this.handle) {
+      case 'tl': this.start={x:img.x,y:img.y}; this.end={x:x2,y:y2}; break;
+      case 'tr': this.start={x:x1,y:img.y}; this.end={x:img.x,y:y2}; break;
+      case 'bl': this.start={x:img.x,y:y1}; this.end={x:x2,y:img.y}; break;
+      case 'br': this.start={x:x1,y:y1}; this.end={x:img.x,y:img.y}; break;
+      case 'top': this.start={x:x1,y:img.y}; this.end={x:x2,y:y2}; break;
+      case 'bottom': this.start={x:x1,y:y1}; this.end={x:x2,y:img.y}; break;
+      case 'left': this.start={x:img.x,y:y1}; this.end={x:x2,y:y2}; break;
+      case 'right': this.start={x:x1,y:y1}; this.end={x:img.x,y:y2}; break;
+      case 'move': {
+        const dx = img.x - (x1+x2)/2, dy = img.y - (y1+y2)/2;
+        const w = x2-x1, h = y2-y1;
+        let nx1 = Math.max(0, Math.min(x1+dx, IMG_W-w)), ny1 = Math.max(0, Math.min(y1+dy, IMG_H-h));
+        this.start = {x:nx1, y:ny1}; this.end = {x:nx1+w, y:ny1+h};
+        break;
+      }
+    }
+  }
+
+  getCroppedData(img) {
+    const r = this.getRect();
+    if (!r || r.x2-r.x1 < 1 || r.y2-r.y1 < 1) return null;
+    const w = r.x2 - r.x1, h = r.y2 - r.y1;
+    const off = document.createElement('canvas');
+    off.width = w; off.height = h;
+    off.getContext('2d').drawImage(img, r.x1, r.y1, w, h, 0, 0, w, h);
+    return { dataUrl: off.toDataURL(), w, h, x: r.x1, y: r.y1 };
+  }
+}
 
   // ── Filter / Timeline controller ──────────────────────────
   class FilterController {
