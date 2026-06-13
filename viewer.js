@@ -137,6 +137,11 @@
   let touchStartTapX = 0, touchStartTapY = 0;
   let wasDragged = false;
   let isPinching = false;
+    // ---- DIFF MODE GLOBALS ----
+  let diffs = [];               // array of [x1,y1, x2,y2, ...] per snapshot pair
+  let diffMode = false;
+  let selectedPixel = null;     // { x, y }
+  
 
   // ---- Texture management ----
   const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
@@ -278,6 +283,60 @@
       parseInt(ds.slice(0,4)), parseInt(ds.slice(4,6))-1, parseInt(ds.slice(6,8)),
       parseInt(ts.slice(0,2)), parseInt(ts.slice(2,4)), parseInt(ts.slice(4,6))
     ) / 1000;
+  }
+
+    // ---- DIFF HELPER FUNCTIONS ----
+  function getPixelChangeIndices(px, py) {
+    // Returns array of snapshot indices (into allSnapshots) where pixel changed
+    if (!diffs.length || allSnapshots.length === 0) return [];
+    const indices = [0]; // first snapshot always included
+    let next = 0;
+    while (true) {
+      let found = -1;
+      for (let i = next; i < diffs.length; i++) {
+        const changes = diffs[i];
+        for (let j = 0; j < changes.length; j += 2) {
+          if (changes[j] === px && changes[j+1] === py) {
+            found = i + 1;
+            break;
+          }
+        }
+        if (found !== -1) break;
+      }
+      if (found === -1 || found === next) break;
+      indices.push(found);
+      next = found;
+    }
+    return [...new Set(indices)].sort((a,b) => a-b);
+  }
+
+  function applyDiffFilter() {
+    if (!selectedPixel) return;
+    const changeIndices = getPixelChangeIndices(selectedPixel.x, selectedPixel.y);
+    if (changeIndices.length === 0) {
+      alert('This pixel never changed across snapshots.');
+      return;
+    }
+    const newFiltered = changeIndices.map(idx => allSnapshots[idx]);
+    // Keep current snapshot if in new list, else go to first
+    const currentName = filteredSnapshots[currentFilteredIndex];
+    let newIndex = newFiltered.indexOf(currentName);
+    if (newIndex === -1) newIndex = 0;
+    filteredSnapshots = newFiltered;
+    sliderValueToName = {};
+    filteredSnapshots.forEach((name, idx) => { sliderValueToName[idx] = name; });
+    slider.max = filteredSnapshots.length - 1;
+    loadFilteredSnapshot(newIndex);
+  }
+
+  function clientToImg(clientX, clientY) {
+    const imgX = Math.round((clientX - offsetX) / scale);
+    const imgY = Math.round((clientY - offsetY) / scale);
+    return { x: Math.min(Math.max(0, imgX), IMG_WIDTH - 1), y: Math.min(Math.max(0, imgY), IMG_HEIGHT - 1) };
+  }
+
+  function imgToClient(imgX, imgY) {
+    return { x: imgX * scale + offsetX, y: imgY * scale + offsetY };
   }
 
   // ---- Filtering (unchanged) ----
@@ -471,6 +530,7 @@
     .catch(e => { timestampLabelTop.textContent = 'Failed to load snapshots.json'; console.error(e); });
 
   intervalSelect.addEventListener('change', () => {
+    if (diffMode) return;
     currentInterval = parseInt(intervalSelect.value);
     buildFilteredList(null);
   });
@@ -493,12 +553,40 @@
 
   // ---- Pan & Zoom (unchanged) ----
   canvas.addEventListener('mousedown', e => { if (selectionMode) return; e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
+  canvas.addEventListener('click', e => {
+    if (window.selectionMode) return;
+    if (diffMode) {
+      handlePixelSelection(e.clientX, e.clientY);
+    }
+  });
   window.addEventListener('mousemove', e => { if (selectionMode) return; if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawScene(); });
   window.addEventListener('mouseup', () => { if (selectionMode) return; dragging = false; canvas.style.cursor = 'grab'; });
 
   canvas.addEventListener('touchstart', e => { if (selectionMode) return; e.preventDefault(); const t = e.touches; if (t.length === 1) { dragging = true; dragStartX = t[0].clientX; dragStartY = t[0].clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; wasDragged = false; touchStartTapX = t[0].clientX; touchStartTapY = t[0].clientY; } else if (t.length === 2) { dragging = false; isPinching = true; const dx = t[1].clientX - t[0].clientX; const dy = t[1].clientY - t[0].clientY; initialPinchDistance = Math.hypot(dx, dy); initialScale = scale; initialPinchCenter = { x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 }; } }, { passive: false });
   canvas.addEventListener('touchmove', e => { if (selectionMode) return; e.preventDefault(); const t = e.touches; if (t.length === 1 && dragging) { offsetX = dragOffsetX + (t[0].clientX - dragStartX); offsetY = dragOffsetY + (t[0].clientY - dragStartY); if (Math.hypot(t[0].clientX - touchStartTapX, t[0].clientY - touchStartTapY) > 5) wasDragged = true; drawScene(); } else if (t.length === 2) { const dx = t[1].clientX - t[0].clientX; const dy = t[1].clientY - t[0].clientY; const nd = Math.hypot(dx, dy); if (initialPinchDistance > 0) { const ns = initialScale * (nd / initialPinchDistance); scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, ns)); const cx = (t[0].clientX + t[1].clientX) / 2; const cy = (t[0].clientY + t[1].clientY) / 2; const sc = scale / initialScale; offsetX = cx - sc * (initialPinchCenter.x - offsetX); offsetY = cy - sc * (initialPinchCenter.y - offsetY); initialPinchCenter = { x: cx, y: cy }; initialScale = scale; initialPinchDistance = nd; drawScene(); } } }, { passive: false });
-  canvas.addEventListener('touchend', e => { if (selectionMode) return; dragging = false; initialPinchDistance = 0; if (!wasDragged && !isPinching && e.changedTouches.length === 1) { const x = e.changedTouches[0].clientX; if (x < window.innerWidth / 2) { if (currentFilteredIndex > 0) loadFilteredSnapshot(currentFilteredIndex - 1); } else { if (currentFilteredIndex < filteredSnapshots.length - 1) loadFilteredSnapshot(currentFilteredIndex + 1); } } if (e.touches.length === 0) { isPinching = false; wasDragged = false; } });
+  canvas.addEventListener('touchend', e => {
+    if (window.selectionMode) return; // area selection active
+    dragging = false;
+    initialPinchDistance = 0;
+    if (!wasDragged && !isPinching && e.changedTouches.length === 1) {
+      const touch = e.changedTouches[0];
+      // If in diff mode, try to select a pixel first
+      if (diffMode) {
+        if (handlePixelSelection(touch.clientX, touch.clientY)) {
+          e.preventDefault();
+          return;
+        }
+      }
+      // Normal left/right navigation (works on filteredSnapshots, which in diff mode contains only change snapshots)
+      const x = touch.clientX;
+      if (x < window.innerWidth / 2) {
+        if (currentFilteredIndex > 0) loadFilteredSnapshot(currentFilteredIndex - 1);
+      } else {
+        if (currentFilteredIndex < filteredSnapshots.length - 1) loadFilteredSnapshot(currentFilteredIndex + 1);
+      }
+    }
+    if (e.touches.length === 0) { isPinching = false; wasDragged = false; }
+  });
   canvas.addEventListener('wheel', e => { if (selectionMode) return; e.preventDefault(); const zf=1.1, old=scale; if(e.deltaY<0) scale*=zf; else scale/=zf; scale=Math.max(MIN_SCALE,Math.min(MAX_SCALE,scale)); const sc=scale/old; offsetX=e.clientX-sc*(e.clientX-offsetX); offsetY=e.clientY-sc*(e.clientY-offsetY); drawScene(); }, {passive:false});
 
   const dlSnapshot = document.getElementById('dl-snapshot');
@@ -668,6 +756,67 @@
         document.getElementById('coords-display').style.display = 'none';
       }
     });
+  }
+
+    // ---- DIFF MODE UI (single toggle button) ----
+  const diffBtn = document.getElementById('diff-btn');
+
+  function enterDiffMode() {
+    diffMode = true;
+    diffBtn.classList.add('diff-active');
+    diffBtn.textContent = '✔️ Done';
+    canvas.classList.add('diff-mode');
+    // Disable interval and date picker (they disappear visually but we hide them)
+    intervalSelect.disabled = true;
+    intervalSelect.style.display = 'none';
+    if (datePicker) datePicker.disabled = true;
+    if (datePicker) datePicker.style.display = 'none';
+    if (timeSelect) timeSelect.disabled = true;
+    if (timeSelect) timeSelect.style.display = 'none';
+    // Clear any area selection drawing
+    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    // Visual hint on timestamp label
+    timestampLabelTop.style.background = 'rgba(76,175,80,0.8)';
+    timestampLabelTop.style.padding = '2px 6px';
+    timestampLabelTop.style.borderRadius = '4px';
+    selectedPixel = null; // reset any previous pixel
+  }
+
+  function exitDiffMode() {
+    diffMode = false;
+    diffBtn.classList.remove('diff-active');
+    diffBtn.textContent = '🔍 Diff';
+    canvas.classList.remove('diff-mode');
+    intervalSelect.disabled = false;
+    intervalSelect.style.display = '';
+    if (datePicker) datePicker.disabled = false;
+    if (datePicker) datePicker.style.display = '';
+    if (timeSelect) timeSelect.disabled = false;
+    if (timeSelect) timeSelect.style.display = '';
+    selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
+    timestampLabelTop.style.background = '';
+    timestampLabelTop.style.padding = '';
+    // Restore normal snapshot list (current interval)
+    buildFilteredList(filteredSnapshots[currentFilteredIndex]);
+  }
+
+  if (diffBtn) {
+    diffBtn.addEventListener('click', () => {
+      if (diffMode) exitDiffMode();
+      else enterDiffMode();
+    });
+  }
+
+  function handlePixelSelection(clientX, clientY) {
+    if (!diffMode) return false;
+    const imgCoord = clientToImg(clientX, clientY);
+    if (imgCoord.x >= 0 && imgCoord.x < IMG_WIDTH && imgCoord.y >= 0 && imgCoord.y < IMG_HEIGHT) {
+      selectedPixel = imgCoord;
+      applyDiffFilter();   // rebuild timeline to only changed snapshots
+      drawScene();         // redraw to show marker
+      return true;
+    }
+    return false;
   }
 
   if (selCanvas) {
