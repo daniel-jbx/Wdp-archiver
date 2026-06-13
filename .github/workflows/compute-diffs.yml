@@ -53,10 +53,14 @@ jobs:
           rclone cat "$BUCKET/snapshots.json" > snapshots.json
           TOTAL=$(jq '. | length' snapshots.json)
 
-          # Download existing diffs.json (if it exists)
-          if rclone ls "$BUCKET/diffs.json" &>/dev/null; then
-            rclone cat "$BUCKET/diffs.json" > diffs.json
-            EXISTING=$(jq '. | length' diffs.json)
+          # Attempt to download existing diffs.json (if it exists and is not empty)
+          EXISTING=0
+          if rclone cat "$BUCKET/diffs.json" > diffs.json 2>/dev/null; then
+            if [ -s diffs.json ]; then
+              EXISTING=$(jq '. | length' diffs.json 2>/dev/null || echo 0)
+            else
+              EXISTING=0
+            fi
           else
             echo "[]" > diffs.json
             EXISTING=0
@@ -81,7 +85,8 @@ jobs:
           with open("snapshots.json") as f:
               snapshots = json.load(f)
           with open("diffs.json") as f:
-              diffs = json.load(f)
+              content = f.read().strip()
+              diffs = json.loads(content) if content else []
 
           existing = len(diffs)
           needed = len(snapshots) - 1
