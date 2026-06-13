@@ -138,12 +138,13 @@
   let initialPinchDistance = 0, initialScale = 1.0, initialPinchCenter = { x: 0, y: 0 };
   let touchStartTapX = 0, touchStartTapY = 0;
   let wasDragged = false;
+  let mouseDragOccurred = false;
   let isPinching = false;
     // ---- DIFF MODE GLOBALS ----
   let diffs = [];               // array of [x1,y1, x2,y2, ...] per snapshot pair
   let diffMode = false;
   let selectedPixel = null;     // { x, y }
-  
+  let pixelLocked = false;
 
   // ---- Texture management ----
   const MAX_TEX = gl.getParameter(gl.MAX_TEXTURE_SIZE);
@@ -591,14 +592,38 @@ function drawScene() {
   });
 
   // ---- Pan & Zoom (unchanged) ----
-  canvas.addEventListener('mousedown', e => { if (selectionMode) return; e.preventDefault(); dragging = true; dragStartX = e.clientX; dragStartY = e.clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; canvas.style.cursor = 'grabbing'; });
-  canvas.addEventListener('click', e => {
+  canvas.addEventListener('mousedown', e => {
+    if (selectionMode) return;
+    e.preventDefault();
+    dragging = true;
+    mouseDragOccurred = false;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragOffsetX = offsetX;
+    dragOffsetY = offsetY;
+    if (!diffMode) canvas.style.cursor = 'grabbing';
+  });
+   canvas.addEventListener('click', e => {
     if (window.selectionMode) return;
+    if (mouseDragOccurred) {
+      mouseDragOccurred = false;
+      return;
+    }
     if (diffMode) {
       handlePixelSelection(e.clientX, e.clientY);
     }
   });
-  window.addEventListener('mousemove', e => { if (selectionMode) return; if (!dragging) return; offsetX = dragOffsetX + (e.clientX - dragStartX); offsetY = dragOffsetY + (e.clientY - dragStartY); drawScene(); });
+    window.addEventListener('mousemove', e => {
+    if (selectionMode) return;
+    if (!dragging) return;
+    // If moved more than 5 pixels, consider it a drag
+    if (Math.hypot(e.clientX - dragStartX, e.clientY - dragStartY) > 5) {
+      mouseDragOccurred = true;
+    }
+    offsetX = dragOffsetX + (e.clientX - dragStartX);
+    offsetY = dragOffsetY + (e.clientY - dragStartY);
+    drawScene();
+  });
   window.addEventListener('mouseup', () => { if (selectionMode) return; dragging = false; canvas.style.cursor = 'grab'; });
 
   canvas.addEventListener('touchstart', e => { if (selectionMode) return; e.preventDefault(); const t = e.touches; if (t.length === 1) { dragging = true; dragStartX = t[0].clientX; dragStartY = t[0].clientY; dragOffsetX = offsetX; dragOffsetY = offsetY; wasDragged = false; touchStartTapX = t[0].clientX; touchStartTapY = t[0].clientY; } else if (t.length === 2) { dragging = false; isPinching = true; const dx = t[1].clientX - t[0].clientX; const dy = t[1].clientY - t[0].clientY; initialPinchDistance = Math.hypot(dx, dy); initialScale = scale; initialPinchCenter = { x: (t[0].clientX + t[1].clientX) / 2, y: (t[0].clientY + t[1].clientY) / 2 }; } }, { passive: false });
@@ -813,6 +838,7 @@ function drawScene() {
 
   function exitDiffMode() {
     diffMode = false;
+    pixelLocked = false;
     diffBtn.classList.remove('diff-active');
     diffBtn.textContent = 'diff';
     canvas.classList.remove('diff-mode');
@@ -838,11 +864,27 @@ function drawScene() {
 
   function handlePixelSelection(clientX, clientY) {
     if (!diffMode) return false;
+    if (pixelLocked) return false; // prevent selecting another pixel while locked
+
     const imgCoord = clientToImg(clientX, clientY);
     if (imgCoord.x >= 0 && imgCoord.x < IMG_WIDTH && imgCoord.y >= 0 && imgCoord.y < IMG_HEIGHT) {
+      // Draw marker immediately
       selectedPixel = imgCoord;
-      applyDiffFilter();   // rebuild timeline to only changed snapshots
-      drawScene();         // redraw to show marker
+      drawScene();
+
+      // Check if this pixel ever changed
+      const changeIndices = getPixelChangeIndices(selectedPixel.x, selectedPixel.y);
+      if (changeIndices.length === 0) {
+        alert('This pixel never changed across snapshots.');
+        // Revert selection and clear marker
+        selectedPixel = null;
+        drawScene();
+        return false;
+      }
+
+      // Pixel has changes – lock selection and rebuild timeline
+      pixelLocked = true;
+      applyDiffFilter();   // rebuild filtered list to only changed snapshots
       return true;
     }
     return false;
