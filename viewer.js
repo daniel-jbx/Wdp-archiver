@@ -10,6 +10,26 @@
   const dlSnap    = document.getElementById('dl-snapshot');
   const dlToggle  = document.getElementById('dl-select-toggle');
   const dlPng     = document.getElementById('dl-select-png');
+  // ---- Copy link button ----
+const copyLinkBtn = document.createElement('button');
+copyLinkBtn.id = 'dl-copy-link';
+copyLinkBtn.className = 'dl-btn';
+copyLinkBtn.textContent = 'copy link';
+dlPng.parentNode.insertBefore(copyLinkBtn, dlOverlay);
+
+copyLinkBtn.addEventListener('click', () => {
+  const name = filterCtrl.currentName();
+  if (!name) return;
+  const url = new URL(window.location);
+  url.searchParams.set('snap', name);
+  url.searchParams.set('x', viewport.offX.toFixed(1));
+  url.searchParams.set('y', viewport.offY.toFixed(1));
+  url.searchParams.set('zoom', viewport.scale.toFixed(4));
+  navigator.clipboard.writeText(url.href).then(() => {
+    copyLinkBtn.textContent = 'copied!';
+    setTimeout(() => { copyLinkBtn.textContent = 'copy link'; }, 1500);
+  }).catch(err => alert('Failed to copy link: ' + err));
+});
   const dlOverlay = document.getElementById('dl-select-overlay');
   const diffBtn   = document.getElementById('diff-btn');
   const coordsDiv = document.getElementById('coords-display');
@@ -24,6 +44,15 @@
     antarktika: { col:1279, row:1715, cols:6, rows:5 }
   }[dataset];
   const IMG_W = ranges.cols * TILE, IMG_H = ranges.rows * TILE;
+  const urlParams = new URLSearchParams(window.location.search);
+const urlSnap   = urlParams.get('snap');
+const urlX      = parseFloat(urlParams.get('x'));
+const urlY      = parseFloat(urlParams.get('y'));
+const urlZoom   = parseFloat(urlParams.get('zoom'));
+let pendingSavedViewport = null;
+if (!isNaN(urlX) && !isNaN(urlY) && !isNaN(urlZoom)) {
+  pendingSavedViewport = { x: urlX, y: urlY, zoom: urlZoom };
+}
 
   function pixelToLatLon(px, py) {
     const gx = ranges.col * TILE + px, gy = ranges.row * TILE + py;
@@ -637,14 +666,21 @@ class SelectionManager {
     currentImage.src = BASE_URL + name;
   };
 
-  currentImage.onload = () => {
-    renderer.setImage(currentImage);
-    if (!initialLoadDone) {
+currentImage.onload = () => {
+  renderer.setImage(currentImage);
+  if (!initialLoadDone) {
+    if (pendingSavedViewport) {
+      viewport.offX = pendingSavedViewport.x;
+      viewport.offY = pendingSavedViewport.y;
+      viewport.scale = pendingSavedViewport.zoom;
+      pendingSavedViewport = null;
+    } else {
       viewport.reset(currentImage);
-      initialLoadDone = true;
     }
-    draw();
-  };
+    initialLoadDone = true;
+  }
+  draw();
+};
   currentImage.onerror = () => console.error('Image failed:', currentImage.src);
 
   function draw() {
@@ -865,12 +901,19 @@ class SelectionManager {
     .then(r => r.json())
     .then(files => {
       if (!files.length) { tsLabel.textContent = 'No snapshots.'; return; }
-      filterCtrl.all = files;
-      filterCtrl.setInterval(parseInt(interval.value)); // default 60 min
-      setupDateTimePickers(files);
-      if (filterCtrl.currentIndex === -1) {
-        filterCtrl._rebuild(); // fallback load
-      }
+filterCtrl.all = files;
+
+if (urlSnap && files.includes(urlSnap)) {
+  // Load the exact snapshot from the URL (uses current interval as context)
+  filterCtrl.rebuildWithAnchor(urlSnap);
+} else {
+  // Normal startup
+  filterCtrl.setInterval(parseInt(interval.value));
+  setupDateTimePickers(files);
+  if (filterCtrl.currentIndex === -1) {
+    filterCtrl._rebuild(); // fallback
+  }
+}
       return fetch(BASE_URL + 'diffs.json').then(r => r.json()).catch(() => ({}));
     })
     .then(diffs => {
