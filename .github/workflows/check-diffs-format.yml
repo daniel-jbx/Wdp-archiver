@@ -1,0 +1,46 @@
+name: Check diffs.json format
+
+on:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: Configure rclone
+        run: |
+          mkdir -p ~/.config/rclone
+          cat > ~/.config/rclone/rclone.conf <<EOF
+          [r2]
+          type = s3
+          provider = Cloudflare
+          endpoint = ${{ secrets.R2_ENDPOINT }}
+          access_key_id = ${{ secrets.R2_ACCESS_KEY_ID }}
+          secret_access_key = ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          no_check_bucket = true
+          EOF
+
+      - name: Download and inspect diffs.json
+        run: |
+          BUCKET="r2:${{ secrets.R2_BUCKET }}"
+          # Download first 200 bytes
+          rclone cat "$BUCKET/diffs.json" | head -c 200 > first200.txt
+          echo "=== First 200 bytes ==="
+          cat first200.txt
+          echo ""
+          # Check first character
+          FIRST_CHAR=$(head -c 1 first200.txt)
+          if [ "$FIRST_CHAR" = "{" ]; then
+            echo "✅ Format: OBJECT (inverted index)"
+          elif [ "$FIRST_CHAR" = "[" ]; then
+            echo "❌ Format: ARRAY (old, large format)"
+          else
+            echo "Unknown format or empty file"
+          fi
+          # Get file size
+          SIZE=$(rclone size "$BUCKET/diffs.json" --json | jq '.bytes')
+          echo "File size: $(numfmt --to=iec $SIZE)"
