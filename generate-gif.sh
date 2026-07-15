@@ -200,9 +200,9 @@ for f in processed/frame_*.png; do
   TOTAL_SIZE=$(( TOTAL_SIZE + SIZE ))
 done
 
-if [[ $TOTAL_SIZE -gt 104857600 ]]; then
-  MB=$(echo "scale=1; $TOTAL_SIZE / 1048576" | bc)
-  echo "ERROR: Total size of ${FRAME_COUNT} frames is ${MB} MB – exceeds 100 MB limit. Aborting."
+if [[ $TOTAL_SIZE -gt 1073741824 ]]; then
+  MB=$(echo "scale=1; $TOTAL_SIZE / 10737419" | bc)
+  echo "ERROR: Total size of ${FRAME_COUNT} frames is ${MB} MB – exceeds 1GB limit. Aborting."
   exit 1
 fi
 
