@@ -4,7 +4,8 @@
   "x": [1987, 3941],
   "y": [2088, 2922],
   "speed": 40,
-  "output_gif": "wdp.gif",
+  "output_gif": "wdp.mp4",
   "interval_minutes": 15,
-  "scale_factor": 1
+  "scale_factor": 1,
+  "output_format": "mp4"
 }
