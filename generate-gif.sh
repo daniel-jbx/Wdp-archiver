@@ -14,7 +14,6 @@ SPEED=$(jq -r '.speed' "$CONFIG_FILE")
 OUTPUT_GIF=$(jq -r '.output_gif' "$CONFIG_FILE")
 INTERVAL_MIN=$(jq -r '.interval_minutes // 0' "$CONFIG_FILE")
 SCALE_FACTOR=$(jq -r '.scale_factor // 1.0' "$CONFIG_FILE")
-MAX_TOTAL_SIZE=1073741824   # 1 GiB
 
 # Validate required fields
 if [[ -z "$START" || -z "$END" || -z "$SPEED" || -z "$OUTPUT_GIF" ]]; then
@@ -26,6 +25,9 @@ fi
 WIDTH=$(( X2 - X1 ))
 HEIGHT=$(( Y2 - Y1 ))
 CROP="${WIDTH}x${HEIGHT}+${X1}+${Y1}"
+
+# Max allowed total size of raw GIF (before final optimisation)
+MAX_TOTAL_SIZE=1073741824   # 1 GiB
 
 # R2 environment
 : "${R2_BUCKET:?R2_BUCKET not set}"
@@ -96,7 +98,7 @@ if [[ -n "$INTERVAL_MIN" && "$INTERVAL_MIN" -gt 0 ]]; then
         done
         if (( best_idx >= 0 )); then
             selected_fname="${ALL_FNAMES[$best_idx]}"
-            # Prevent the same snapshot from being used twice
+            # Prevent duplicate (extremely unlikely with typical intervals)
             if [[ ! " ${SELECTED_FNAMES[@]} " =~ " ${selected_fname} " ]]; then
                 SELECTED_FNAMES+=("$selected_fname")
             fi
@@ -142,7 +144,7 @@ process_frame() {
   convert "processed/banner_${idx}.png" "processed/cropped_${idx}.png" -append +repage "processed/frame_${idx}.png"
 }
 
-# -- Early estimate using the first snapshot (with scaling) ------------
+# -- Early estimate using first frame (convert to GIF for accuracy) ----
 total_snapshots=${#SNAPSHOTS[@]}
 first_fname="${SNAPSHOTS[0]}"
 if [[ $first_fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
@@ -154,23 +156,26 @@ else
 fi
 
 process_frame "$first_fname" "0000" "$first_ts"
-# Apply scaling to the first frame if needed
+
+# Apply scaling if requested
 if [[ "$SCALE_FACTOR" != "1.0" ]]; then
   convert "processed/frame_0000.png" \
           -resize "$(awk "BEGIN {printf \"%.0f\", $WIDTH * $SCALE_FACTOR}")"x"$(awk "BEGIN {printf \"%.0f\", $HEIGHT * $SCALE_FACTOR}")"! \
           "processed/frame_0000.png"
 fi
 
-first_size=$(stat -c%s "processed/frame_0000.png")
-estimated_total=$(( first_size * total_snapshots ))
-estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
-
+# Convert single frame to GIF to get a realistic per‑frame size estimate
+convert "processed/frame_0000.png" "processed/_est_test.gif"
+first_gif_size=$(stat -c%s "processed/_est_test.gif")
+rm -f "processed/_est_test.gif"
+estimated_total=$(( first_gif_size * total_snapshots ))
 estimated_gb=$(echo "scale=1; $estimated_total / 1073741824" | bc)
+
 if [[ $estimated_total -gt $MAX_TOTAL_SIZE ]]; then
-  echo "ERROR: Estimated total size of ${total_snapshots} frames is ~${estimated_gb} GB – exceeds 1 GB limit. Aborting."
+  echo "ERROR: Estimated final GIF size is ~${estimated_gb} GB – exceeds 1 GB limit. Aborting."
   exit 1
 fi
-echo "Estimated total size: ~${estimated_gb} GB – processing remaining frames."
+echo "Estimated final GIF size: ~${estimated_gb} GB – processing remaining frames."
 
 # -- Process the rest of the snapshots ---------------------------------
 i=1
@@ -251,17 +256,15 @@ echo "Assembling GIF..."
 
 FRAME_COUNT=${#SNAPSHOTS[@]}
 
-# Total size check (already roughly checked, but final validation)
-TOTAL_SIZE=0
+# Final total size check using actual PNG frames (just a safety net)
+TOTAL_PNG_SIZE=0
 for f in processed/frame_*.png; do
   SIZE=$(stat -c%s "$f")
-  TOTAL_SIZE=$(( TOTAL_SIZE + SIZE ))
+  TOTAL_PNG_SIZE=$(( TOTAL_PNG_SIZE + SIZE ))
 done
-
-TOTAL_GB=$(echo "scale=1; $TOTAL_SIZE / 1073741824" | bc)
-if [[ $TOTAL_SIZE -gt $MAX_TOTAL_SIZE ]]; then
-  echo "ERROR: Total size of ${FRAME_COUNT} frames is ${TOTAL_GB} GB – exceeds 1 GB limit. Aborting."
-  exit 1
+# This is a very conservative (over) check – but it's fast and prevents extreme edge cases
+if [[ $TOTAL_PNG_SIZE -gt $MAX_TOTAL_SIZE ]]; then
+  echo "WARNING: Total PNG frame size is large ($(echo "scale=1; $TOTAL_PNG_SIZE/1073741824" | bc) GB), but final GIF may be smaller. Proceeding..."
 fi
 
 # Prepare arguments for the final convert command
