@@ -3,8 +3,8 @@
   "end":   "2026-07-15T23:59:59Z",
   "x": [1987, 3941],
   "y": [2088, 2922],
-  "speed": 40,
+  "speed": 30,
   "output_gif": "wdp.gif",
-  "interval_minutes": 60,
+  "interval_minutes": 75,
   "scale_factor": 0.5
 }
