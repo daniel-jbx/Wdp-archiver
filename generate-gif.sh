@@ -130,12 +130,12 @@ if [[ $BANNER_HEIGHT -lt $(( FONT_SIZE + 4 )) ]]; then
   BANNER_HEIGHT=$(( FONT_SIZE + 4 ))
 fi
 
-# Helper function to process one frame
+# Helper function to process one frame (with 30s timeout on download)
 process_frame() {
   local fname="$1"
   local idx="$2"
   local ts_display="$3"
-  rclone copyto ":s3:${R2_BUCKET}/${fname}" "frames/${fname}" "${RCLONE_BASE[@]}"
+  rclone copyto ":s3:${R2_BUCKET}/${fname}" "frames/${fname}" "${RCLONE_BASE[@]}" --timeout 30s
   convert "frames/${fname}" -crop "$CROP" +repage "processed/cropped_${idx}.png"
   convert "processed/cropped_${idx}.png" -background "#A0BDFF" -alpha remove -alpha off "processed/cropped_${idx}.png"
   convert -size "${WIDTH}x${BANNER_HEIGHT}" xc:black \
@@ -164,18 +164,20 @@ if [[ "$SCALE_FACTOR" != "1.0" ]]; then
           "processed/frame_0000.png"
 fi
 
-# Convert single frame to GIF to get a realistic per‑frame size estimate
+# Convert single frame to GIF to get a realistic per‑frame size estimate (in MB)
 convert "processed/frame_0000.png" "processed/_est_test.gif"
 first_gif_size=$(stat -c%s "processed/_est_test.gif")
 rm -f "processed/_est_test.gif"
 estimated_total=$(( first_gif_size * total_snapshots ))
-estimated_gb=$(echo "scale=1; $estimated_total / 1073741824" | bc)
+
+# Display in MB
+estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
 
 if [[ $estimated_total -gt $MAX_TOTAL_SIZE ]]; then
-  echo "ERROR: Estimated final GIF size is ~${estimated_gb} GB – exceeds 1 GB limit. Aborting."
+  echo "ERROR: Estimated final GIF size is ~${estimated_mb} MB – exceeds 1 GB limit. Aborting."
   exit 1
 fi
-echo "Estimated final GIF size: ~${estimated_gb} GB – processing remaining frames."
+echo "Estimated final GIF size: ~${estimated_mb} MB – processing remaining frames."
 
 # -- Process the rest of the snapshots ---------------------------------
 i=1
@@ -256,15 +258,14 @@ echo "Assembling GIF..."
 
 FRAME_COUNT=${#SNAPSHOTS[@]}
 
-# Final total size check using actual PNG frames (just a safety net)
+# Final total size check using actual PNG frames (just a safety net, shown in MB)
 TOTAL_PNG_SIZE=0
 for f in processed/frame_*.png; do
   SIZE=$(stat -c%s "$f")
   TOTAL_PNG_SIZE=$(( TOTAL_PNG_SIZE + SIZE ))
 done
-# This is a very conservative (over) check – but it's fast and prevents extreme edge cases
 if [[ $TOTAL_PNG_SIZE -gt $MAX_TOTAL_SIZE ]]; then
-  echo "WARNING: Total PNG frame size is large ($(echo "scale=1; $TOTAL_PNG_SIZE/1073741824" | bc) GB), but final GIF may be smaller. Proceeding..."
+  echo "WARNING: Total PNG frame size is large ($(echo "scale=1; $TOTAL_PNG_SIZE/1048576" | bc) MB), but final GIF may be smaller. Proceeding..."
 fi
 
 # Prepare arguments for the final convert command
