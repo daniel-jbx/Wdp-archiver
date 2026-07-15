@@ -12,8 +12,9 @@ Y1=$(jq -r '.y[0]' "$CONFIG_FILE")
 Y2=$(jq -r '.y[1]' "$CONFIG_FILE")
 SPEED=$(jq -r '.speed' "$CONFIG_FILE")
 OUTPUT_GIF=$(jq -r '.output_gif' "$CONFIG_FILE")
-INTERVAL_MIN=$(jq -r '.interval_minutes // 0' "$CONFIG_FILE")   # NEW
-SCALE_FACTOR=$(jq -r '.scale_factor // 1.0' "$CONFIG_FILE")     # NEW
+INTERVAL_MIN=$(jq -r '.interval_minutes // 0' "$CONFIG_FILE")
+SCALE_FACTOR=$(jq -r '.scale_factor // 1.0' "$CONFIG_FILE")
+MAX_TOTAL_SIZE=1073741824   # 1 GiB
 
 # Validate required fields
 if [[ -z "$START" || -z "$END" || -z "$SPEED" || -z "$OUTPUT_GIF" ]]; then
@@ -164,11 +165,12 @@ first_size=$(stat -c%s "processed/frame_0000.png")
 estimated_total=$(( first_size * total_snapshots ))
 estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
 
-if [[ $estimated_total -gt 104857600 ]]; then
-  echo "ERROR: Estimated total size of ${total_snapshots} frames is ~${estimated_mb} MB – exceeds 100 MB limit. Aborting."
+estimated_gb=$(echo "scale=1; $estimated_total / 1073741824" | bc)
+if [[ $estimated_total -gt $MAX_TOTAL_SIZE ]]; then
+  echo "ERROR: Estimated total size of ${total_snapshots} frames is ~${estimated_gb} GB – exceeds 1 GB limit. Aborting."
   exit 1
 fi
-echo "Estimated total size: ~${estimated_mb} MB – processing remaining frames."
+echo "Estimated total size: ~${estimated_gb} GB – processing remaining frames."
 
 # -- Process the rest of the snapshots ---------------------------------
 i=1
@@ -256,9 +258,9 @@ for f in processed/frame_*.png; do
   TOTAL_SIZE=$(( TOTAL_SIZE + SIZE ))
 done
 
-if [[ $TOTAL_SIZE -gt 104857600 ]]; then
-  MB=$(echo "scale=1; $TOTAL_SIZE / 1048576" | bc)
-  echo "ERROR: Total size of ${FRAME_COUNT} frames is ${MB} MB – exceeds 100 MB limit. Aborting."
+TOTAL_GB=$(echo "scale=1; $TOTAL_SIZE / 1073741824" | bc)
+if [[ $TOTAL_SIZE -gt $MAX_TOTAL_SIZE ]]; then
+  echo "ERROR: Total size of ${FRAME_COUNT} frames is ${TOTAL_GB} GB – exceeds 1 GB limit. Aborting."
   exit 1
 fi
 
