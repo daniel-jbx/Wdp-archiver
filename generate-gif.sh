@@ -14,6 +14,8 @@ SPEED=$(jq -r '.speed' "$CONFIG_FILE")
 OUTPUT_GIF=$(jq -r '.output_gif' "$CONFIG_FILE")
 INTERVAL_MIN=$(jq -r '.interval_minutes // 0' "$CONFIG_FILE")
 SCALE_FACTOR=$(jq -r '.scale_factor // 1.0' "$CONFIG_FILE")
+OUTPUT_FORMAT=$(jq -r '.output_format // "gif"' "$CONFIG_FILE")
+VIDEO_FPS=$(jq -r '.video_fps // 0' "$CONFIG_FILE")   # 0 means "auto‑derive from SPEED"
 
 # Validate required fields
 if [[ -z "$START" || -z "$END" || -z "$SPEED" || -z "$OUTPUT_GIF" ]]; then
@@ -26,8 +28,8 @@ WIDTH=$(( X2 - X1 ))
 HEIGHT=$(( Y2 - Y1 ))
 CROP="${WIDTH}x${HEIGHT}+${X1}+${Y1}"
 
-# Max allowed total size of raw GIF (before final optimisation)
-MAX_TOTAL_SIZE=1073741824   # 1 GiB
+# Max allowed total size (1 GiB – still checked on PNGs before final output)
+MAX_TOTAL_SIZE=1073741824
 
 # R2 environment
 : "${R2_BUCKET:?R2_BUCKET not set}"
@@ -98,7 +100,6 @@ if [[ -n "$INTERVAL_MIN" && "$INTERVAL_MIN" -gt 0 ]]; then
         done
         if (( best_idx >= 0 )); then
             selected_fname="${ALL_FNAMES[$best_idx]}"
-            # Prevent duplicate (extremely unlikely with typical intervals)
             if [[ ! " ${SELECTED_FNAMES[@]} " =~ " ${selected_fname} " ]]; then
                 SELECTED_FNAMES+=("$selected_fname")
             fi
@@ -124,13 +125,11 @@ if [[ $FONT_SIZE -lt 10 ]]; then
   FONT_SIZE=10
 fi
 
-# Banner height: FONT_SIZE * 1.2 (integer part) with a minimum of FONT_SIZE+4
 BANNER_HEIGHT=$(echo "$FONT_SIZE * 1.2" | bc | cut -d'.' -f1 2>/dev/null || echo "$(( (FONT_SIZE * 12) / 10 ))")
 if [[ $BANNER_HEIGHT -lt $(( FONT_SIZE + 4 )) ]]; then
   BANNER_HEIGHT=$(( FONT_SIZE + 4 ))
 fi
 
-# Helper function to process one frame (with 30s timeout on download)
 process_frame() {
   local fname="$1"
   local idx="$2"
@@ -144,7 +143,7 @@ process_frame() {
   convert "processed/banner_${idx}.png" "processed/cropped_${idx}.png" -append +repage "processed/frame_${idx}.png"
 }
 
-# -- Early estimate using first frame (convert to GIF for accuracy) ----
+# -- Early estimate (only for GIF, not needed for video) ---------------
 total_snapshots=${#SNAPSHOTS[@]}
 first_fname="${SNAPSHOTS[0]}"
 if [[ $first_fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
@@ -157,29 +156,29 @@ fi
 
 process_frame "$first_fname" "0000" "$first_ts"
 
-# Apply scaling if requested
 if [[ "$SCALE_FACTOR" != "1.0" ]]; then
   convert "processed/frame_0000.png" \
           -resize "$(awk "BEGIN {printf \"%.0f\", $WIDTH * $SCALE_FACTOR}")"x"$(awk "BEGIN {printf \"%.0f\", $HEIGHT * $SCALE_FACTOR}")"! \
           "processed/frame_0000.png"
 fi
 
-# Convert single frame to GIF to get a realistic per‑frame size estimate (in MB)
-convert "processed/frame_0000.png" "processed/_est_test.gif"
-first_gif_size=$(stat -c%s "processed/_est_test.gif")
-rm -f "processed/_est_test.gif"
-estimated_total=$(( first_gif_size * total_snapshots ))
-
-# Display in MB
-estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
-
-if [[ $estimated_total -gt $MAX_TOTAL_SIZE ]]; then
-  echo "ERROR: Estimated final GIF size is ~${estimated_mb} MB – exceeds 1 GB limit. Aborting."
-  exit 1
+# For GIF, do the test conversion to estimate size; for MP4 we skip
+if [[ "$OUTPUT_FORMAT" == "gif" ]]; then
+  convert "processed/frame_0000.png" "processed/_est_test.gif"
+  first_gif_size=$(stat -c%s "processed/_est_test.gif")
+  rm -f "processed/_est_test.gif"
+  estimated_total=$(( first_gif_size * total_snapshots ))
+  estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
+  if [[ $estimated_total -gt $MAX_TOTAL_SIZE ]]; then
+    echo "ERROR: Estimated final GIF size is ~${estimated_mb} MB – exceeds 1 GB limit. Aborting."
+    exit 1
+  fi
+  echo "Estimated final GIF size: ~${estimated_mb} MB – processing remaining frames."
+else
+  echo "Output format: MP4 – no size estimate needed (video will be highly compressed)."
 fi
-echo "Estimated final GIF size: ~${estimated_mb} MB – processing remaining frames."
 
-# -- Process the rest of the snapshots ---------------------------------
+# -- Process remaining frames ------------------------------------------
 i=1
 for fname in "${SNAPSHOTS[@]:1}"; do
   if [[ $fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
@@ -192,7 +191,6 @@ for fname in "${SNAPSHOTS[@]:1}"; do
   idx_pad=$(printf "%04d" $i)
   echo "  $fname  ->  frame_${idx_pad}.png"
   process_frame "$fname" "$idx_pad" "$ts_display"
-  # Apply scaling if requested
   if [[ "$SCALE_FACTOR" != "1.0" ]]; then
     convert "processed/frame_${idx_pad}.png" \
             -resize "$(awk "BEGIN {printf \"%.0f\", $WIDTH * $SCALE_FACTOR}")"x"$(awk "BEGIN {printf \"%.0f\", $HEIGHT * $SCALE_FACTOR}")"! \
@@ -201,94 +199,109 @@ for fname in "${SNAPSHOTS[@]:1}"; do
   i=$(( i + 1 ))
 done
 
-# -- Compute per-frame delays from time gaps ---------------------------
-prev_ts=0
-prev_fname=""
-diffs=()
-
-for fname in "${SNAPSHOTS[@]}"; do
-  if [[ $fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
-    datestr="${BASH_REMATCH[1]}"
-    timestr="${BASH_REMATCH[2]}"
-    ts=$(date -d"${datestr:0:4}-${datestr:4:2}-${datestr:6:2}T${timestr:0:2}:${timestr:2:2}:${timestr:4:2}Z" +%s)
-    if [[ -n $prev_fname ]]; then
-      diff_sec=$(( ts - prev_ts ))
-      diffs+=("$diff_sec")
+# ----------------------------------------------------------------------
+# Output generation – GIF or MP4
+# ----------------------------------------------------------------------
+if [[ "$OUTPUT_FORMAT" == "mp4" ]]; then
+  # Determine FPS
+  if [[ "$VIDEO_FPS" =~ ^[0-9]+$ && "$VIDEO_FPS" -gt 0 ]]; then
+    FPS=$VIDEO_FPS
+  else
+    # Auto: use SPEED (capped at 60) – mirrors the original GIF timing
+    FPS=$SPEED
+    if [[ $FPS -gt 60 ]]; then
+      FPS=60
     fi
-    prev_ts=$ts
-    prev_fname=$fname
   fi
-done
+  echo "Creating MP4 at ${FPS} fps..."
 
-# Handle single snapshot
-if [[ ${#diffs[@]} -eq 0 ]]; then
-  MIN_DIFF=1
-  diffs=(1)
+  # Build ffmpeg command from numbered frames
+  # frame_0000.png … frame_NNNN.png
+  # Use a concat file list (safest for non-contiguous numbering, but we have contiguous)
+  # Simpler: pattern glob (requires -start_number 0 if we use printf %04d)
+  ffmpeg -y -framerate "$FPS" -i processed/frame_%04d.png \
+         -vf "format=yuv420p" \
+         -c:v libx264 -preset medium -crf 23 \
+         -pix_fmt yuv420p -movflags +faststart \
+         "$OUTPUT_GIF"
+
+  echo "MP4 created: $OUTPUT_GIF"
 else
-  MIN_DIFF=${diffs[0]}
-  for d in "${diffs[@]}"; do
-    (( d < MIN_DIFF )) && MIN_DIFF=$d
+  # Original GIF path
+  echo "Assembling GIF..."
+
+  # Compute per-frame delays (unchanged)
+  prev_ts=0
+  prev_fname=""
+  diffs=()
+  for fname in "${SNAPSHOTS[@]}"; do
+    if [[ $fname =~ wdpsnapshot_([0-9]{8})_([0-9]{6})\.png$ ]]; then
+      datestr="${BASH_REMATCH[1]}"
+      timestr="${BASH_REMATCH[2]}"
+      ts=$(date -d"${datestr:0:4}-${datestr:4:2}-${datestr:6:2}T${timestr:0:2}:${timestr:2:2}:${timestr:4:2}Z" +%s)
+      if [[ -n $prev_fname ]]; then
+        diff_sec=$(( ts - prev_ts ))
+        diffs+=("$diff_sec")
+      fi
+      prev_ts=$ts
+      prev_fname=$fname
+    fi
   done
-  # Add a duplicate of the last interval for the final frame (end pause)
-  diffs+=("${diffs[-1]}")
-fi
 
-# Convert each diff to centiseconds: delay_cs = (diff / MIN_DIFF) * (100 / SPEED)
-DELAYS=()
-for diff_sec in "${diffs[@]}"; do
-  delay_cs=$(echo "scale=2; ($diff_sec / $MIN_DIFF) * (100 / $SPEED)" | bc)
-  delay_cs=$(printf "%.0f" "$delay_cs")
-  # Minimum GIF delay is 2 centiseconds
-  if [[ $delay_cs -lt 2 ]]; then
-    delay_cs=2
+  if [[ ${#diffs[@]} -eq 0 ]]; then
+    MIN_DIFF=1
+    diffs=(1)
+  else
+    MIN_DIFF=${diffs[0]}
+    for d in "${diffs[@]}"; do
+      (( d < MIN_DIFF )) && MIN_DIFF=$d
+    done
+    diffs+=("${diffs[-1]}")
   fi
-  DELAYS+=("$delay_cs")
-done
 
-# -- End pause: 2× max delay or 100 cs, whichever is larger ------------
-MAX_DELAY=0
-for d in "${DELAYS[@]}"; do
-  (( d > MAX_DELAY )) && MAX_DELAY=$d
-done
-END_DELAY=$(( 2 * MAX_DELAY ))
-[[ $END_DELAY -lt 100 ]] && END_DELAY=100
+  DELAYS=()
+  for diff_sec in "${diffs[@]}"; do
+    delay_cs=$(echo "scale=2; ($diff_sec / $MIN_DIFF) * (100 / $SPEED)" | bc)
+    delay_cs=$(printf "%.0f" "$delay_cs")
+    [[ $delay_cs -lt 2 ]] && delay_cs=2
+    DELAYS+=("$delay_cs")
+  done
 
-# -- Assemble GIF with per-frame delays and a final extended frame -----
-echo "Assembling GIF..."
+  MAX_DELAY=0
+  for d in "${DELAYS[@]}"; do
+    (( d > MAX_DELAY )) && MAX_DELAY=$d
+  done
+  END_DELAY=$(( 2 * MAX_DELAY ))
+  [[ $END_DELAY -lt 100 ]] && END_DELAY=100
 
-FRAME_COUNT=${#SNAPSHOTS[@]}
+  FRAME_COUNT=${#SNAPSHOTS[@]}
+  TOTAL_PNG_SIZE=0
+  for f in processed/frame_*.png; do
+    SIZE=$(stat -c%s "$f")
+    TOTAL_PNG_SIZE=$(( TOTAL_PNG_SIZE + SIZE ))
+  done
+  if [[ $TOTAL_PNG_SIZE -gt $MAX_TOTAL_SIZE ]]; then
+    echo "WARNING: Total PNG frame size is large ($(echo "scale=1; $TOTAL_PNG_SIZE/1048576" | bc) MB), but final GIF may be smaller. Proceeding..."
+  fi
 
-# Final total size check using actual PNG frames (just a safety net, shown in MB)
-TOTAL_PNG_SIZE=0
-for f in processed/frame_*.png; do
-  SIZE=$(stat -c%s "$f")
-  TOTAL_PNG_SIZE=$(( TOTAL_PNG_SIZE + SIZE ))
-done
-if [[ $TOTAL_PNG_SIZE -gt $MAX_TOTAL_SIZE ]]; then
-  echo "WARNING: Total PNG frame size is large ($(echo "scale=1; $TOTAL_PNG_SIZE/1048576" | bc) MB), but final GIF may be smaller. Proceeding..."
+  ARGS=()
+  for i in $(seq 0 $(( FRAME_COUNT - 1 ))); do
+    idx=$(printf "%04d" $i)
+    ARGS+=(-delay "${DELAYS[$i]}" "processed/frame_${idx}.png")
+  done
+
+  LAST_IDX=$(printf "%04d" $(( FRAME_COUNT - 1 )))
+  cp "processed/frame_${LAST_IDX}.png" "processed/last_hold.png"
+  ARGS+=(-delay "$END_DELAY" "processed/last_hold.png")
+
+  convert "${ARGS[@]}" -loop 0 "$OUTPUT_GIF"
+  if command -v gifsicle &>/dev/null; then
+    gifsicle --batch -O3 "$OUTPUT_GIF"
+  fi
+  echo "GIF created: $OUTPUT_GIF"
 fi
 
-# Prepare arguments for the final convert command
-ARGS=()
-for i in $(seq 0 $(( FRAME_COUNT - 1 ))); do
-  idx=$(printf "%04d" $i)
-  ARGS+=(-delay "${DELAYS[$i]}" "processed/frame_${idx}.png")
-done
-
-# Duplicate last frame for the end pause
-LAST_IDX=$(printf "%04d" $(( FRAME_COUNT - 1 )))
-cp "processed/frame_${LAST_IDX}.png" "processed/last_hold.png"
-ARGS+=(-delay "$END_DELAY" "processed/last_hold.png")
-
-# Final GIF
-convert "${ARGS[@]}" -loop 0 "$OUTPUT_GIF"
-if command -v gifsicle &>/dev/null; then
-  gifsicle --batch -O3 "$OUTPUT_GIF"
-else
-  echo "gifsicle not found – skipping optimisation (file may be larger)"
-fi
-
-# -- Resolve filename collision (rename if file already exists) -------
+# -- Rename to avoid overwriting (common for both formats) ------------
 FINAL_NAME="$OUTPUT_GIF"
 if [[ -f "$FINAL_NAME" ]]; then
   base="${OUTPUT_GIF%.*}"
@@ -299,7 +312,7 @@ if [[ -f "$FINAL_NAME" ]]; then
   done
   FINAL_NAME="${base}_${counter}.${ext}"
   mv "$OUTPUT_GIF" "$FINAL_NAME"
-  echo "Renamed GIF to avoid overwriting: $FINAL_NAME"
+  echo "Renamed to avoid overwriting: $FINAL_NAME"
 fi
 
-echo "GIF saved to $FINAL_NAME"
+echo "Done. Output: $FINAL_NAME"
