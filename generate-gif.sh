@@ -113,8 +113,8 @@ first_size=$(stat -c%s "processed/frame_0000.png")
 estimated_total=$(( first_size * total_snapshots ))
 estimated_mb=$(echo "scale=1; $estimated_total / 1048576" | bc)
 
-if [[ $estimated_total -gt 104857600 ]]; then
-  echo "ERROR: Estimated total size of ${total_snapshots} frames is ~${estimated_mb} MB – exceeds 100 MB limit. Aborting."
+if [[ $estimated_total -gt 1073741824 ]]; then
+  echo "ERROR: Estimated total size of ${total_snapshots} frames is ~${estimated_mb} MB – exceeds 1 GB limit. Aborting."
   exit 1
 fi
 echo "Estimated total size: ~${estimated_mb} MB – processing remaining frames."
