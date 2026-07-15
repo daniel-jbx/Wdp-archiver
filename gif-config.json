@@ -5,6 +5,6 @@
   "y": [2088, 2922],
   "speed": 40,
   "output_gif": "wdp.gif",
-  "interval_minutes": 60,
+  "interval_minutes": 15,
   "scale_factor": 1
 }
