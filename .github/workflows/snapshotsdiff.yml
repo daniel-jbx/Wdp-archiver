@@ -76,7 +76,8 @@ jobs:
               base = f.replace('wdpsnapshot_', '').replace('.png', '')
               return datetime.strptime(base, '%Y%m%d_%H%M%S')
 
-          start_dt, end_dt = datetime.strptime(start_str, '%Y%m%d_%H%M%S'), datetime.strptime(end_str, '%Y%m%d_%H%M%S')
+          start_dt = datetime.strptime(start_str, '%Y%m%d_%H%M%S')
+          end_dt = datetime.strptime(end_str, '%Y%m%d_%H%M%S')
           snap1 = min(snapshots, key=lambda f: abs((parse_ts(f)-start_dt).total_seconds()))
           snap2 = min(snapshots, key=lambda f: abs((parse_ts(f)-end_dt).total_seconds()))
 
@@ -101,34 +102,37 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      - name: Generate diff (transparent background, faint unchanged, full changed)
+      - name: Generate transparent diff (changed pixels full opacity, same transparent)
         id: diff
         run: |
-          set +e
-          # Get dimensions
-          W=$(identify -format "%w" snapshot1.png)
-          H=$(identify -format "%h" snapshot2.png)
+          # Remove any existing alpha from both images to compare RGB only
+          convert snapshot1.png -alpha off snapshot1_rgb.png
+          convert snapshot2.png -alpha off snapshot2_rgb.png
 
-          # Create a mask: white where pixels differ (with fuzz 5%), black elsewhere
-          compare -metric AE -fuzz 5% -compose difference snapshot1.png snapshot2.png mask.png 2> metric.txt
-          METRIC=$(cat metric.txt | tr -d '\n ' | cut -d'(' -f1)
-          echo "Differing pixels: $METRIC"
-          echo "metric=$METRIC" >> $GITHUB_OUTPUT
+          # Create a binary mask: white where pixels differ, black where they are the same
+          # Use a small fuzz factor to ignore compression artifacts
+          convert snapshot1_rgb.png snapshot2_rgb.png \
+            -compose difference -composite \
+            -grayscale average -auto-level -threshold 1% \
+            mask.png
 
-          # Build the diff image:
-          # 1. background = snapshot2 at 10% opacity
-          # 2. overlay = snapshot2 with alpha = mask (so diff pixels are opaque, same are transparent)
-          # Then composite overlay on top of background.
-          convert snapshot2.png \
-            \( -clone 0 -alpha set -channel A -evaluate set 10% \) \
-            \( -clone 0 \( mask.png -alpha off -threshold 1% \) -alpha off -compose CopyOpacity -composite \) \
-            -delete 0 \
-            -composite diff.png
+          # Count how many white pixels (differing)
+          DIFF_COUNT=$(convert mask.png -format "%[fx:mean*w*h]" info:)
+          echo "Differing pixels: $DIFF_COUNT"
 
-          # If metric is 0, diff will be just the faint background – we can add a label.
-          if [ "$METRIC" = "0" ] || [ "$METRIC" = "0.000000" ]; then
-            convert diff.png -fill "rgba(255,0,0,0.8)" -pointsize 48 -gravity center -annotate +0+0 "No changes" diff.png
+          # If no differences, create a transparent image with a small text annotation
+          if [ "$DIFF_COUNT" = "0" ] || [ "$DIFF_COUNT" = "0.0" ]; then
+            convert -size $(identify -format "%wx%h" snapshot2.png) xc:none \
+              -fill "rgba(255,0,0,0.6)" -pointsize 48 -gravity center -annotate +0+0 "No changes" \
+              diff.png
+          else
+            # Apply the mask as alpha channel to snapshot2 (full color, opaque only where changed)
+            convert snapshot2.png -alpha off mask.png \
+              -compose CopyOpacity -composite diff.png
           fi
+
+          # Cleanup temporary files
+          rm -f snapshot1_rgb.png snapshot2_rgb.png mask.png
 
           exit 0
 
