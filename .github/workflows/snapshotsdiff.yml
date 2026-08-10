@@ -6,7 +6,6 @@ on:
   #   paths:
   #     - timestamps.json
 
-# Grant write permissions for the GITHUB_TOKEN
 permissions:
   contents: write
 
@@ -17,7 +16,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history so we can push
+          fetch-depth: 0
 
       - name: Install ImageMagick, rclone, and jq
         run: |
@@ -53,10 +52,7 @@ jobs:
         id: find
         run: |
           python3 << EOF
-          import json
-          import os
-          import sys
-          import re
+          import json, os, sys, re
           from datetime import datetime
 
           with open('snapshots.json') as f:
@@ -72,28 +68,20 @@ jobs:
 
           print(f"Valid snapshots found: {len(snapshots)}", file=sys.stderr)
           if not snapshots:
-              print("No valid snapshots found in snapshots.json!", file=sys.stderr)
+              print("No valid snapshots found!", file=sys.stderr)
               sys.exit(1)
 
-          start_str = os.environ['START']
-          end_str   = os.environ['END']
-
-          def parse_ts(filename):
-              base = filename.replace('wdpsnapshot_', '').replace('.png', '')
+          start_str, end_str = os.environ['START'], os.environ['END']
+          def parse_ts(f):
+              base = f.replace('wdpsnapshot_', '').replace('.png', '')
               return datetime.strptime(base, '%Y%m%d_%H%M%S')
 
-          start_dt = datetime.strptime(start_str, '%Y%m%d_%H%M%S')
-          end_dt   = datetime.strptime(end_str,   '%Y%m%d_%H%M%S')
-
-          def closest_to(target, snapshots):
-              return min(snapshots, key=lambda f: abs((parse_ts(f) - target).total_seconds()))
-
-          snap1 = closest_to(start_dt, snapshots)
-          snap2 = closest_to(end_dt, snapshots)
+          start_dt, end_dt = datetime.strptime(start_str, '%Y%m%d_%H%M%S'), datetime.strptime(end_str, '%Y%m%d_%H%M%S')
+          snap1 = min(snapshots, key=lambda f: abs((parse_ts(f)-start_dt).total_seconds()))
+          snap2 = min(snapshots, key=lambda f: abs((parse_ts(f)-end_dt).total_seconds()))
 
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-              out.write(f"snapshot1={snap1}\n")
-              out.write(f"snapshot2={snap2}\n")
+              out.write(f"snapshot1={snap1}\nsnapshot2={snap2}\n")
           EOF
         env:
           START: ${{ steps.read_json.outputs.start }}
@@ -102,62 +90,54 @@ jobs:
       - name: Download snapshots from R2
         run: |
           rclone copyto ":s3:${R2_BUCKET}/${{ steps.find.outputs.snapshot1 }}" snapshot1.png \
-            --s3-provider="Cloudflare" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --verbose
+            --s3-provider="Cloudflare" --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" --verbose
           rclone copyto ":s3:${R2_BUCKET}/${{ steps.find.outputs.snapshot2 }}" snapshot2.png \
-            --s3-provider="Cloudflare" \
-            --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
-            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --verbose
+            --s3-provider="Cloudflare" --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" --verbose
         env:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      - name: Generate diff image (robust)
+      - name: Generate diff (transparent background, faint unchanged, full changed)
         id: diff
         run: |
-          # Show image info for debugging
-          identify snapshot1.png snapshot2.png
-
-          # Run compare, but do NOT let exit code stop the script
           set +e
-          compare -metric AE -highlight-color red snapshot1.png snapshot2.png diff.png 2> metric.txt
-          COMPARE_EXIT=$?
-          set -e
+          # Get dimensions
+          W=$(identify -format "%w" snapshot1.png)
+          H=$(identify -format "%h" snapshot2.png)
 
+          # Create a mask: white where pixels differ (with fuzz 5%), black elsewhere
+          compare -metric AE -fuzz 5% -compose difference snapshot1.png snapshot2.png mask.png 2> metric.txt
           METRIC=$(cat metric.txt | tr -d '\n ' | cut -d'(' -f1)
-          echo "Metric (number of differing pixels): $METRIC"
+          echo "Differing pixels: $METRIC"
           echo "metric=$METRIC" >> $GITHUB_OUTPUT
 
-          # Fallback if diff.png wasn't produced
-          if [ ! -f diff.png ]; then
-            echo "compare did not produce diff.png - creating overlay"
-            composite -compose difference snapshot1.png snapshot2.png diff_raw.png
-            convert diff_raw.png -auto-level -channel RGB -evaluate set 100% -fill red -opaque white diff.png
+          # Build the diff image:
+          # 1. background = snapshot2 at 10% opacity
+          # 2. overlay = snapshot2 with alpha = mask (so diff pixels are opaque, same are transparent)
+          # Then composite overlay on top of background.
+          convert snapshot2.png \
+            \( -clone 0 -alpha set -channel A -evaluate set 10% \) \
+            \( -clone 0 \( mask.png -alpha off -threshold 1% \) -alpha off -compose CopyOpacity -composite \) \
+            -delete 0 \
+            -composite diff.png
+
+          # If metric is 0, diff will be just the faint background – we can add a label.
+          if [ "$METRIC" = "0" ] || [ "$METRIC" = "0.000000" ]; then
+            convert diff.png -fill "rgba(255,0,0,0.8)" -pointsize 48 -gravity center -annotate +0+0 "No changes" diff.png
           fi
 
           exit 0
 
       - name: Commit and push diff.png to repo
         run: |
-          # Configure git
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Add the diff file (overwrites existing)
           git add diff.png
-
-          # Commit if there are changes; if nothing changed, skip commit
           git commit -m "Update diff.png [skip ci]" || echo "No changes to commit"
-
-          # Push the commit to the current branch
           git push
         env:
-          # The GITHUB_TOKEN is automatically used by git push
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
