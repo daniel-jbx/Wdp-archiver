@@ -1,0 +1,135 @@
+name: Diff Snapshots
+
+on:
+  workflow_dispatch:
+    # Optionally, you can add inputs to override the JSON file:
+    # inputs:
+    #   start:
+    #     description: 'Start timestamp (YYYYMMDD_HHMMSS)'
+    #     required: false
+    #   end:
+    #     description: 'End timestamp (YYYYMMDD_HHMMSS)'
+    #     required: false
+  # push:
+  #   paths:
+  #     - timestamps.json   # auto-run when the JSON changes
+
+jobs:
+  diff:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install ImageMagick, rclone, and jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y imagemagick jq
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
+
+      - name: Read timestamps from JSON
+        id: read_json
+        run: |
+          # Assumes timestamps.json exists in repo root with fields "start" and "end"
+          # Example: {"start": "20260101_120000", "end": "20260102_150000"}
+          START=$(jq -r '.start' timestamps.json)
+          END=$(jq -r '.end' timestamps.json)
+          echo "start=$START" >> $GITHUB_OUTPUT
+          echo "end=$END" >> $GITHUB_OUTPUT
+
+      - name: Get snapshots list from R2
+        run: |
+          rclone cat ":s3:${R2_BUCKET}/snapshots.json" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            > snapshots.json
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      - name: Find closest snapshots
+        id: find
+        run: |
+          python3 << EOF
+          import json
+          import os
+          from datetime import datetime
+
+          # Read snapshots list
+          with open('snapshots.json') as f:
+              try:
+                  snapshots = json.load(f)
+              except:
+                  snapshots = []
+          if not isinstance(snapshots, list):
+              snapshots = []
+
+          start_str = os.environ['START']
+          end_str   = os.environ['END']
+
+          # Parse a filename like "wdpsnapshot_YYYYMMDD_HHMMSS.png"
+          def parse_ts(filename):
+              base = filename.replace('wdpsnapshot_', '').replace('.png', '')
+              return datetime.strptime(base, '%Y%m%d_%H%M%S')
+
+          start_dt = datetime.strptime(start_str, '%Y%m%d_%H%M%S')
+          end_dt   = datetime.strptime(end_str,   '%Y%m%d_%H%M%S')
+
+          # Find closest by absolute time difference (in seconds)
+          def closest_to(target, snapshots):
+              if not snapshots:
+                  return None
+              return min(snapshots, key=lambda f: abs((parse_ts(f) - target).total_seconds()))
+
+          snap1 = closest_to(start_dt, snapshots)
+          snap2 = closest_to(end_dt, snapshots)
+
+          if snap1 is None or snap2 is None:
+              print("No snapshots found!", file=sys.stderr)
+              sys.exit(1)
+
+          # Write results to GitHub output
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f"snapshot1={snap1}\n")
+              out.write(f"snapshot2={snap2}\n")
+          EOF
+        env:
+          START: ${{ steps.read_json.outputs.start }}
+          END: ${{ steps.read_json.outputs.end }}
+
+      - name: Download snapshots from R2
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/${{ steps.find.outputs.snapshot1 }}" snapshot1.png \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --verbose
+          rclone copyto ":s3:${R2_BUCKET}/${{ steps.find.outputs.snapshot2 }}" snapshot2.png \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --verbose
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      - name: Generate diff image
+        run: |
+          # Use ImageMagick compare to highlight differences (red on white)
+          compare -highlight-color red snapshot1.png snapshot2.png diff.png
+
+      - name: Upload diff as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: diff
+          path: diff.png
