@@ -102,39 +102,49 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      - name: Generate transparent diff (changed pixels full opacity, same transparent)
+      - name: Generate transparent diff (robust)
         id: diff
         run: |
-          # 1. Strip alpha from both images to compare RGB only
-          convert snapshot1.png -alpha off snapshot1_rgb.png
-          convert snapshot2.png -alpha off snapshot2_rgb.png
+          set -x  # Print commands for debugging
+          set -e
 
-          # 2. Create a difference mask: white where RGB differs (with 5% fuzz to ignore compression artifacts)
-          #    The mask will be grayscale: white = different, black = same.
-          compare -fuzz 5% -compose difference snapshot1_rgb.png snapshot2_rgb.png mask.png
+          # Verify images exist and show properties
+          echo "=== Image info ==="
+          ls -la snapshot1.png snapshot2.png
+          identify snapshot1.png snapshot2.png
 
-          # 3. Binarize the mask: any non‑black becomes pure white (ensures clean alpha)
-          convert mask.png -threshold 0 mask_binary.png
+          # Strip alpha to get pure RGB for comparison
+          convert snapshot1.png -alpha remove snapshot1_rgb.png
+          convert snapshot2.png -alpha remove snapshot2_rgb.png
 
-          # 4. Count differing pixels (just for logging)
-          DIFF_COUNT=$(convert mask_binary.png -format "%[fx:mean*w*h]" info:)
+          # Create difference mask: white where pixels differ (with 5% fuzz)
+          # This command outputs a grayscale image where brightness indicates difference magnitude
+          compare -fuzz 5% -compose difference snapshot1_rgb.png snapshot2_rgb.png diff_grayscale.png
+
+          # Binarize: any non‑black becomes pure white (ensures binary mask)
+          convert diff_grayscale.png -threshold 0 mask.png
+
+          # Count differing pixels (for logging)
+          DIFF_COUNT=$(convert mask.png -format "%[fx:mean*w*h]" info:)
           echo "Differing pixels: $DIFF_COUNT"
 
-          # 5. If no differences, create a fully transparent image with a small red note
           if [ "$DIFF_COUNT" = "0" ] || [ "$DIFF_COUNT" = "0.0" ]; then
+            echo "No differences found — creating transparent image with note"
+            # Create a transparent canvas with a red "No changes" text
             convert -size $(identify -format "%wx%h" snapshot2.png) xc:none \
-              -fill "rgba(255,0,0,0.6)" -pointsize 48 -gravity center -annotate +0+0 "No changes" \
-              diff.png
+              -fill "rgba(255,0,0,0.6)" -pointsize 48 -gravity center \
+              -annotate +0+0 "No changes" diff.png
           else
-            # 6. Use the binary mask as the alpha channel of snapshot2's RGB channels
-            #    This makes changed pixels fully opaque, unchanged fully transparent.
-            convert snapshot2.png -alpha off \
-              mask_binary.png -compose CopyOpacity -composite diff.png
+            echo "Differences found — building transparent diff"
+            # Use the binary mask as the alpha channel of snapshot2's RGB channels
+            # Changed pixels become fully opaque, unchanged become fully transparent
+            convert snapshot2.png -alpha remove mask.png -compose CopyOpacity -composite diff.png
           fi
 
-          # Clean up
-          rm -f snapshot1_rgb.png snapshot2_rgb.png mask.png mask_binary.png
+          # Clean temporary files
+          rm -f snapshot1_rgb.png snapshot2_rgb.png diff_grayscale.png mask.png
 
+          echo "Diff generation complete"
           exit 0
 
       - name: Commit and push diff.png to repo
