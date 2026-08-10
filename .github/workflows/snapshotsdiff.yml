@@ -117,9 +117,8 @@ jobs:
           convert snapshot1.png -alpha remove snapshot1_rgb.png
           convert snapshot2.png -alpha remove snapshot2_rgb.png
 
-          # Create difference mask: white where pixels differ (with 5% fuzz)
-          # This command outputs a grayscale image where brightness indicates difference magnitude
-          compare -fuzz 5% -compose difference snapshot1_rgb.png snapshot2_rgb.png diff_grayscale.png
+          # Create difference mask (5% fuzz); exit code 1 = differences, 2 = error
+          compare -fuzz 5% -compose difference snapshot1_rgb.png snapshot2_rgb.png diff_grayscale.png || [ $? -eq 1 ]
 
           # Binarize: any non‑black becomes pure white (ensures binary mask)
           convert diff_grayscale.png -threshold 0 mask.png
@@ -137,7 +136,6 @@ jobs:
           else
             echo "Differences found — building transparent diff"
             # Use the binary mask as the alpha channel of snapshot2's RGB channels
-            # Changed pixels become fully opaque, unchanged become fully transparent
             convert snapshot2.png -alpha remove mask.png -compose CopyOpacity -composite diff.png
           fi
 
