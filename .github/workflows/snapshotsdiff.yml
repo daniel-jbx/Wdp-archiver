@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   # push:
   #   paths:
-  #     - timestamps.json   # Uncomment to auto‑run when the JSON changes
+  #     - timestamps.json
 
 jobs:
   diff:
@@ -53,7 +53,6 @@ jobs:
           import re
           from datetime import datetime
 
-          # Read snapshots list
           with open('snapshots.json') as f:
               try:
                   raw = json.load(f)
@@ -62,12 +61,10 @@ jobs:
           if not isinstance(raw, list):
               raw = []
 
-          # Keep only valid snapshot filenames: wdpsnapshot_YYYYMMDD_HHMMSS.png
           pattern = re.compile(r'^wdpsnapshot_\d{8}_\d{6}\.png$')
           snapshots = [s for s in raw if isinstance(s, str) and pattern.match(s)]
 
           print(f"Valid snapshots found: {len(snapshots)}", file=sys.stderr)
-
           if not snapshots:
               print("No valid snapshots found in snapshots.json!", file=sys.stderr)
               sys.exit(1)
@@ -88,7 +85,6 @@ jobs:
           snap1 = closest_to(start_dt, snapshots)
           snap2 = closest_to(end_dt, snapshots)
 
-          # Write results to GitHub output
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
               out.write(f"snapshot1={snap1}\n")
               out.write(f"snapshot2={snap2}\n")
@@ -117,9 +113,31 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      - name: Generate diff image
+      - name: Generate diff image (robust)
+        id: diff
         run: |
-          compare -highlight-color red snapshot1.png snapshot2.png diff.png
+          # Print image info for debugging
+          identify snapshot1.png snapshot2.png
+
+          # Run compare, but do NOT let the exit code stop the script
+          set +e
+          compare -metric AE -highlight-color red snapshot1.png snapshot2.png diff.png 2> metric.txt
+          COMPARE_EXIT=$?
+          set -e
+
+          METRIC=$(cat metric.txt | tr -d '\n ' | cut -d'(' -f1)  # handle "(...)" in output
+          echo "Metric (number of differing pixels): $METRIC"
+          echo "metric=$METRIC" >> $GITHUB_OUTPUT
+
+          # If no diff file was created (possible with some versions), generate a red overlay manually
+          if [ ! -f diff.png ]; then
+            echo "compare did not produce diff.png - creating overlay with composite"
+            composite -compose difference snapshot1.png snapshot2.png diff_raw.png
+            convert diff_raw.png -auto-level -channel RGB -evaluate set 100% -fill red -opaque white diff.png
+          fi
+
+          # Always succeed
+          exit 0
 
       - name: Upload diff as workflow artifact
         uses: actions/upload-artifact@v4
