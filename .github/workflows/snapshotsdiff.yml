@@ -123,7 +123,7 @@ jobs:
             diff_max.png
 
           # 5% fuzz → threshold ≈ 13 (out of 255)
-          convert diff_max.png -threshold 13 mask.png
+          convert diff_max.png -threshold 5 mask.png
 
           # Count differing pixels (white in mask)
           DIFF_COUNT=$(convert mask.png -format "%[fx:mean*w*h]" info:)
@@ -140,7 +140,7 @@ jobs:
             # Convert mask to alpha: unchanged (black) → 10%, changed (white) → 100%
             # black → gray(26) (≈10% opacity), white → white (100% opacity)
             convert mask.png \
-              -fill "gray(26)" -opaque black \
+              -fill "gray(13)" -opaque black \
               -fill white -opaque white \
               alpha.png
 
