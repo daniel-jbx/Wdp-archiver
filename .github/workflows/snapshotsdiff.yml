@@ -2,17 +2,9 @@ name: Diff Snapshots
 
 on:
   workflow_dispatch:
-    # Optionally, you can add inputs to override the JSON file:
-    # inputs:
-    #   start:
-    #     description: 'Start timestamp (YYYYMMDD_HHMMSS)'
-    #     required: false
-    #   end:
-    #     description: 'End timestamp (YYYYMMDD_HHMMSS)'
-    #     required: false
   # push:
   #   paths:
-  #     - timestamps.json   # auto-run when the JSON changes
+  #     - timestamps.json   # Uncomment to auto‑run when the JSON changes
 
 jobs:
   diff:
@@ -32,8 +24,6 @@ jobs:
       - name: Read timestamps from JSON
         id: read_json
         run: |
-          # Assumes timestamps.json exists in repo root with fields "start" and "end"
-          # Example: {"start": "20260101_120000", "end": "20260102_150000"}
           START=$(jq -r '.start' timestamps.json)
           END=$(jq -r '.end' timestamps.json)
           echo "start=$START" >> $GITHUB_OUTPUT
@@ -59,21 +49,32 @@ jobs:
           python3 << EOF
           import json
           import os
+          import sys
+          import re
           from datetime import datetime
 
           # Read snapshots list
           with open('snapshots.json') as f:
               try:
-                  snapshots = json.load(f)
+                  raw = json.load(f)
               except:
-                  snapshots = []
-          if not isinstance(snapshots, list):
-              snapshots = []
+                  raw = []
+          if not isinstance(raw, list):
+              raw = []
+
+          # Keep only valid snapshot filenames: wdpsnapshot_YYYYMMDD_HHMMSS.png
+          pattern = re.compile(r'^wdpsnapshot_\d{8}_\d{6}\.png$')
+          snapshots = [s for s in raw if isinstance(s, str) and pattern.match(s)]
+
+          print(f"Valid snapshots found: {len(snapshots)}", file=sys.stderr)
+
+          if not snapshots:
+              print("No valid snapshots found in snapshots.json!", file=sys.stderr)
+              sys.exit(1)
 
           start_str = os.environ['START']
           end_str   = os.environ['END']
 
-          # Parse a filename like "wdpsnapshot_YYYYMMDD_HHMMSS.png"
           def parse_ts(filename):
               base = filename.replace('wdpsnapshot_', '').replace('.png', '')
               return datetime.strptime(base, '%Y%m%d_%H%M%S')
@@ -81,18 +82,11 @@ jobs:
           start_dt = datetime.strptime(start_str, '%Y%m%d_%H%M%S')
           end_dt   = datetime.strptime(end_str,   '%Y%m%d_%H%M%S')
 
-          # Find closest by absolute time difference (in seconds)
           def closest_to(target, snapshots):
-              if not snapshots:
-                  return None
               return min(snapshots, key=lambda f: abs((parse_ts(f) - target).total_seconds()))
 
           snap1 = closest_to(start_dt, snapshots)
           snap2 = closest_to(end_dt, snapshots)
-
-          if snap1 is None or snap2 is None:
-              print("No snapshots found!", file=sys.stderr)
-              sys.exit(1)
 
           # Write results to GitHub output
           with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
@@ -125,7 +119,6 @@ jobs:
 
       - name: Generate diff image
         run: |
-          # Use ImageMagick compare to highlight differences (red on white)
           compare -highlight-color red snapshot1.png snapshot2.png diff.png
 
       - name: Upload diff as workflow artifact
