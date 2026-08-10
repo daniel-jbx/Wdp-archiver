@@ -102,45 +102,55 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      - name: Generate transparent diff (robust)
+      - name: Generate diff (unchanged 10% opacity, changed 100% opacity)
         id: diff
         run: |
-          set -x  # Print commands for debugging
+          set -x
           set -e
 
-          # Verify images exist and show properties
           echo "=== Image info ==="
           ls -la snapshot1.png snapshot2.png
           identify snapshot1.png snapshot2.png
 
-          # Strip alpha to get pure RGB for comparison
+          # Strip alpha → pure RGB for comparison
           convert snapshot1.png -alpha remove snapshot1_rgb.png
           convert snapshot2.png -alpha remove snapshot2_rgb.png
 
-          # Create difference mask (5% fuzz); exit code 1 = differences, 2 = error
-          compare -fuzz 5% -compose difference snapshot1_rgb.png snapshot2_rgb.png diff_grayscale.png || [ $? -eq 1 ]
+          # Compute per-pixel maximum difference across R,G,B channels
+          convert snapshot1_rgb.png snapshot2_rgb.png \
+            -compose difference -composite \
+            -channel RGB -separate -evaluate-sequence Max \
+            diff_max.png
 
-          # Binarize: any non‑black becomes pure white (ensures binary mask)
-          convert diff_grayscale.png -threshold 0 mask.png
+          # 5% fuzz → threshold ≈ 13 (out of 255)
+          convert diff_max.png -threshold 13 mask.png
 
-          # Count differing pixels (for logging)
+          # Count differing pixels (white in mask)
           DIFF_COUNT=$(convert mask.png -format "%[fx:mean*w*h]" info:)
           echo "Differing pixels: $DIFF_COUNT"
 
           if [ "$DIFF_COUNT" = "0" ] || [ "$DIFF_COUNT" = "0.0" ]; then
-            echo "No differences found — creating transparent image with note"
-            # Create a transparent canvas with a red "No changes" text
-            convert -size $(identify -format "%wx%h" snapshot2.png) xc:none \
-              -fill "rgba(255,0,0,0.6)" -pointsize 48 -gravity center \
+            echo "No differences — showing snapshot2 at 10% opacity with note"
+            convert snapshot2.png \
+              -alpha set -channel A -evaluate set 10% +channel \
+              -fill "rgba(255,0,0,0.8)" -pointsize 48 -gravity center \
               -annotate +0+0 "No changes" diff.png
           else
-            echo "Differences found — building transparent diff"
-            # Use the binary mask as the alpha channel of snapshot2's RGB channels
-            convert snapshot2.png -alpha remove mask.png -compose CopyOpacity -composite diff.png
+            echo "Differences found — building opacity-based overlay"
+            # Convert mask to alpha: unchanged (black) → 10%, changed (white) → 100%
+            # black → gray(26) (≈10% opacity), white → white (100% opacity)
+            convert mask.png \
+              -fill "gray(26)" -opaque black \
+              -fill white -opaque white \
+              alpha.png
+
+            # Apply alpha to snapshot2
+            convert snapshot2.png -alpha remove alpha.png \
+              -compose CopyOpacity -composite diff.png
           fi
 
           # Clean temporary files
-          rm -f snapshot1_rgb.png snapshot2_rgb.png diff_grayscale.png mask.png
+          rm -f snapshot1_rgb.png snapshot2_rgb.png diff_max.png mask.png alpha.png
 
           echo "Diff generation complete"
           exit 0
