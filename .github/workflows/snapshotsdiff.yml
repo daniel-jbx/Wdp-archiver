@@ -18,13 +18,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install ImageMagick, rclone, and jq
+      - name: Install rclone, jq, and Python Pillow
         run: |
           sudo apt-get update
-          sudo apt-get install -y imagemagick jq
+          sudo apt-get install -y jq
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
           rm rclone-current-linux-amd64.deb
+          pip install Pillow
 
       - name: Read timestamps from JSON
         id: read_json
@@ -102,57 +103,72 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
-      - name: Generate diff (unchanged 10% opacity, changed 100% opacity)
+      - name: Generate diff with Python (Pillow)
         id: diff
         run: |
-          set -x
-          set -e
+          python3 << 'EOF'
+          from PIL import Image, ImageDraw
+          import sys
 
-          echo "=== Image info ==="
-          ls -la snapshot1.png snapshot2.png
-          identify snapshot1.png snapshot2.png
+          # Load snapshots
+          snap1 = Image.open('snapshot1.png').convert('RGB')
+          snap2 = Image.open('snapshot2.png').convert('RGB')
+          w, h = snap1.size
+          print(f"Image size: {w}x{h}")
 
-          # Strip alpha → pure RGB for comparison
-          convert snapshot1.png -alpha remove snapshot1_rgb.png
-          convert snapshot2.png -alpha remove snapshot2_rgb.png
+          # --- Adjust opacity for unchanged pixels here ---
+          UNCHANGED_OPACITY = 10    # in percent (change to 5 for 5%)
+          # ------------------------------------------------
 
-          # Compute per-pixel maximum difference across R,G,B channels
-          convert snapshot1_rgb.png snapshot2_rgb.png \
-            -compose difference -composite \
-            -channel RGB -separate -evaluate-sequence Max \
-            diff_max.png
+          # Threshold for "difference" (5% fuzz = 13/255)
+          THRESHOLD = 13
 
-          # 5% fuzz → threshold ≈ 13 (out of 255)
-          convert diff_max.png -threshold 5 mask.png
+          # Create an alpha mask: white where different, black where same
+          mask = Image.new('L', (w, h), 0)
+          pixels1 = snap1.load()
+          pixels2 = snap2.load()
+          mask_px = mask.load()
 
-          # Count differing pixels (white in mask)
-          DIFF_COUNT=$(convert mask.png -format "%[fx:mean*w*h]" info:)
-          echo "Differing pixels: $DIFF_COUNT"
+          diff_count = 0
+          for y in range(h):
+              for x in range(w):
+                  r1, g1, b1 = pixels1[x, y]
+                  r2, g2, b2 = pixels2[x, y]
+                  max_diff = max(abs(r1-r2), abs(g1-g2), abs(b1-b2))
+                  if max_diff > THRESHOLD:
+                      mask_px[x, y] = 255  # fully opaque (changed)
+                      diff_count += 1
+                  else:
+                      mask_px[x, y] = 0    # will become UNCHANGED_OPACITY later
 
-          if [ "$DIFF_COUNT" = "0" ] || [ "$DIFF_COUNT" = "0.0" ]; then
-            echo "No differences — showing snapshot2 at 10% opacity with note"
-            convert snapshot2.png \
-              -alpha set -channel A -evaluate set 10% +channel \
-              -fill "rgba(255,0,0,0.8)" -pointsize 48 -gravity center \
-              -annotate +0+0 "No changes" diff.png
-          else
-            echo "Differences found — building opacity-based overlay"
-            # Convert mask to alpha: unchanged (black) → 10%, changed (white) → 100%
-            # black → gray(26) (≈10% opacity), white → white (100% opacity)
-            convert mask.png \
-              -fill "gray(13)" -opaque black \
-              -fill white -opaque white \
-              alpha.png
+          print(f"Differing pixels: {diff_count}")
 
-            # Apply alpha to snapshot2
-            convert snapshot2.png -alpha remove alpha.png \
-              -compose CopyOpacity -composite diff.png
-          fi
+          # Create the final RGBA image from snapshot2
+          result = snap2.convert('RGBA')
 
-          # Clean temporary files
-          rm -f snapshot1_rgb.png snapshot2_rgb.png diff_max.png mask.png alpha.png
+          if diff_count == 0:
+              # No changes: show snapshot2 at UNCHANGED_OPACITY with a label
+              alpha = Image.new('L', (w, h), int(255 * UNCHANGED_OPACITY / 100))
+              result.putalpha(alpha)
+              draw = ImageDraw.Draw(result)
+              # Red text, semi‑transparent background already set
+              draw.text((w//2, h//2), "No changes", fill=(255,0,0,255), anchor="mm")
+          else:
+              # Build alpha from mask: black → UNCHANGED_OPACITY, white → 100%
+              alpha = Image.new('L', (w, h))
+              alpha_px = alpha.load()
+              unchanged_val = int(255 * UNCHANGED_OPACITY / 100)
+              for y in range(h):
+                  for x in range(w):
+                      if mask_px[x, y] == 255:
+                          alpha_px[x, y] = 255        # 100% opaque
+                      else:
+                          alpha_px[x, y] = unchanged_val  # UNCHANGED_OPACITY opaque
+              result.putalpha(alpha)
 
-          echo "Diff generation complete"
+          result.save('diff.png')
+          print("Diff generation complete")
+          EOF
           exit 0
 
       - name: Commit and push diff.png to repo
