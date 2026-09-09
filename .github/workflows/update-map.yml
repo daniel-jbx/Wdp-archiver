@@ -19,11 +19,39 @@ jobs:
 
       - name: Install ImageMagick, pngquant and rclone
         run: |
-          sudo apt-get update
+          # Disable flaky third-party repositories that can cause hash mismatches
+          # (Google Chrome, Microsoft packages, etc.) They are not needed here.
+          sudo rm -f /etc/apt/sources.list.d/google-chrome.list
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
+          # If there are other .list files from third parties, remove them as well
+          # sudo rm -f /etc/apt/sources.list.d/other-repo.list
+
+          # Update apt with retries
+          for i in 1 2 3; do
+            echo "Attempt $i to update apt package lists..."
+            if sudo apt-get update -o Acquire::Retries=3; then
+              echo "apt-get update succeeded"
+              break
+            else
+              echo "apt-get update failed (attempt $i)"
+              if [ $i -eq 3 ]; then
+                echo "All attempts failed, exiting."
+                exit 1
+              fi
+              sleep $((i * 10))
+            fi
+          done
+
+          # Install imagemagick and pngquant
           sudo apt-get install -y imagemagick pngquant
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
-          sudo dpkg -i rclone-current-linux-amd64.deb
-          rm rclone-current-linux-amd64.deb
+
+          # Install rclone from GitHub Releases (more reliable than downloads.rclone.org)
+          RCLONE_VERSION="1.65.0"  # Pin to a known version; adjust if needed
+          curl -L --retry 5 --retry-delay 5 \
+            -o rclone.deb \
+            "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.deb"
+          sudo dpkg -i rclone.deb
+          rm rclone.deb
 
       - name: Download and stitch tiles
         run: bash download-and-stitch.sh
