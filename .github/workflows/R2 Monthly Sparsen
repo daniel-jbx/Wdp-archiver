@@ -1,0 +1,138 @@
+name: R2 Monthly Sparsen (>30 days → 1/3hr)
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List and download cull set but do not delete from R2'
+        type: boolean
+        default: true
+      age_days:
+        description: 'Only sparsen snapshots older than this many days'
+        type: string
+        default: '30'
+      bucket_hours:
+        description: 'Retention bucket size in hours for old snapshots'
+        type: string
+        default: '3'
+
+permissions:
+  contents: read
+
+jobs:
+  sparsen:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+          rm rclone-current-linux-amd64.deb
+
+      - name: Build cull list
+        id: cull
+        run: |
+          set -euo pipefail
+          BUCKET="${{ secrets.R2_BUCKET }}"
+          NOW=$(date +%s)
+          AGE_DAYS="${{ inputs.age_days }}"
+          BUCKET_HOURS="${{ inputs.bucket_hours }}"
+          BUCKET_SECONDS=$(( BUCKET_HOURS * 3600 ))
+
+          rclone lsf ":s3:${BUCKET}" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+            --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --s3-no-check-bucket \
+            --include "wdpsnapshot_*.png" > all_snapshots.txt
+
+          python3 << 'PY'
+          import os, re, sys
+          from datetime import datetime, timezone
+
+          NOW = int(os.environ["NOW"])
+          AGE_DAYS = int(os.environ["AGE_DAYS"])
+          BUCKET_SECONDS = int(os.environ["BUCKET_SECONDS"])
+          cutoff = NOW - AGE_DAYS * 86400
+
+          pattern = re.compile(r"wdpsnapshot_(\d{8})_(\d{6})\.png$")
+          by_bucket = {}
+
+          with open("all_snapshots.txt") as f:
+              for line in f:
+                  name = line.strip()
+                  m = pattern.search(name)
+                  if not m:
+                      continue
+                  dt = datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+                  epoch = int(dt.timestamp())
+                  if epoch >= cutoff:
+                      continue
+                  bucket = epoch - (epoch % BUCKET_SECONDS)
+                  by_bucket.setdefault(bucket, []).append((epoch, name))
+
+          cull = []
+          for bucket in sorted(by_bucket):
+              entries = sorted(by_bucket[bucket])
+              # keep the earliest in each bucket; cull the rest
+              for epoch, name in entries[1:]:
+                  cull.append(name)
+
+          with open("cull_list.txt", "w") as out:
+              for name in cull:
+                  out.write(name + "\n")
+
+          print(f"Old snapshots beyond {AGE_DAYS}d: {sum(len(v) for v in by_bucket.values())}")
+          print(f"Buckets: {len(by_bucket)}")
+          print(f"Cull set: {len(cull)}")
+          PY
+
+      - name: Download culled snapshots
+        run: |
+          mkdir -p culled
+          rclone copy \
+            --files-from cull_list.txt \
+            ":s3:${{ secrets.R2_BUCKET }}" culled/ \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+            --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --s3-no-check-bucket \
+            --verbose
+
+      - name: Upload culled snapshots as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: culled-snapshots-${{ github.run_id }}
+          path: culled/
+          retention-days: 90
+          compression-level: 0   # PNGs are already compressed
+
+      - name: Delete culled snapshots from R2 (skipped on dry run)
+        if: ${{ inputs.dry_run == false }}
+        run: |
+          while IFS= read -r file; do
+            rclone delete ":s3:${{ secrets.R2_BUCKET }}/${file}" \
+              --s3-provider="Cloudflare" \
+              --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+              --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+              --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+              --s3-no-check-bucket
+          done < cull_list.txt
+
+      - name: Regenerate snapshots.json
+        run: |
+          rclone lsf ":s3:${{ secrets.R2_BUCKET }}" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+            --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --s3-no-check-bucket \
+            --include "wdpsnapshot_*.png" | sort | jq -R . | jq -s . > snapshots.json
+          rclone copyto snapshots.json ":s3:${{ secrets.R2_BUCKET }}/snapshots.json" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${{ secrets.R2_ENDPOINT }}" \
+            --s3-access-key-id="${{ secrets.R2_ACCESS_KEY_ID }}" \
+            --s3-secret-access-key="${{ secrets.R2_SECRET_ACCESS_KEY }}" \
+            --s3-no-check-bucket
