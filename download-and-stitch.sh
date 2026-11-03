@@ -2,10 +2,10 @@
 set -euo pipefail
 
 # ---- CONFIGURE YOUR TILE RANGE ----
-START_COL=1225  # leftmost column (X)
+START_COL=1224  # leftmost column (X)
 START_ROW=513   # topmost row (Y)
 END_COL=1231    # rightmost column (X)
-END_ROW=518     # bottommost row (Y)
+END_ROW=519     # bottommost row (Y)
 # -----------------------------------
 
 BASE_URL="https://backend.wplace.live/files/s0/tiles"
