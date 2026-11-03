@@ -579,9 +579,22 @@
   };
 
   currentImage.onload = () => {
+    const prevRanges = current.ranges;
+    const hadImage   = initialLoadDone;
+
     current.w = currentImage.naturalWidth;
     current.h = currentImage.naturalHeight;
     current.ranges = rangesForSize(current.w, current.h);
+
+    // If this is a snapshot switch and the origin tile moved (e.g. legacy
+    // 7000x6000 at col 1225 vs. new 8000x7000 at col 1224), shift the viewport
+    // so the geographic position on screen stays put.
+    if (hadImage && (prevRanges.col !== current.ranges.col || prevRanges.row !== current.ranges.row)) {
+      const dx = (current.ranges.col - prevRanges.col) * TILE;
+      const dy = (current.ranges.row - prevRanges.row) * TILE;
+      viewport.offX += dx * viewport.scale;
+      viewport.offY += dy * viewport.scale;
+    }
 
     renderer.setImage(currentImage);
     if (!initialLoadDone) {
