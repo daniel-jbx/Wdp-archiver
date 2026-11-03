@@ -11,32 +11,50 @@
   const dlToggle  = document.getElementById('dl-select-toggle');
   const dlPng     = document.getElementById('dl-select-png');
   const dlOverlay = document.getElementById('dl-select-overlay');
-  const diffBtn   = document.getElementById('diff-btn');
   const coordsDiv = document.getElementById('coords-display');
   const selCtx    = selCanvas.getContext('2d');
 
-  // ---- Copy link button (after dlOverlay) ----
+  // Transitional: hide the diff button until index.html drops it.
+  const _diffBtnEl = document.getElementById('diff-btn');
+  if (_diffBtnEl) _diffBtnEl.style.display = 'none';
+
+  // Copy link button (after dlOverlay)
   const copyLinkBtn = document.createElement('button');
   copyLinkBtn.id = 'dl-copy-link';
   copyLinkBtn.className = 'dl-btn';
   copyLinkBtn.textContent = 'copy link';
   dlPng.parentNode.insertBefore(copyLinkBtn, dlOverlay);
 
-  // diff button listener (outside fetch, works immediately after data ready)
-  diffBtn.addEventListener('click', () => {
-    if (!diffMgr) return;   // silently ignore if diffs not yet loaded
-    diffMgr.toggle(!diffMgr.active);
-  });
-
   // ── Dataset & constants ────────────────────────────────────
   const dataset  = location.pathname.includes('/antarktika/') ? 'antarktika' : 'wdp';
   const BASE_URL = `https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/${dataset === 'wdp' ? '' : 'antarktika/'}`;
   const ZOOM = 11, TILE = 1000, WORLD = Math.pow(2, ZOOM) * TILE;
+
   const ranges = {
-    wdp:        { col:1225, row:513, cols:7, rows:6 },
+    wdp:        { col:1224, row:513, cols:8, rows:7 },
     antarktika: { col:1279, row:1715, cols:6, rows:5 }
   }[dataset];
-  const IMG_W = ranges.cols * TILE, IMG_H = ranges.rows * TILE;
+
+  const SIZE_TO_RANGES = {
+    wdp: {
+      '8000x7000': { col:1224, row:513, cols:8, rows:7 },
+      '7000x6000': { col:1225, row:513, cols:7, rows:6 },
+    },
+    antarktika: {
+      '6000x5000': { col:1279, row:1715, cols:6, rows:5 },
+    }
+  }[dataset] || {};
+
+  function rangesForSize(w, h) {
+    return SIZE_TO_RANGES[`${w}x${h}`] || ranges;
+  }
+
+  // Per-image geometry — updated whenever a snapshot finishes loading.
+  const current = {
+    w: ranges.cols * TILE,
+    h: ranges.rows * TILE,
+    ranges: ranges,
+  };
 
   // URL state for sharable links
   const urlParams = new URLSearchParams(window.location.search);
@@ -49,8 +67,21 @@
     pendingSavedViewport = { x: urlX, y: urlY, zoom: urlZoom };
   }
 
+  // ── Helpers ────────────────────────────────────────────────
+  function parseTimestamp(name) {
+    const m = name.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
+    if (!m) return null;
+    return {
+      epoch: Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5], +m[6]) / 1000,
+      date:  `${m[1]}-${m[2]}-${m[3]}`,
+      time:  `${m[4]}:${m[5]}:${m[6]}`,
+    };
+  }
+  function epochFromName(name) { return parseTimestamp(name)?.epoch ?? 0; }
+
   function pixelToLatLon(px, py) {
-    const gx = ranges.col * TILE + px, gy = ranges.row * TILE + py;
+    const gx = current.ranges.col * TILE + px;
+    const gy = current.ranges.row * TILE + py;
     const y = 1 - 2 * gy / WORLD, lon = (gx / WORLD) * 360 - 180;
     const lat = (2 * Math.atan(Math.exp(Math.PI * y)) - Math.PI / 2) * 180 / Math.PI;
     return { lat, lon };
@@ -59,12 +90,12 @@
     const nw = pixelToLatLon(x, y), se = pixelToLatLon(x + w, y + h);
     return { north: nw.lat, south: se.lat, west: nw.lon, east: se.lon };
   }
-  function epochFromName(name) {
-    const m = name.match(/(\d{8})_(\d{6})/);
-    if (!m) return 0;
-    const d = m[1], t = m[2];
-    return Date.UTC(d.slice(0,4), d.slice(4,6)-1, d.slice(6,8),
-                    t.slice(0,2), t.slice(2,4), t.slice(4,6)) / 1000;
+
+  function matMul(a, b, out) {
+    for (let c = 0; c < 3; c++) {
+      const b0 = b[c*3], b1 = b[c*3+1], b2 = b[c*3+2];
+      for (let r = 0; r < 3; r++) out[c*3+r] = a[r]*b0 + a[3+r]*b1 + a[6+r]*b2;
+    }
   }
 
   // ── Renderer (WebGL) ───────────────────────────────────────
@@ -177,12 +208,6 @@
       const proj = new Float32Array([2/cssW, 0, 0, 0, -2/cssH, 0, -1, 1, 1]);
       const pan  = new Float32Array([1, 0, 0, 0, 1, 0, offX, offY, 1]);
       const zoom = new Float32Array([scale, 0, 0, 0, scale, 0, 0, 0, 1]);
-      const matMul = (a, b, out) => {
-        for (let c=0; c<3; c++) {
-          let b0 = b[c*3], b1 = b[c*3+1], b2 = b[c*3+2];
-          for (let r=0; r<3; r++) out[c*3+r] = a[r]*b0 + a[3+r]*b1 + a[6+r]*b2;
-        }
-      };
       const tmp1 = new Float32Array(9), tmp2 = new Float32Array(9);
       matMul(pan, zoom, tmp1);
       matMul(proj, tmp1, tmp2);
@@ -212,19 +237,16 @@
 
   // ── Viewport (pan/zoom) ────────────────────────────────────
   class Viewport {
-    constructor(renderer, w, h) {
-      this.renderer = renderer;
+    constructor(w, h) {
       this.w = w; this.h = h;
       this.scale = 1; this.offX = 0; this.offY = 0;
       this.minScale = 0.1; this.maxScale = 1000;
       this.dragging = false; this.dragStartX = 0; this.dragStartY = 0;
-      this.dragOffX = 0; this.dragOffY = 0; this.dragOccurred = false;
+      this.dragOffX = 0; this.dragOffY = 0;
       this.pinching = false; this.pinchDist = 0; this.pinchScale = 1;
       this.pinchCx = 0; this.pinchCy = 0;
-      this.tapStartX = 0; this.tapStartY = 0; this.wasDragged = false;
       this.onTapLeft  = null;
       this.onTapRight = null;
-      this.onClick    = null;
     }
 
     reset(img) {
@@ -260,11 +282,6 @@
         this.dragging = true;
         this.dragStartX = clientX; this.dragStartY = clientY;
         this.dragOffX = this.offX; this.dragOffY = this.offY;
-        this.dragOccurred = false;
-        if (e.touches) {
-          this.tapStartX = clientX; this.tapStartY = clientY;
-          this.wasDragged = false;
-        }
       }
     }
 
@@ -287,13 +304,12 @@
       }
       if (this.dragging) {
         const dx = clientX - this.dragStartX, dy = clientY - this.dragStartY;
-        if (Math.hypot(dx, dy) > 5) this.dragOccurred = true;
         this.offX = this.dragOffX + dx;
         this.offY = this.dragOffY + dy;
       }
     }
 
-    onPointerUp(e, clientX, clientY) {
+    onPointerUp(e) {
       if (this.pinching && e.touches && e.touches.length < 2) {
         this.pinching = false;
       }
@@ -301,14 +317,11 @@
         this.dragging = false;
         if (e.changedTouches && e.changedTouches.length === 1 && !this.pinching) {
           const tx = e.changedTouches[0].clientX;
-          if (!this.wasDragged && Math.hypot(tx - this.tapStartX, e.changedTouches[0].clientY - this.tapStartY) <= 5) {
-            if (tx < window.innerWidth/2) { if (this.onTapLeft) this.onTapLeft(); }
-            else { if (this.onTapRight) this.onTapRight(); }
+          const ty = e.changedTouches[0].clientY;
+          if (Math.hypot(tx - this.dragStartX, ty - this.dragStartY) <= 5) {
+            if (tx < window.innerWidth / 2) { if (this.onTapLeft) this.onTapLeft(); }
+            else                            { if (this.onTapRight) this.onTapRight(); }
           }
-          this.wasDragged = false;
-        }
-        if (e.type === 'mouseup' && !this.dragOccurred) {
-          if (this.onClick) this.onClick(clientX, clientY);
         }
       }
     }
@@ -333,6 +346,7 @@
       this.start = null; this.end = null;
       this.dragging = false; this.handle = null;
       this.HANDLE = 8;
+      selCanvas.style.pointerEvents = 'none';
     }
 
     getRect() {
@@ -347,11 +361,13 @@
 
     toggle(on) {
       this.mode = on;
+      selCanvas.style.pointerEvents = on ? 'auto' : 'none';
       if (!on) {
         this.start = this.end = null;
         this.handle = null;
         this.clear();
         dlPng.style.display = dlOverlay.style.display = 'none';
+        coordsDiv.style.display = 'none';
       }
     }
 
@@ -382,7 +398,12 @@
       coordsDiv.textContent = `x: [${r.x1}, ${r.x2}]  y: [${r.y1}, ${r.y2}]`;
     }
 
-    _clamp(p) { return { x: Math.max(0, Math.min(p.x, IMG_W)), y: Math.max(0, Math.min(p.y, IMG_H)) }; }
+    _clamp(p) {
+      return {
+        x: Math.max(0, Math.min(p.x, current.w)),
+        y: Math.max(0, Math.min(p.y, current.h))
+      };
+    }
 
     hitHandle(clientX, clientY) {
       const r = this.getRect();
@@ -405,7 +426,7 @@
       const img = this._clamp(this.vp.clientToImg(clientX, clientY));
       if (this.start && this.end && this.getRect()) {
         this.handle = this.hitHandle(clientX, clientY);
-        if (this.handle) return; // resizing an existing selection
+        if (this.handle) return;
       }
       dlPng.style.display = dlOverlay.style.display = 'none';
       this.dragging = true;
@@ -449,7 +470,8 @@
         case 'move': {
           const dx = img.x - (x1+x2)/2, dy = img.y - (y1+y2)/2;
           const w = x2-x1, h = y2-y1;
-          let nx1 = Math.max(0, Math.min(x1+dx, IMG_W-w)), ny1 = Math.max(0, Math.min(y1+dy, IMG_H-h));
+          const nx1 = Math.max(0, Math.min(x1+dx, current.w - w));
+          const ny1 = Math.max(0, Math.min(y1+dy, current.h - h));
           this.start = {x:nx1, y:ny1}; this.end = {x:nx1+w, y:ny1+h};
           break;
         }
@@ -474,68 +496,55 @@
       this.filtered = [];
       this.currentIndex = -1;
       this.intervalSec = 3600;
-      this.customList = null;
-      this._sliderMap = {};
-    }
-
-    setCustomList(list) {
-      this.customList = list;
-      this._rebuild();
     }
 
     setInterval(minutes) {
       this.intervalSec = minutes * 60;
-      if (!this.customList) this._rebuild();
     }
 
-    rebuildWithAnchor(anchorName) { this._buildFiltered(anchorName); }
-
-    _rebuild() { this._buildFiltered(null); }
-
-    _buildFiltered(anchorName) {
-      if (this.customList) {
-        this.filtered = this.customList;
-        this._updateSlider();
-        const idx = anchorName ? this.filtered.indexOf(anchorName) : -1;
-        this.load(idx >= 0 ? idx : this.filtered.length - 1);
-        return;
-      }
+    rebuild(anchorName = null) {
       const interval = this.intervalSec;
       if (!interval || this.all.length === 0) {
-        this.filtered = this.all.sort((a,b) => epochFromName(a) - epochFromName(b));
+        this.filtered = this.all.slice().sort((a, b) => epochFromName(a) - epochFromName(b));
         this._updateSlider();
         let idx = anchorName ? this.filtered.indexOf(anchorName) : -1;
         if (idx === -1) idx = this.filtered.length - 1;
         this.load(idx);
         return;
       }
-      const cands = this.all.map(n => ({name:n, ep:epochFromName(n)})).sort((a,b)=>a.ep-b.ep);
-      const anchorIdx = anchorName ? cands.findIndex(c=>c.name===anchorName) : cands.length-1;
+      const cands = this.all
+        .map(n => ({ name: n, ep: epochFromName(n) }))
+        .sort((a, b) => a.ep - b.ep);
+      const anchorIdx = anchorName ? cands.findIndex(c => c.name === anchorName) : cands.length - 1;
       if (anchorIdx === -1) { this.load(0); return; }
       const anchorEp = cands[anchorIdx].ep;
       const selected = new Map();
       selected.set(anchorEp, cands[anchorIdx].name);
-      const minEp = cands[0].ep, maxEp = cands[cands.length-1].ep;
-      for (let k = Math.ceil((minEp-anchorEp)/interval); k <= Math.floor((maxEp-anchorEp)/interval); k++) {
+      const minEp = cands[0].ep, maxEp = cands[cands.length - 1].ep;
+      for (let k = Math.ceil((minEp - anchorEp) / interval); k <= Math.floor((maxEp - anchorEp) / interval); k++) {
         if (k === 0) continue;
         const target = anchorEp + k * interval;
-        let l=0, r=cands.length-1;
-        while(l<=r){ let m=(l+r)>>1; if(cands[m].ep<target) l=m+1; else r=m-1; }
-        let best = null, bestDiff=Infinity;
-        if(l<cands.length){ let d=Math.abs(cands[l].ep-target); if(d<bestDiff){ bestDiff=d; best=cands[l]; } }
-        if(l-1>=0){ let d=Math.abs(cands[l-1].ep-target); if(d<bestDiff){ bestDiff=d; best=cands[l-1]; } }
-        if(best && !selected.has(best.ep)) selected.set(best.ep, best.name);
+        let l = 0, r = cands.length - 1;
+        while (l <= r) { const m = (l + r) >> 1; if (cands[m].ep < target) l = m + 1; else r = m - 1; }
+        let best = null, bestDiff = Infinity;
+        if (l < cands.length) {
+          const d = Math.abs(cands[l].ep - target);
+          if (d < bestDiff) { bestDiff = d; best = cands[l]; }
+        }
+        if (l - 1 >= 0) {
+          const d = Math.abs(cands[l - 1].ep - target);
+          if (d < bestDiff) { bestDiff = d; best = cands[l - 1]; }
+        }
+        if (best && !selected.has(best.ep)) selected.set(best.ep, best.name);
       }
-      this.filtered = Array.from(selected.keys()).sort((a,b)=>a-b).map(ep=>selected.get(ep));
+      this.filtered = Array.from(selected.keys()).sort((a, b) => a - b).map(ep => selected.get(ep));
       this._updateSlider();
       let targetIdx = this.filtered.indexOf(cands[anchorIdx].name);
-      if (targetIdx === -1) targetIdx = this.filtered.length-1;
+      if (targetIdx === -1) targetIdx = this.filtered.length - 1;
       this.load(targetIdx);
     }
 
     _updateSlider() {
-      this._sliderMap = {};
-      this.filtered.forEach((name,i) => this._sliderMap[i] = name);
       slider.max = Math.max(0, this.filtered.length - 1);
     }
 
@@ -543,112 +552,30 @@
       if (idx < 0 || idx >= this.filtered.length) return;
       this.currentIndex = idx;
       slider.value = idx;
-      const name = this._sliderMap[idx];
+      const name = this.filtered[idx];
       if (!name) return;
-      const m = name.match(/(\d{8})_(\d{6})/);
-      tsLabel.textContent = m ? `${m[1].slice(0,4)}-${m[1].slice(4,6)}-${m[1].slice(6,8)} ${m[2].slice(0,2)}:${m[2].slice(2,4)}:${m[2].slice(4,6)}` : name;
+      const ts = parseTimestamp(name);
+      tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : name;
       if (this.onLoadSnapshot) this.onLoadSnapshot(name);
     }
 
-    currentName() { return this._sliderMap[this.currentIndex]; }
-  }
-
-  // ── Diff Manager ──────────────────────────────────────────
-  class DiffManager {
-    constructor(diffs, filterCtrl, viewport) {
-      this.diffs = diffs;
-      this.fc = filterCtrl;
-      this.vp = viewport;
-      this.active = false;
-      this.locked = false;
-      this.pixel = null;
-    }
-
-    toggle(on) {
-      this.active = on;
-      if (on) {
-        diffBtn.textContent = 'done';
-        canvas.classList.add('diff-mode');
-        interval.disabled = true; interval.style.display = 'none';
-        if (datePick) { datePick.disabled = true; datePick.style.display = 'none'; }
-        if (timeSel) { timeSel.disabled = true; timeSel.style.display = 'none'; }
-        selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-        tsLabel.style.background = 'rgba(76,175,80,0.8)';
-        tsLabel.style.padding = '2px 6px';
-        tsLabel.style.borderRadius = '4px';
-        this.pixel = null;
-        this.locked = false;
-        dlToggle.style.display = 'none';                // hide select area
-      } else {
-        diffBtn.textContent = 'diff';
-        canvas.classList.remove('diff-mode');
-        interval.disabled = false; interval.style.display = '';
-        if (datePick) { datePick.disabled = false; datePick.style.display = ''; }
-        if (timeSel) { timeSel.disabled = false; timeSel.style.display = ''; }
-        tsLabel.style.background = '';
-        tsLabel.style.padding = '';
-        this.fc.setCustomList(null);
-        dlToggle.style.display = '';                    // show select area
-      }
-    }
-
-    selectPixel(clientX, clientY) {
-      if (!this.active || this.locked) return false;
-      const p = this.vp.clientToImg(clientX, clientY);
-      if (p.x < 0 || p.x >= IMG_W || p.y < 0 || p.y >= IMG_H) return false;
-
-      this.pixel = p;
-      draw();
-
-      const key = `${p.x},${p.y}`;
-      const idxs = this.diffs[key] || [];
-      if (idxs.length === 0) {
-        alert('This pixel never changed across snapshots.');
-        return false;
-      }
-
-      this.locked = true;
-      const changedSnaps = [0, ...idxs].map(i => this.fc.all[i]).filter(Boolean);
-      this.fc.setCustomList(changedSnaps);
-      return true;
-    }
-
-    drawMarker(ctx) {
-      if (!this.pixel || !this.active) return;
-      ctx.save();
-      const sc = this.vp.scale;
-      const s = this.vp.imgToClient(this.pixel.x, this.pixel.y);
-      const w = Math.max(1, sc), h = Math.max(1, sc);
-      ctx.imageSmoothingEnabled = false;
-      ctx.strokeStyle = 'red'; ctx.lineWidth = 1;
-      ctx.strokeRect(s.x, s.y, w, h);
-      ctx.fillStyle = 'rgba(255,0,0,0.3)';
-      ctx.fillRect(s.x, s.y, w, h);
-      ctx.restore();
-    }
+    currentName() { return this.filtered[this.currentIndex]; }
   }
 
   // ── Application setup ────────────────────────────────────
   const renderer = new Renderer(canvas);
-  const viewport = new Viewport(renderer, window.innerWidth, window.innerHeight);
+  const viewport = new Viewport(window.innerWidth, window.innerHeight);
   const selection = new SelectionManager(selCtx, viewport);
   const filterCtrl = new FilterController([]);
-  let diffMgr = null;
   const currentImage = new Image();
   currentImage.crossOrigin = 'anonymous';
   let initialLoadDone = false;
 
-  // Wire viewport callbacks
   viewport.onTapLeft = () => {
     if (filterCtrl.currentIndex > 0) filterCtrl.load(filterCtrl.currentIndex - 1);
   };
   viewport.onTapRight = () => {
     if (filterCtrl.currentIndex < filterCtrl.filtered.length - 1) filterCtrl.load(filterCtrl.currentIndex + 1);
-  };
-  viewport.onClick = (x, y) => {
-    if (diffMgr && diffMgr.active) {
-      if (diffMgr.selectPixel(x, y)) draw();
-    }
   };
 
   filterCtrl.onLoadSnapshot = (name) => {
@@ -656,6 +583,10 @@
   };
 
   currentImage.onload = () => {
+    current.w = currentImage.naturalWidth;
+    current.h = currentImage.naturalHeight;
+    current.ranges = rangesForSize(current.w, current.h);
+
     renderer.setImage(currentImage);
     if (!initialLoadDone) {
       if (pendingSavedViewport) {
@@ -677,21 +608,19 @@
     renderer.gl.clearColor(...bg);
     renderer.gl.clear(renderer.gl.COLOR_BUFFER_BIT);
     renderer.draw(viewport.offX, viewport.offY, viewport.scale, window.innerWidth, window.innerHeight);
-    if (!selection.mode && diffMgr && diffMgr.active) {
-      diffMgr.drawMarker(selCtx);
-    } else if (!selection.mode && !(diffMgr && diffMgr.active)) {
+    if (!selection.mode) {
       selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
     }
   }
 
-  // ── Event wiring (immediate) ─────────────────────────────
+  // ── Event wiring ─────────────────────────────────────────
   function addEvents() {
     const el = canvas;
     el.addEventListener('mousedown', e => {
       if (selection.mode) return;
       e.preventDefault();
       viewport.onPointerDown(e, e.clientX, e.clientY);
-      if (!diffMgr || !diffMgr.active) el.style.cursor = 'grabbing';
+      el.style.cursor = 'grabbing';
     });
     window.addEventListener('mousemove', e => {
       if (selection.mode) return;
@@ -702,8 +631,8 @@
     });
     window.addEventListener('mouseup', e => {
       if (selection.mode) return;
-      viewport.onPointerUp(e, e.clientX, e.clientY);
-      el.style.cursor = (diffMgr && diffMgr.active) ? 'crosshair' : 'grab';
+      viewport.onPointerUp(e);
+      el.style.cursor = 'grab';
       draw();
     });
     el.addEventListener('touchstart', e => {
@@ -719,7 +648,7 @@
     }, {passive:false});
     el.addEventListener('touchend', e => {
       if (selection.mode) return;
-      viewport.onPointerUp(e, e.changedTouches[0]?.clientX, e.changedTouches[0]?.clientY);
+      viewport.onPointerUp(e);
       draw();
     });
     el.addEventListener('wheel', e => {
@@ -729,32 +658,28 @@
       draw();
     }, {passive:false});
 
-    // Selection canvas events
+    // Selection canvas: pointerEvents gating handles mode checks.
     selCanvas.addEventListener('mousedown', e => {
-      if (!selection.mode) return;
       e.preventDefault();
       selection.dragStart(e.clientX, e.clientY);
       selection.draw();
     });
     selCanvas.addEventListener('mousemove', e => {
-      if (!selection.mode) return;
       selection.dragMove(e.clientX, e.clientY);
     });
-    selCanvas.addEventListener('mouseup', () => { if (selection.mode) selection.dragEnd(); });
+    selCanvas.addEventListener('mouseup', () => selection.dragEnd());
     selCanvas.addEventListener('touchstart', e => {
-      if (!selection.mode) return;
       e.preventDefault();
       const t = e.touches[0];
       selection.dragStart(t.clientX, t.clientY);
       selection.draw();
     }, {passive:false});
     selCanvas.addEventListener('touchmove', e => {
-      if (!selection.mode) return;
       e.preventDefault();
       const t = e.touches[0];
       selection.dragMove(t.clientX, t.clientY);
     }, {passive:false});
-    selCanvas.addEventListener('touchend', () => { if (selection.mode) selection.dragEnd(); });
+    selCanvas.addEventListener('touchend', () => selection.dragEnd());
   }
 
   addEvents();
@@ -784,18 +709,7 @@
 
   dlToggle.addEventListener('click', () => {
     selection.toggle(!selection.mode);
-    if (selection.mode) {
-      dlToggle.textContent = 'done';
-      selCanvas.style.pointerEvents = 'auto';
-      diffBtn.style.display = 'none';
-    } else {
-      dlToggle.textContent = 'select area';
-      selCanvas.style.pointerEvents = 'none';
-      selection.clear();
-      dlPng.style.display = dlOverlay.style.display = 'none';
-      coordsDiv.style.display = 'none';
-      diffBtn.style.display = '';
-    }
+    dlToggle.textContent = selection.mode ? 'done' : 'select area';
   });
 
   dlPng.addEventListener('click', () => {
@@ -810,8 +724,7 @@
     const data = selection.getCroppedData(currentImage);
     if (!data) return;
     const bounds = cropToBounds(data.x, data.y, data.w, data.h);
-    const m = (filterCtrl.currentName()||'').match(/(\d{8}_\d{6})/);
-    const ts = m ? m[0] : Date.now();
+    const ts = parseTimestamp(filterCtrl.currentName() || '')?.epoch ?? Date.now();
     const overlay = {
       id: `${dataset}_custom_${ts}`, schemaVersion:"1", name:`custom_${ts}.png`,
       opacity:1, image:{dataUrl:data.dataUrl, width:data.w, height:data.h},
@@ -834,52 +747,52 @@
   });
 
   interval.addEventListener('change', () => {
-    if (diffMgr && diffMgr.active) return;
     filterCtrl.setInterval(parseInt(interval.value));
+    filterCtrl.rebuild();
   });
 
-  // Date/time pickers (populated after fetch)
+  // Date/time pickers. Returns the initial anchor (or null), does NOT trigger a load.
   function setupDateTimePickers(snaps) {
     const byDate = new Map();
     for (const f of snaps) {
-      const m = f.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
-      if (!m) continue;
-      const dateKey = `${m[1]}-${m[2]}-${m[3]}`;
-      const timeStr = `${m[4]}:${m[5]}:${m[6]}`;
-      if (!byDate.has(dateKey)) byDate.set(dateKey, []);
-      byDate.get(dateKey).push({name:f, time:timeStr});
+      const ts = parseTimestamp(f);
+      if (!ts) continue;
+      if (!byDate.has(ts.date)) byDate.set(ts.date, []);
+      byDate.get(ts.date).push({ name: f, time: ts.time });
     }
-    for (const arr of byDate.values()) arr.sort((a,b)=>a.time.localeCompare(b.time));
+    for (const arr of byDate.values()) arr.sort((a, b) => a.time.localeCompare(b.time));
     const dates = Array.from(byDate.keys()).sort();
     if (dates.length) {
-      datePick.min = dates[0]; datePick.max = dates[dates.length-1];
-      datePick.value = dates[dates.length-1];
+      datePick.min = dates[0];
+      datePick.max = dates[dates.length - 1];
+      datePick.value = dates[dates.length - 1];
     }
     function populateTime(dateVal) {
-      const snaps = byDate.get(dateVal);
-      if (!snaps || snaps.length===0) { timeSel.style.display='none'; return; }
+      const arr = byDate.get(dateVal);
+      if (!arr || arr.length === 0) { timeSel.style.display = 'none'; return; }
       timeSel.style.display = 'inline-block';
       timeSel.innerHTML = '<option value="">Select time...</option>';
-      snaps.forEach(s => { const o = document.createElement('option'); o.value=s.name; o.text=s.time; timeSel.appendChild(o); });
+      arr.forEach(s => {
+        const o = document.createElement('option');
+        o.value = s.name;
+        o.text = s.time;
+        timeSel.appendChild(o);
+      });
     }
     if (datePick.value) {
       populateTime(datePick.value);
-      const snaps = byDate.get(datePick.value);
-      if (snaps && snaps.length) {
-        timeSel.value = snaps[snaps.length-1].name;
-        filterCtrl.rebuildWithAnchor(snaps[snaps.length-1].name);
-      }
+      const arr = byDate.get(datePick.value);
+      if (arr && arr.length) timeSel.value = arr[arr.length - 1].name;
     }
     datePick.addEventListener('change', () => {
-      if (diffMgr && diffMgr.active) return;
       populateTime(datePick.value);
       timeSel.value = '';
     });
     timeSel.addEventListener('change', () => {
-      if (diffMgr && diffMgr.active) return;
       const name = timeSel.value;
-      if (name) filterCtrl.rebuildWithAnchor(name);
+      if (name) filterCtrl.rebuild(name);
     });
+    return timeSel.value || null;
   }
 
   slider.addEventListener('input', () => filterCtrl.load(parseInt(slider.value)));
@@ -906,21 +819,12 @@
       filterCtrl.all = files;
 
       if (urlSnap && files.includes(urlSnap)) {
-        // Load the exact snapshot from the URL
-        filterCtrl.rebuildWithAnchor(urlSnap);
+        filterCtrl.rebuild(urlSnap);
       } else {
-        // Normal startup
+        const anchor = setupDateTimePickers(files);
         filterCtrl.setInterval(parseInt(interval.value));
-        setupDateTimePickers(files);
-        if (filterCtrl.currentIndex === -1) {
-          filterCtrl._rebuild(); // fallback
-        }
+        filterCtrl.rebuild(anchor);
       }
-      return fetch(BASE_URL + 'diffs.json').then(r => r.json()).catch(() => ({}));
-    })
-    .then(diffs => {
-      diffMgr = new DiffManager(diffs, filterCtrl, viewport);
-      // diff button listener is already attached above – it just checks diffMgr
     })
     .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e); });
 })();
