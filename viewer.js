@@ -578,7 +578,7 @@
     currentImage.src = BASE_URL + name;
   };
 
-  currentImage.onload = () => {
+currentImage.onload = () => {
     const prevRanges = current.ranges;
     const hadImage   = initialLoadDone;
 
@@ -586,27 +586,41 @@
     current.h = currentImage.naturalHeight;
     current.ranges = rangesForSize(current.w, current.h);
 
-    // If this is a snapshot switch and the origin tile moved (e.g. legacy
-    // 7000x6000 at col 1225 vs. new 8000x7000 at col 1224), shift the viewport
-    // so the geographic position on screen stays put.
-    if (hadImage && (prevRanges.col !== current.ranges.col || prevRanges.row !== current.ranges.row)) {
-      const dx = (current.ranges.col - prevRanges.col) * TILE;
-      const dy = (current.ranges.row - prevRanges.row) * TILE;
-      viewport.offX += dx * viewport.scale;
-      viewport.offY += dy * viewport.scale;
+    const originChanged = hadImage && (
+        prevRanges.col !== current.ranges.col ||
+        prevRanges.row !== current.ranges.row
+    );
+
+    console.log('[onload]', {
+        hadImage,
+        size:   `${current.w}x${current.h}`,
+        prev:   `${prevRanges.col},${prevRanges.row}`,
+        next:   `${current.ranges.col},${current.ranges.row}`,
+        originChanged,
+        offX_before: viewport.offX,
+        offY_before: viewport.offY,
+        scale: viewport.scale,
+    });
+
+    if (originChanged) {
+        const dx = (current.ranges.col - prevRanges.col) * TILE;
+        const dy = (current.ranges.row - prevRanges.row) * TILE;
+        viewport.offX += dx * viewport.scale;
+        viewport.offY += dy * viewport.scale;
+        console.log('[onload] shifted', { dx, dy, offX_after: viewport.offX, offY_after: viewport.offY });
     }
 
     renderer.setImage(currentImage);
     if (!initialLoadDone) {
-      if (pendingSavedViewport) {
-        viewport.offX = pendingSavedViewport.x;
-        viewport.offY = pendingSavedViewport.y;
-        viewport.scale = pendingSavedViewport.zoom;
-        pendingSavedViewport = null;
-      } else {
-        viewport.reset(currentImage);
-      }
-      initialLoadDone = true;
+        if (pendingSavedViewport) {
+            viewport.offX = pendingSavedViewport.x;
+            viewport.offY = pendingSavedViewport.y;
+            viewport.scale = pendingSavedViewport.zoom;
+            pendingSavedViewport = null;
+        } else {
+            viewport.reset(currentImage);
+        }
+        initialLoadDone = true;
     }
     draw();
   };
