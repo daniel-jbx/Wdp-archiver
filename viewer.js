@@ -14,10 +14,6 @@
   const coordsDiv = document.getElementById('coords-display');
   const selCtx    = selCanvas.getContext('2d');
 
-  // Transitional: hide the diff button until index.html drops it.
-  const _diffBtnEl = document.getElementById('diff-btn');
-  if (_diffBtnEl) _diffBtnEl.style.display = 'none';
-
   // Copy link button (after dlOverlay)
   const copyLinkBtn = document.createElement('button');
   copyLinkBtn.id = 'dl-copy-link';
