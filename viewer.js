@@ -879,7 +879,6 @@
         filterCtrl.rebuild(anchor);
       }
     })
-    .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e);
-  });
+    .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e); });
 
 })();
