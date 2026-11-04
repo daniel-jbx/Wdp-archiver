@@ -108,6 +108,10 @@
     constructor() {
       this.baseCache = new Map();
       this.diffCache = new Map();
+      this.palette = null;
+    }
+    setPalette(p) {
+      this.palette = p;
     }
     registerBase(baseTime, imgPromise) {
       this.baseCache.set(baseTime, imgPromise);
@@ -133,9 +137,26 @@
       c.height = baseImg.naturalHeight;
       const ctx = c.getContext('2d');
       ctx.drawImage(baseImg, 0, 0);
-      for (const [x, y, color] of diff.changes) {
-        ctx.fillStyle = color;
-        ctx.fillRect(x, y, 1, 1);
+      const fmt = diff.format || entry.format || 'v1';
+      if (fmt === 'v3-rle') {
+        for (const [y, x0, runs] of diff.rows) {
+          let x = x0;
+          for (const [idx, len] of runs) {
+            ctx.fillStyle = this.palette[idx];
+            ctx.fillRect(x, y, len, 1);
+            x += len;
+          }
+        }
+      } else if (fmt === 'v2-flat') {
+        for (const [x, y, idx] of diff.changes) {
+          ctx.fillStyle = this.palette[idx];
+          ctx.fillRect(x, y, 1, 1);
+        }
+      } else {
+        for (const [x, y, color] of diff.changes) {
+          ctx.fillStyle = color;
+          ctx.fillRect(x, y, 1, 1);
+        }
       }
       return c;
     }
@@ -836,7 +857,17 @@
   }
 
   loadManifest()
-    .then(entries => {
+    .then(entries => Promise.all([
+      Promise.resolve(entries),
+      fetch(BASE_URL + 'palette.json').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]))
+    .then(([entries, palette]) => {
+      if (palette) {
+        compositor.setPalette(palette);
+        console.log(`[palette] ${palette.length} colors loaded`);
+      } else {
+        console.log('[palette] not found; v2/v3 diffs will fail to render');
+      }
       if (!entries.length) { tsLabel.textContent = 'No snapshots.'; return; }
       filterCtrl.all = entries;
       const urlEntry = urlSnap ? entries.find(e => e.name === urlSnap) : null;
@@ -848,5 +879,5 @@
         filterCtrl.rebuild(anchor);
       }
     })
-    .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e); });
-})();
+    .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e);
+});
