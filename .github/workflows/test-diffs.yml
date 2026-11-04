@@ -1,0 +1,72 @@
+name: Test diff conversion
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'UTC date to process (YYYYMMDD, e.g. 20251101)'
+        required: true
+        default: '20251101'
+
+permissions:
+  contents: write
+
+jobs:
+  build-diffs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install pillow numpy
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download snapshots
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p day
+          rclone copy ":s3:${R2_BUCKET}" day/ \
+            --include "wdpsnapshot_${{ inputs.date }}_*.png" \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${R2_ENDPOINT}" \
+            --s3-access-key-id="${R2_ACCESS_KEY_ID}" \
+            --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
+            --s3-no-check-bucket
+          echo "Downloaded:"
+          ls -lh day | head -30
+
+      - name: Convert to diffs
+        run: |
+          python3 make-diffs.py --input day --output publish
+          echo
+          echo "Generated:"
+          ls -lh publish | head -30
+
+      - name: Add viewer files
+        run: |
+          if [ -f viewer.html ]; then cp viewer.html publish/index.html
+          elif [ -f index.html ]; then cp index.html publish/index.html
+          fi
+          cp viewer.js publish/viewer.js
+          cp viewer.css publish/viewer.css
+
+      - name: Publish to pages/test-diffs
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_branch: pages
+          publish_dir: ./publish
+          destination_dir: test-diffs
+          keep_files: true
+          commit_message: "test diffs for ${{ inputs.date }}"
