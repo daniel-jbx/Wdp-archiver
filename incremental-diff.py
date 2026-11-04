@@ -44,11 +44,12 @@ def ensure_palette(env, sample_png, tmp):
     local = tmp / 'palette.json'
     try:
         download(env, 'palette.json', str(local))
+    except subprocess.CalledProcessError:
+        pass
+    if local.exists():
         palette = json.load(open(local))
         print(f"Palette: loaded {len(palette)} colors from R2")
         return palette
-    except subprocess.CalledProcessError:
-        pass
     arr = load_rgb(sample_png)
     unique = np.unique(arr.reshape(-1, 3), axis=0)
     palette = ['#%02x%02x%02x' % tuple(int(v) for v in c) for c in unique]
@@ -169,9 +170,9 @@ def main():
         timeline_path = tmp / 'timeline.json'
         try:
             download(env, 'timeline.json', str(timeline_path))
-            timeline = json.load(open(timeline_path))
-            print(f"Loaded timeline: {len(timeline)} entries")
         except subprocess.CalledProcessError:
+            pass
+        if not timeline_path.exists():
             print("No existing timeline.json; initializing with this snapshot as base.")
             upload(env, str(snap_path), snap_name)
             timeline = [{"time": new_time, "kind": "png", "src": snap_name,
@@ -179,6 +180,8 @@ def main():
             save_timeline(env, tmp, timeline)
             print("Done (first entry).")
             return
+        timeline = json.load(open(timeline_path))
+        print(f"Loaded timeline: {len(timeline)} entries")
 
         if not timeline:
             print("ERROR: timeline.json is empty", file=sys.stderr)
@@ -242,7 +245,7 @@ def main():
                 "time": new_time, "kind": "diff",
                 "format": last.get('format', 'v1'),
                 "base": base_entry['time'], "src": last['src'],
-                "name": new_time, "bytes": 0,  # reuse counts as 0 incremental bytes
+                "name": new_time, "bytes": 0,
             })
             save_timeline(env, tmp, timeline)
             print(f"Done (reused). Timeline: {len(timeline)} entries.")
@@ -260,13 +263,11 @@ def main():
               f"(PNG size {png_size/1024/1024:.2f} MB, "
               f"threshold {CUMULATIVE_MULTIPLIER:.1f}x)")
 
-        single_exceeded    = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
-        cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER  * png_size
+        single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
+        cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
 
-        # Activity gate: if chain is settled (< ACTIVITY_FRACTION of changes/cycle),
-        # defer promote even if cumulative threshold is hit.
         if activity is None:
-            churning = True  # no prev diff available; be safe and behave as before
+            churning = True
         else:
             churning = activity > len(changes) * ACTIVITY_FRACTION
 
