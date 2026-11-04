@@ -112,6 +112,9 @@
     registerBase(baseTime, imgPromise) {
       this.baseCache.set(baseTime, imgPromise);
     }
+    hasBase(baseTime) {
+      return this.baseCache.has(baseTime);
+    }
     getDiff(src) {
       if (this.diffCache.has(src)) return this.diffCache.get(src);
       const p = fetch(BASE_URL + src).then(r => {
@@ -559,6 +562,17 @@
         compositor.registerBase(entry.time, p);
         source = await p;
       } else if (entry.kind === 'diff') {
+        // Ensure the base PNG for this diff has been loaded.
+        if (!compositor.hasBase(entry.base)) {
+          const baseEntry = filterCtrl.all.find(
+            e => e.kind === 'png' && e.time === entry.base
+          );
+          if (!baseEntry) {
+            throw new Error('base entry missing from manifest: ' + entry.base);
+          }
+          const p = loadImage(BASE_URL + baseEntry.src);
+          compositor.registerBase(baseEntry.time, p);
+        }
         source = await compositor.compose(entry);
       } else {
         source = await loadImage(BASE_URL + entry.name);
