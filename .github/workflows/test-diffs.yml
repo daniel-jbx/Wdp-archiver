@@ -44,14 +44,17 @@ jobs:
             --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
             --s3-no-check-bucket
           echo "Downloaded:"
-          ls -lh day | head -30
+          ls -lh day | head -30 || true
+          echo "PNG count: $(find day -name '*.png' | wc -l)"
 
       - name: Convert to diffs
         run: |
           python3 make-diffs.py --input day --output publish
           echo
           echo "Generated:"
-          ls -lh publish | head -30
+          ls -lh publish | head -30 || true
+          echo "PNG count: $(find publish -name '*.png' | wc -l)"
+          echo "Diff count: $(find publish -name '*.json' ! -name 'timeline.json' | wc -l)"
 
       - name: Add viewer files
         run: |
@@ -60,13 +63,36 @@ jobs:
           fi
           cp viewer.js publish/viewer.js
           cp viewer.css publish/viewer.css
+          echo "Publish folder contents:"
+          ls -lh publish || true
+          echo "Final PNG count in publish: $(find publish -name '*.png' | wc -l)"
 
       - name: Publish to pages/test-diffs
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_branch: pages
-          publish_dir: ./publish
-          destination_dir: test-diffs
-          keep_files: true
-          commit_message: "test diffs for ${{ inputs.date }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          git clone --depth=1 --branch=pages \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            pages-repo
+          cd pages-repo
+
+          rm -rf test-diffs
+          mkdir -p test-diffs
+          cp -r ../publish/* test-diffs/
+
+          echo "PNG count in publish: $(find ../publish -name '*.png' | wc -l)"
+          echo "PNG count in test-diffs: $(find test-diffs -name '*.png' | wc -l)"
+          if [ "$(find test-diffs -name '*.png' | wc -l)" -eq 0 ]; then
+            echo "ERROR: no PNG files copied into test-diffs — aborting."
+            ls -la test-diffs
+            exit 1
+          fi
+
+          touch test-diffs/.nojekyll
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add test-diffs
+          git commit -m "test diffs for ${{ inputs.date }}" || echo "nothing to commit"
+          git push origin pages
