@@ -58,8 +58,11 @@ def main():
     timeline = []
     base_time = None
     base_arr = None
+    prev_arr = None
+    prev_entry = None
     total_original = 0
     total_new = 0
+    reused_count = 0
 
     for idx, png_path in enumerate(pngs):
         t = parse_ts(png_path.name)
@@ -73,6 +76,8 @@ def main():
             base_arr = load_rgb(png_path)
             base_time = t
             timeline.append({"time": t, "kind": "png", "src": png_path.name, "name": t})
+            prev_arr = base_arr
+            prev_entry = timeline[-1]
             total_new += orig_size
             print(f"{t}: base png ({orig_size/1024/1024:.2f} MB)")
             continue
@@ -84,7 +89,30 @@ def main():
             base_arr = new_arr
             base_time = t
             timeline.append({"time": t, "kind": "png", "src": png_path.name, "name": t})
+            prev_arr = new_arr
+            prev_entry = timeline[-1]
             total_new += orig_size
+            print(f"{t}: size change → base png")
+            continue
+
+        # Dedupe: if this snapshot is pixel-identical to the previous one and
+        # the previous entry was a diff, reuse that diff file instead of
+        # writing a byte-identical copy.
+        if (prev_arr is not None
+                and prev_entry is not None
+                and prev_entry["kind"] == "diff"
+                and np.array_equal(new_arr, prev_arr)):
+            timeline.append({
+                "time": t,
+                "kind": "diff",
+                "base": base_time,
+                "src":  prev_entry["src"],
+                "name": t,
+            })
+            prev_arr = new_arr
+            prev_entry = timeline[-1]
+            reused_count += 1
+            print(f"{t}: unchanged → reuse {prev_entry['src']}")
             continue
 
         changes = compute_changes(base_arr, new_arr)
@@ -98,12 +126,16 @@ def main():
             base_arr = new_arr
             base_time = t
             timeline.append({"time": t, "kind": "png", "src": png_path.name, "name": t})
+            prev_arr = new_arr
+            prev_entry = timeline[-1]
             total_new += orig_size
             print(f"{t}: promote → png ({len(changes):,} changes)")
         else:
             diff_name = f"wdpdiff_{t}.json"
             (out_dir / diff_name).write_bytes(payload)
             timeline.append({"time": t, "kind": "diff", "base": base_time, "src": diff_name, "name": t})
+            prev_arr = new_arr
+            prev_entry = timeline[-1]
             total_new += len(payload)
             print(f"{t}: diff {len(changes):,} changes → {len(payload)/1024:.1f} KB")
 
@@ -114,7 +146,7 @@ def main():
     print(f"  Original: {total_original/1024/1024:.2f} MB ({len(pngs)} PNGs)")
     npng = sum(1 for e in timeline if e['kind'] == 'png')
     ndiff = sum(1 for e in timeline if e['kind'] == 'diff')
-    print(f"  New:      {total_new/1024/1024:.2f} MB ({npng} PNGs + {ndiff} diffs)")
+    print(f"  New:      {total_new/1024/1024:.2f} MB ({npng} PNGs + {ndiff} diffs, {reused_count} reused)")
     if total_original:
         print(f"  Savings:  {(1 - total_new/total_original)*100:.1f}%")
 
