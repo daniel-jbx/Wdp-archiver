@@ -1,8 +1,8 @@
 name: R2 Tiered Sparsen (Daily)
 
 on:
-  schedule:
-    - cron: '0 2 * * *'   # daily at 02:00 UTC
+#  schedule:
+#    - cron: '0 2 * * *'   # daily at 02:00 UTC
   workflow_dispatch:       # also manual trigger
 
 permissions:
