@@ -1,0 +1,57 @@
+name: Verify palette stability
+
+on:
+  workflow_dispatch:
+    inputs:
+      snap1:
+        description: 'First snapshot filename on R2'
+        required: true
+        default: 'wdpsnapshot_20261101_000119.png'
+      snap2:
+        description: 'Second snapshot filename on R2'
+        required: true
+        default: 'wdpsnapshot_20261101_150128.png'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python3 -m pip install --quiet pillow numpy
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download snapshots
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/${{ inputs.snap1 }}" snap1.png \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${R2_ENDPOINT}" \
+            --s3-access-key-id="${R2_ACCESS_KEY_ID}" \
+            --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
+            --s3-no-check-bucket
+          rclone copyto ":s3:${R2_BUCKET}/${{ inputs.snap2 }}" snap2.png \
+            --s3-provider="Cloudflare" \
+            --s3-endpoint="${R2_ENDPOINT}" \
+            --s3-access-key-id="${R2_ACCESS_KEY_ID}" \
+            --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
+            --s3-no-check-bucket
+          ls -lh snap1.png snap2.png
+
+      - name: Run verification
+        run: python3 verify-palette.py snap1.png snap2.png
