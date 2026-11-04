@@ -880,4 +880,7 @@
       }
     })
     .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e);
-});
+  });
+
+})();
+ 
