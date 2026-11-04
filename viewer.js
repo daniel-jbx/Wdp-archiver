@@ -1,5 +1,4 @@
 (function() {
-  // ── DOM refs ───────────────────────────────────────────────
   const canvas    = document.getElementById('canvas');
   const selCanvas = document.getElementById('sel-canvas');
   const slider    = document.getElementById('slider');
@@ -14,16 +13,25 @@
   const coordsDiv = document.getElementById('coords-display');
   const selCtx    = selCanvas.getContext('2d');
 
-  // Copy link button (after dlOverlay)
+  const _diffBtnEl = document.getElementById('diff-btn');
+  if (_diffBtnEl) _diffBtnEl.style.display = 'none';
+
   const copyLinkBtn = document.createElement('button');
   copyLinkBtn.id = 'dl-copy-link';
   copyLinkBtn.className = 'dl-btn';
   copyLinkBtn.textContent = 'copy link';
   dlPng.parentNode.insertBefore(copyLinkBtn, dlOverlay);
 
-  // ── Dataset & constants ────────────────────────────────────
+  const urlParams = new URLSearchParams(window.location.search);
+  const urlSnap   = urlParams.get('snap');
+  const urlX      = parseFloat(urlParams.get('x'));
+  const urlY      = parseFloat(urlParams.get('y'));
+  const urlZoom   = parseFloat(urlParams.get('zoom'));
+  const urlBase   = urlParams.get('base');
+
   const dataset  = location.pathname.includes('/antarktika/') ? 'antarktika' : 'wdp';
-  const BASE_URL = `https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/${dataset === 'wdp' ? '' : 'antarktika/'}`;
+  const DEFAULT_BASE = `https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/${dataset === 'wdp' ? '' : 'antarktika/'}`;
+  const BASE_URL = urlBase || DEFAULT_BASE;
   const ZOOM = 11, TILE = 1000, WORLD = Math.pow(2, ZOOM) * TILE;
 
   const ranges = {
@@ -45,25 +53,17 @@
     return SIZE_TO_RANGES[`${w}x${h}`] || ranges;
   }
 
-  // Per-image geometry — updated whenever a snapshot finishes loading.
   const current = {
     w: ranges.cols * TILE,
     h: ranges.rows * TILE,
     ranges: ranges,
   };
 
-  // URL state for sharable links
-  const urlParams = new URLSearchParams(window.location.search);
-  const urlSnap   = urlParams.get('snap');
-  const urlX      = parseFloat(urlParams.get('x'));
-  const urlY      = parseFloat(urlParams.get('y'));
-  const urlZoom   = parseFloat(urlParams.get('zoom'));
   let pendingSavedViewport = null;
   if (!isNaN(urlX) && !isNaN(urlY) && !isNaN(urlZoom)) {
     pendingSavedViewport = { x: urlX, y: urlY, zoom: urlZoom };
   }
 
-  // ── Helpers ────────────────────────────────────────────────
   function parseTimestamp(name) {
     const m = name.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/);
     if (!m) return null;
@@ -74,6 +74,16 @@
     };
   }
   function epochFromName(name) { return parseTimestamp(name)?.epoch ?? 0; }
+
+  function loadImage(url) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.crossOrigin = 'anonymous';
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error('image failed: ' + url));
+      img.src = url;
+    });
+  }
 
   function pixelToLatLon(px, py) {
     const gx = current.ranges.col * TILE + px;
@@ -94,53 +104,69 @@
     }
   }
 
-  // ── Renderer (WebGL) ───────────────────────────────────────
+  class Compositor {
+    constructor() {
+      this.baseCache = new Map();
+      this.diffCache = new Map();
+    }
+    registerBase(baseTime, imgPromise) {
+      this.baseCache.set(baseTime, imgPromise);
+    }
+    hasBase(baseTime) {
+      return this.baseCache.has(baseTime);
+    }
+    getDiff(src) {
+      if (this.diffCache.has(src)) return this.diffCache.get(src);
+      const p = fetch(BASE_URL + src).then(r => {
+        if (!r.ok) throw new Error('diff failed: ' + src);
+        return r.json();
+      });
+      this.diffCache.set(src, p);
+      return p;
+    }
+    async compose(entry) {
+      const basePromise = this.baseCache.get(entry.base);
+      if (!basePromise) throw new Error('base not loaded: ' + entry.base);
+      const [baseImg, diff] = await Promise.all([basePromise, this.getDiff(entry.src)]);
+      const c = document.createElement('canvas');
+      c.width = baseImg.naturalWidth;
+      c.height = baseImg.naturalHeight;
+      const ctx = c.getContext('2d');
+      ctx.drawImage(baseImg, 0, 0);
+      for (const [x, y, color] of diff.changes) {
+        ctx.fillStyle = color;
+        ctx.fillRect(x, y, 1, 1);
+      }
+      return c;
+    }
+  }
+
   class Renderer {
     constructor(canvas) {
       this.gl = canvas.getContext('webgl', { antialias: false }) ||
                 canvas.getContext('experimental-webgl', { antialias: false });
       if (!this.gl) { document.body.innerHTML = 'WebGL not supported'; return; }
       const gl = this.gl;
-
       const vs = gl.createShader(gl.VERTEX_SHADER);
-      gl.shaderSource(vs,
-        'attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;uniform mat3 u_matrix;void main(){vec3 p=u_matrix*vec3(a_position,1.0);gl_Position=vec4(p.xy,0.0,1.0);v_texCoord=a_texCoord;}');
+      gl.shaderSource(vs, 'attribute vec2 a_position;attribute vec2 a_texCoord;varying vec2 v_texCoord;uniform mat3 u_matrix;void main(){vec3 p=u_matrix*vec3(a_position,1.0);gl_Position=vec4(p.xy,0.0,1.0);v_texCoord=a_texCoord;}');
       gl.compileShader(vs);
-      if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) {
-        console.error('Vertex shader error:', gl.getShaderInfoLog(vs));
-        document.body.innerHTML = 'Vertex shader failed';
-        return;
-      }
-
+      if (!gl.getShaderParameter(vs, gl.COMPILE_STATUS)) { document.body.innerHTML = 'Vertex shader failed'; return; }
       const fs = gl.createShader(gl.FRAGMENT_SHADER);
-      gl.shaderSource(fs,
-        'precision mediump float;varying vec2 v_texCoord;uniform sampler2D u_texture;void main(){gl_FragColor=texture2D(u_texture,v_texCoord);}');
+      gl.shaderSource(fs, 'precision mediump float;varying vec2 v_texCoord;uniform sampler2D u_texture;void main(){gl_FragColor=texture2D(u_texture,v_texCoord);}');
       gl.compileShader(fs);
-      if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) {
-        console.error('Fragment shader error:', gl.getShaderInfoLog(fs));
-        document.body.innerHTML = 'Fragment shader failed';
-        return;
-      }
-
+      if (!gl.getShaderParameter(fs, gl.COMPILE_STATUS)) { document.body.innerHTML = 'Fragment shader failed'; return; }
       const program = gl.createProgram();
       gl.attachShader(program, vs);
       gl.attachShader(program, fs);
       gl.linkProgram(program);
-      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-        console.error('Program link error:', gl.getProgramInfoLog(program));
-        document.body.innerHTML = 'Shader link failed';
-        return;
-      }
-
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) { document.body.innerHTML = 'Shader link failed'; return; }
       this.program = program;
       gl.enable(gl.BLEND);
       gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-
       this.aPos = gl.getAttribLocation(program, 'a_position');
       this.aTex = gl.getAttribLocation(program, 'a_texCoord');
       this.uMatrix = gl.getUniformLocation(program, 'u_matrix');
       this.uTex = gl.getUniformLocation(program, 'u_texture');
-
       this.quadBuf = gl.createBuffer();
       gl.bindBuffer(gl.ARRAY_BUFFER, this.quadBuf);
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0,0,0,0, 1,0,1,0, 0,1,0,1, 1,0,1,0, 0,1,0,1, 1,1,1,1]), gl.STATIC_DRAW);
@@ -148,16 +174,16 @@
       gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 16, 0);
       gl.enableVertexAttribArray(this.aTex);
       gl.vertexAttribPointer(this.aTex, 2, gl.FLOAT, false, 16, 8);
-
       this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
       this.tiles = [];
       this.single = null;
     }
-
     setImage(img) {
       const gl = this.gl;
       this._cleanup();
-      if (img.width <= this.maxTex && img.height <= this.maxTex) {
+      const w = img.width || img.naturalWidth;
+      const h = img.height || img.naturalHeight;
+      if (w <= this.maxTex && h <= this.maxTex) {
         const tex = gl.createTexture();
         gl.bindTexture(gl.TEXTURE_2D, tex);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -165,20 +191,17 @@
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
         gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
         gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-        if (gl.getError() === gl.NO_ERROR) {
-          this.single = { tex, w:img.width, h:img.height };
-          return;
-        }
+        if (gl.getError() === gl.NO_ERROR) { this.single = { tex, w, h }; return; }
         gl.deleteTexture(tex);
       }
       const tileSize = Math.min(this.maxTex, 2048);
       const off = document.createElement('canvas');
       const ctx = off.getContext('2d');
-      for (let y=0; y<img.height; y+=tileSize) {
-        for (let x=0; x<img.width; x+=tileSize) {
-          const w = Math.min(tileSize, img.width-x), h = Math.min(tileSize, img.height-y);
-          off.width = w; off.height = h;
-          ctx.drawImage(img, x, y, w, h, 0, 0, w, h);
+      for (let y=0; y<h; y+=tileSize) {
+        for (let x=0; x<w; x+=tileSize) {
+          const tw = Math.min(tileSize, w-x), th = Math.min(tileSize, h-y);
+          off.width = tw; off.height = th;
+          ctx.drawImage(img, x, y, tw, th, 0, 0, tw, th);
           const tex = gl.createTexture();
           gl.bindTexture(gl.TEXTURE_2D, tex);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
@@ -186,17 +209,15 @@
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
           gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
           gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, off);
-          if (gl.getError() === gl.NO_ERROR) this.tiles.push({ tex, x, y, w, h });
+          if (gl.getError() === gl.NO_ERROR) this.tiles.push({ tex, x, y, w: tw, h: th });
         }
       }
     }
-
     _cleanup() {
       this.tiles.forEach(t => this.gl.deleteTexture(t.tex));
       if (this.single) this.gl.deleteTexture(this.single.tex);
       this.tiles = []; this.single = null;
     }
-
     draw(offX, offY, scale, cssW, cssH) {
       const gl = this.gl;
       gl.useProgram(this.program);
@@ -231,7 +252,6 @@
     }
   }
 
-  // ── Viewport (pan/zoom) ────────────────────────────────────
   class Viewport {
     constructor(w, h) {
       this.w = w; this.h = h;
@@ -241,32 +261,25 @@
       this.dragOffX = 0; this.dragOffY = 0;
       this.pinching = false; this.pinchDist = 0; this.pinchScale = 1;
       this.pinchCx = 0; this.pinchCy = 0;
-      this.onTapLeft  = null;
-      this.onTapRight = null;
+      this.onTapLeft = null; this.onTapRight = null;
     }
-
     reset(img) {
-      this.scale = Math.min(this.w / img.width, this.h / img.height);
-      this.offX = (this.w - img.width * this.scale) / 2;
-      this.offY = (this.h - img.height * this.scale) / 2;
+      const w = img.width || img.naturalWidth;
+      const h = img.height || img.naturalHeight;
+      this.scale = Math.min(this.w / w, this.h / h);
+      this.offX = (this.w - w * this.scale) / 2;
+      this.offY = (this.h - h * this.scale) / 2;
     }
-
     clientToImg(cx, cy) {
-      return {
-        x: Math.round((cx - this.offX) / this.scale),
-        y: Math.round((cy - this.offY) / this.scale)
-      };
+      return { x: Math.round((cx - this.offX) / this.scale), y: Math.round((cy - this.offY) / this.scale) };
     }
     imgToClient(ix, iy) {
       return { x: ix * this.scale + this.offX, y: iy * this.scale + this.offY };
     }
-
     updateSize(w, h) { this.w = w; this.h = h; }
-
     onPointerDown(e, clientX, clientY) {
       if (e.touches && e.touches.length === 2) {
-        this.dragging = false;
-        this.pinching = true;
+        this.dragging = false; this.pinching = true;
         const dx = e.touches[1].clientX - clientX, dy = e.touches[1].clientY - clientY;
         this.pinchDist = Math.hypot(dx, dy);
         this.pinchScale = this.scale;
@@ -280,7 +293,6 @@
         this.dragOffX = this.offX; this.dragOffY = this.offY;
       }
     }
-
     onPointerMove(e, clientX, clientY) {
       if (this.pinching && e.touches && e.touches.length === 2) {
         const t0 = e.touches[0], t1 = e.touches[1];
@@ -299,16 +311,12 @@
         return;
       }
       if (this.dragging) {
-        const dx = clientX - this.dragStartX, dy = clientY - this.dragStartY;
-        this.offX = this.dragOffX + dx;
-        this.offY = this.dragOffY + dy;
+        this.offX = this.dragOffX + (clientX - this.dragStartX);
+        this.offY = this.dragOffY + (clientY - this.dragStartY);
       }
     }
-
     onPointerUp(e) {
-      if (this.pinching && e.touches && e.touches.length < 2) {
-        this.pinching = false;
-      }
+      if (this.pinching && e.touches && e.touches.length < 2) this.pinching = false;
       if (this.dragging) {
         this.dragging = false;
         if (e.changedTouches && e.changedTouches.length === 1 && !this.pinching) {
@@ -321,11 +329,9 @@
         }
       }
     }
-
     onWheel(dy, x, y) {
-      const factor = 1.1;
       const old = this.scale;
-      this.scale = dy < 0 ? this.scale * factor : this.scale / factor;
+      this.scale = dy < 0 ? this.scale * 1.1 : this.scale / 1.1;
       this.scale = Math.max(this.minScale, Math.min(this.maxScale, this.scale));
       const sc = this.scale / old;
       this.offX = x - sc * (x - this.offX);
@@ -333,7 +339,6 @@
     }
   }
 
-  // ── Selection Manager ──────────────────────────────────────
   class SelectionManager {
     constructor(selCtx, viewport) {
       this.ctx = selCtx;
@@ -344,7 +349,6 @@
       this.HANDLE = 8;
       selCanvas.style.pointerEvents = 'none';
     }
-
     getRect() {
       if (!this.start || !this.end) return null;
       return {
@@ -354,7 +358,6 @@
         y2: Math.max(this.start.y, this.end.y)
       };
     }
-
     toggle(on) {
       this.mode = on;
       selCanvas.style.pointerEvents = on ? 'auto' : 'none';
@@ -366,9 +369,7 @@
         coordsDiv.style.display = 'none';
       }
     }
-
     clear() { this.ctx.clearRect(0, 0, this.ctx.canvas.width, this.ctx.canvas.height); }
-
     draw() {
       this.clear();
       const r = this.getRect();
@@ -393,14 +394,12 @@
       coordsDiv.style.display = 'inline-block';
       coordsDiv.textContent = `x: [${r.x1}, ${r.x2}]  y: [${r.y1}, ${r.y2}]`;
     }
-
     _clamp(p) {
       return {
         x: Math.max(0, Math.min(p.x, current.w)),
         y: Math.max(0, Math.min(p.y, current.h))
       };
     }
-
     hitHandle(clientX, clientY) {
       const r = this.getRect();
       if (!r) return null;
@@ -417,7 +416,6 @@
       if (img.x>x1 && img.x<x2 && img.y>y1 && img.y<y2) return 'move';
       return null;
     }
-
     dragStart(clientX, clientY) {
       const img = this._clamp(this.vp.clientToImg(clientX, clientY));
       if (this.start && this.end && this.getRect()) {
@@ -473,7 +471,6 @@
         }
       }
     }
-
     getCroppedData(img) {
       const r = this.getRect();
       if (!r || r.x2-r.x1 < 1 || r.y2-r.y1 < 1) return null;
@@ -485,37 +482,32 @@
     }
   }
 
-  // ── Filter / Timeline controller ──────────────────────────
   class FilterController {
-    constructor(allSnapshots) {
-      this.all = allSnapshots;
+    constructor(allEntries) {
+      this.all = allEntries;
       this.filtered = [];
       this.currentIndex = -1;
       this.intervalSec = 3600;
     }
-
-    setInterval(minutes) {
-      this.intervalSec = minutes * 60;
-    }
-
+    setInterval(minutes) { this.intervalSec = minutes * 60; }
     rebuild(anchorName = null) {
       const interval = this.intervalSec;
       if (!interval || this.all.length === 0) {
-        this.filtered = this.all.slice().sort((a, b) => epochFromName(a) - epochFromName(b));
-        this._updateSlider();
-        let idx = anchorName ? this.filtered.indexOf(anchorName) : -1;
+        this.filtered = this.all.slice().sort((a, b) => epochFromName(a.name) - epochFromName(b.name));
+        slider.max = Math.max(0, this.filtered.length - 1);
+        let idx = anchorName ? this.filtered.findIndex(e => e.name === anchorName) : -1;
         if (idx === -1) idx = this.filtered.length - 1;
         this.load(idx);
         return;
       }
       const cands = this.all
-        .map(n => ({ name: n, ep: epochFromName(n) }))
+        .map(entry => ({ entry, ep: epochFromName(entry.name) }))
         .sort((a, b) => a.ep - b.ep);
-      const anchorIdx = anchorName ? cands.findIndex(c => c.name === anchorName) : cands.length - 1;
+      const anchorIdx = anchorName ? cands.findIndex(c => c.entry.name === anchorName) : cands.length - 1;
       if (anchorIdx === -1) { this.load(0); return; }
       const anchorEp = cands[anchorIdx].ep;
       const selected = new Map();
-      selected.set(anchorEp, cands[anchorIdx].name);
+      selected.set(anchorEp, cands[anchorIdx].entry);
       const minEp = cands[0].ep, maxEp = cands[cands.length - 1].ep;
       for (let k = Math.ceil((minEp - anchorEp) / interval); k <= Math.floor((maxEp - anchorEp) / interval); k++) {
         if (k === 0) continue;
@@ -523,48 +515,36 @@
         let l = 0, r = cands.length - 1;
         while (l <= r) { const m = (l + r) >> 1; if (cands[m].ep < target) l = m + 1; else r = m - 1; }
         let best = null, bestDiff = Infinity;
-        if (l < cands.length) {
-          const d = Math.abs(cands[l].ep - target);
-          if (d < bestDiff) { bestDiff = d; best = cands[l]; }
-        }
-        if (l - 1 >= 0) {
-          const d = Math.abs(cands[l - 1].ep - target);
-          if (d < bestDiff) { bestDiff = d; best = cands[l - 1]; }
-        }
-        if (best && !selected.has(best.ep)) selected.set(best.ep, best.name);
+        if (l < cands.length) { const d = Math.abs(cands[l].ep - target); if (d < bestDiff) { bestDiff = d; best = cands[l]; } }
+        if (l - 1 >= 0) { const d = Math.abs(cands[l - 1].ep - target); if (d < bestDiff) { bestDiff = d; best = cands[l - 1]; } }
+        if (best && !selected.has(best.ep)) selected.set(best.ep, best.entry);
       }
       this.filtered = Array.from(selected.keys()).sort((a, b) => a - b).map(ep => selected.get(ep));
-      this._updateSlider();
-      let targetIdx = this.filtered.indexOf(cands[anchorIdx].name);
+      slider.max = Math.max(0, this.filtered.length - 1);
+      let targetIdx = this.filtered.findIndex(e => e.name === cands[anchorIdx].entry.name);
       if (targetIdx === -1) targetIdx = this.filtered.length - 1;
       this.load(targetIdx);
     }
-
-    _updateSlider() {
-      slider.max = Math.max(0, this.filtered.length - 1);
-    }
-
     load(idx) {
       if (idx < 0 || idx >= this.filtered.length) return;
       this.currentIndex = idx;
       slider.value = idx;
-      const name = this.filtered[idx];
-      if (!name) return;
-      const ts = parseTimestamp(name);
-      tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : name;
-      if (this.onLoadSnapshot) this.onLoadSnapshot(name);
+      const entry = this.filtered[idx];
+      if (!entry) return;
+      const ts = parseTimestamp(entry.name);
+      tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : entry.name;
+      if (this.onLoadSnapshot) this.onLoadSnapshot(entry);
     }
-
-    currentName() { return this.filtered[this.currentIndex]; }
+    currentEntry() { return this.filtered[this.currentIndex] || null; }
+    currentName() { return this.currentEntry()?.name ?? null; }
   }
 
-  // ── Application setup ────────────────────────────────────
   const renderer = new Renderer(canvas);
   const viewport = new Viewport(window.innerWidth, window.innerHeight);
   const selection = new SelectionManager(selCtx, viewport);
   const filterCtrl = new FilterController([]);
-  const currentImage = new Image();
-  currentImage.crossOrigin = 'anonymous';
+  const compositor = new Compositor();
+  let currentSource = null;
   let initialLoadDone = false;
 
   viewport.onTapLeft = () => {
@@ -574,69 +554,73 @@
     if (filterCtrl.currentIndex < filterCtrl.filtered.length - 1) filterCtrl.load(filterCtrl.currentIndex + 1);
   };
 
-  filterCtrl.onLoadSnapshot = (name) => {
-    currentImage.src = BASE_URL + name;
-  };
-
-currentImage.onload = () => {
-    const prevRanges = current.ranges;
-    const hadImage   = initialLoadDone;
-
-    current.w = currentImage.naturalWidth;
-    current.h = currentImage.naturalHeight;
-    current.ranges = rangesForSize(current.w, current.h);
-
-    const originChanged = hadImage && (
-        prevRanges.col !== current.ranges.col ||
-        prevRanges.row !== current.ranges.row
-    );
-
-    console.log('[onload]', {
-        hadImage,
-        size:   `${current.w}x${current.h}`,
-        prev:   `${prevRanges.col},${prevRanges.row}`,
-        next:   `${current.ranges.col},${current.ranges.row}`,
-        originChanged,
-        offX_before: viewport.offX,
-        offY_before: viewport.offY,
-        scale: viewport.scale,
-    });
-
-    if (originChanged) {
-        const dx = (current.ranges.col - prevRanges.col) * TILE;
-        const dy = (current.ranges.row - prevRanges.row) * TILE;
-        viewport.offX += dx * viewport.scale;
-        viewport.offY += dy * viewport.scale;
-        console.log('[onload] shifted', { dx, dy, offX_after: viewport.offX, offY_after: viewport.offY });
-    }
-
-    renderer.setImage(currentImage);
-    if (!initialLoadDone) {
-        if (pendingSavedViewport) {
-            viewport.offX = pendingSavedViewport.x;
-            viewport.offY = pendingSavedViewport.y;
-            viewport.scale = pendingSavedViewport.zoom;
-            pendingSavedViewport = null;
-        } else {
-            viewport.reset(currentImage);
+  async function onLoadSnapshot(entry) {
+    try {
+      let source;
+      if (entry.kind === 'png') {
+        const p = loadImage(BASE_URL + entry.src);
+        compositor.registerBase(entry.time, p);
+        source = await p;
+      } else if (entry.kind === 'diff') {
+        // Ensure the base PNG for this diff has been loaded.
+        if (!compositor.hasBase(entry.base)) {
+          const baseEntry = filterCtrl.all.find(
+            e => e.kind === 'png' && e.time === entry.base
+          );
+          if (!baseEntry) {
+            throw new Error('base entry missing from manifest: ' + entry.base);
+          }
+          const p = loadImage(BASE_URL + baseEntry.src);
+          compositor.registerBase(baseEntry.time, p);
         }
-        initialLoadDone = true;
+        source = await compositor.compose(entry);
+      } else {
+        source = await loadImage(BASE_URL + entry.name);
+      }
+      applySource(source);
+    } catch (e) {
+      console.error('load failed:', entry, e);
+      tsLabel.textContent = 'load failed';
+    }
+  }
+  filterCtrl.onLoadSnapshot = onLoadSnapshot;
+
+  function applySource(source) {
+    const prevRanges = current.ranges;
+    const hadImage = initialLoadDone;
+    currentSource = source;
+    current.w = source.width || source.naturalWidth;
+    current.h = source.height || source.naturalHeight;
+    current.ranges = rangesForSize(current.w, current.h);
+    if (hadImage && (prevRanges.col !== current.ranges.col || prevRanges.row !== current.ranges.row)) {
+      const dx = (current.ranges.col - prevRanges.col) * TILE;
+      const dy = (current.ranges.row - prevRanges.row) * TILE;
+      viewport.offX += dx * viewport.scale;
+      viewport.offY += dy * viewport.scale;
+    }
+    renderer.setImage(source);
+    if (!initialLoadDone) {
+      if (pendingSavedViewport) {
+        viewport.offX = pendingSavedViewport.x;
+        viewport.offY = pendingSavedViewport.y;
+        viewport.scale = pendingSavedViewport.zoom;
+        pendingSavedViewport = null;
+      } else {
+        viewport.reset(source);
+      }
+      initialLoadDone = true;
     }
     draw();
-  };
-  currentImage.onerror = () => console.error('Image failed:', currentImage.src);
+  }
 
   function draw() {
     const bg = dataset === 'antarktika' ? [0.9725,0.9569,0.9412,1] : [0.627,0.741,1.0,1];
     renderer.gl.clearColor(...bg);
     renderer.gl.clear(renderer.gl.COLOR_BUFFER_BIT);
     renderer.draw(viewport.offX, viewport.offY, viewport.scale, window.innerWidth, window.innerHeight);
-    if (!selection.mode) {
-      selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
-    }
+    if (!selection.mode) selCtx.clearRect(0, 0, selCanvas.width, selCanvas.height);
   }
 
-  // ── Event wiring ─────────────────────────────────────────
   function addEvents() {
     const el = canvas;
     el.addEventListener('mousedown', e => {
@@ -647,10 +631,7 @@ currentImage.onload = () => {
     });
     window.addEventListener('mousemove', e => {
       if (selection.mode) return;
-      if (viewport.dragging) {
-        viewport.onPointerMove(e, e.clientX, e.clientY);
-        draw();
-      }
+      if (viewport.dragging) { viewport.onPointerMove(e, e.clientX, e.clientY); draw(); }
     });
     window.addEventListener('mouseup', e => {
       if (selection.mode) return;
@@ -680,16 +661,8 @@ currentImage.onload = () => {
       viewport.onWheel(e.deltaY, e.clientX, e.clientY);
       draw();
     }, {passive:false});
-
-    // Selection canvas: pointerEvents gating handles mode checks.
-    selCanvas.addEventListener('mousedown', e => {
-      e.preventDefault();
-      selection.dragStart(e.clientX, e.clientY);
-      selection.draw();
-    });
-    selCanvas.addEventListener('mousemove', e => {
-      selection.dragMove(e.clientX, e.clientY);
-    });
+    selCanvas.addEventListener('mousedown', e => { e.preventDefault(); selection.dragStart(e.clientX, e.clientY); selection.draw(); });
+    selCanvas.addEventListener('mousemove', e => selection.dragMove(e.clientX, e.clientY));
     selCanvas.addEventListener('mouseup', () => selection.dragEnd());
     selCanvas.addEventListener('touchstart', e => {
       e.preventDefault();
@@ -704,16 +677,31 @@ currentImage.onload = () => {
     }, {passive:false});
     selCanvas.addEventListener('touchend', () => selection.dragEnd());
   }
-
   addEvents();
 
-  // Download / UI buttons
-  dlSnap.addEventListener('click', () => {
-    const name = filterCtrl.currentName();
-    if (!name) return;
-    const a = document.createElement('a');
-    a.href = BASE_URL + name; a.download = name;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  dlSnap.addEventListener('click', async () => {
+    const entry = filterCtrl.currentEntry();
+    if (!entry) return;
+    if (entry.kind === 'png' && entry.src) {
+      const a = document.createElement('a');
+      a.href = BASE_URL + entry.src; a.download = entry.src;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    } else if (entry.kind === 'diff') {
+      try {
+        const c = await compositor.compose(entry);
+        c.toBlob(blob => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = `wdpsnapshot_${entry.name}.png`;
+          document.body.appendChild(a); a.click(); document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        });
+      } catch (e) { alert('compose failed: ' + e.message); }
+    } else {
+      const a = document.createElement('a');
+      a.href = BASE_URL + entry.name; a.download = entry.name;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    }
   });
 
   copyLinkBtn.addEventListener('click', () => {
@@ -736,7 +724,8 @@ currentImage.onload = () => {
   });
 
   dlPng.addEventListener('click', () => {
-    const data = selection.getCroppedData(currentImage);
+    if (!currentSource) return;
+    const data = selection.getCroppedData(currentSource);
     if (!data) return;
     const a = document.createElement('a');
     a.href = data.dataUrl; a.download = 'selection.png';
@@ -744,7 +733,8 @@ currentImage.onload = () => {
   });
 
   dlOverlay.addEventListener('click', () => {
-    const data = selection.getCroppedData(currentImage);
+    if (!currentSource) return;
+    const data = selection.getCroppedData(currentSource);
     if (!data) return;
     const bounds = cropToBounds(data.x, data.y, data.w, data.h);
     const ts = parseTimestamp(filterCtrl.currentName() || '')?.epoch ?? Date.now();
@@ -762,11 +752,10 @@ currentImage.onload = () => {
     URL.revokeObjectURL(url);
   });
 
-  // Keyboard
   window.addEventListener('keydown', e => {
     if (e.key === 'ArrowLeft') { e.preventDefault(); if (filterCtrl.currentIndex>0) filterCtrl.load(filterCtrl.currentIndex-1); }
     else if (e.key === 'ArrowRight') { e.preventDefault(); if (filterCtrl.currentIndex<filterCtrl.filtered.length-1) filterCtrl.load(filterCtrl.currentIndex+1); }
-    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); viewport.reset(currentImage); draw(); }
+    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); if (currentSource) { viewport.reset(currentSource); draw(); } }
   });
 
   interval.addEventListener('change', () => {
@@ -774,14 +763,13 @@ currentImage.onload = () => {
     filterCtrl.rebuild();
   });
 
-  // Date/time pickers. Returns the initial anchor (or null), does NOT trigger a load.
-  function setupDateTimePickers(snaps) {
+  function setupDateTimePickers(entries) {
     const byDate = new Map();
-    for (const f of snaps) {
-      const ts = parseTimestamp(f);
+    for (const entry of entries) {
+      const ts = parseTimestamp(entry.name);
       if (!ts) continue;
       if (!byDate.has(ts.date)) byDate.set(ts.date, []);
-      byDate.get(ts.date).push({ name: f, time: ts.time });
+      byDate.get(ts.date).push({ name: entry.name, time: ts.time });
     }
     for (const arr of byDate.values()) arr.sort((a, b) => a.time.localeCompare(b.time));
     const dates = Array.from(byDate.keys()).sort();
@@ -797,8 +785,7 @@ currentImage.onload = () => {
       timeSel.innerHTML = '<option value="">Select time...</option>';
       arr.forEach(s => {
         const o = document.createElement('option');
-        o.value = s.name;
-        o.text = s.time;
+        o.value = s.name; o.text = s.time;
         timeSel.appendChild(o);
       });
     }
@@ -807,10 +794,7 @@ currentImage.onload = () => {
       const arr = byDate.get(datePick.value);
       if (arr && arr.length) timeSel.value = arr[arr.length - 1].name;
     }
-    datePick.addEventListener('change', () => {
-      populateTime(datePick.value);
-      timeSel.value = '';
-    });
+    datePick.addEventListener('change', () => { populateTime(datePick.value); timeSel.value = ''; });
     timeSel.addEventListener('change', () => {
       const name = timeSel.value;
       if (name) filterCtrl.rebuild(name);
@@ -820,7 +804,6 @@ currentImage.onload = () => {
 
   slider.addEventListener('input', () => filterCtrl.load(parseInt(slider.value)));
 
-  // Initial canvas size
   function onResize() {
     const dpr = window.devicePixelRatio || 1;
     const w = window.innerWidth, h = window.innerHeight;
@@ -834,17 +817,33 @@ currentImage.onload = () => {
   window.addEventListener('resize', onResize);
   onResize();
 
-  // Fetch data
-  fetch(BASE_URL + 'snapshots.json')
-    .then(r => r.json())
-    .then(files => {
-      if (!files.length) { tsLabel.textContent = 'No snapshots.'; return; }
-      filterCtrl.all = files;
+  function loadManifest() {
+    return fetch(BASE_URL + 'timeline.json')
+      .then(r => { if (!r.ok) throw new Error('no timeline'); return r.json(); })
+      .then(entries => {
+        if (!Array.isArray(entries)) throw new Error('bad timeline');
+        console.log(`[manifest] timeline.json: ${entries.length} entries`);
+        return entries;
+      })
+      .catch(() =>
+        fetch(BASE_URL + 'snapshots.json')
+          .then(r => r.json())
+          .then(files => {
+            console.log(`[manifest] snapshots.json (legacy): ${files.length} entries`);
+            return files.map(f => ({ name: f, kind: 'png', src: f }));
+          })
+      );
+  }
 
-      if (urlSnap && files.includes(urlSnap)) {
-        filterCtrl.rebuild(urlSnap);
+  loadManifest()
+    .then(entries => {
+      if (!entries.length) { tsLabel.textContent = 'No snapshots.'; return; }
+      filterCtrl.all = entries;
+      const urlEntry = urlSnap ? entries.find(e => e.name === urlSnap) : null;
+      if (urlEntry) {
+        filterCtrl.rebuild(urlEntry.name);
       } else {
-        const anchor = setupDateTimePickers(files);
+        const anchor = setupDateTimePickers(entries);
         filterCtrl.setInterval(parseInt(interval.value));
         filterCtrl.rebuild(anchor);
       }
