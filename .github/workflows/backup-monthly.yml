@@ -1,0 +1,123 @@
+name: Monthly backup
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_month:
+        description: 'YYYYMM to back up (default: previous month)'
+        required: false
+        default: ''
+      force:
+        description: 'Overwrite existing release if one exists'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 3 2 * *'
+
+concurrency:
+  group: monthly-backup
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      month: ${{ steps.r.outputs.month }}
+    steps:
+      - id: r
+        run: |
+          if [ -n "${{ inputs.target_month }}" ]; then
+            m="${{ inputs.target_month }}"
+            if ! [[ "$m" =~ ^[0-9]{6}$ ]]; then
+              echo "ERROR: target_month must be YYYYMM, got: $m"
+              exit 1
+            fi
+          else
+            m=$(date -u -d "$(date -u +%Y-%m-01) -1 day" +%Y%m)
+          fi
+          echo "Target month: $m"
+          echo "month=$m" >> $GITHUB_OUTPUT
+
+  backup:
+    needs: resolve
+    runs-on: ubuntu-latest
+    env:
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MONTH: ${{ needs.resolve.outputs.month }}
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Check for existing release
+        id: check
+        run: |
+          tag="r2-backup-${MONTH}"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            if [ "${{ inputs.force }}" = "true" ]; then
+              echo "Release $tag exists; force=true so it will be replaced"
+              echo "skip=false" >> $GITHUB_OUTPUT
+              echo "replace=true" >> $GITHUB_OUTPUT
+            else
+              echo "Release $tag already exists. Use force=true to replace."
+              echo "skip=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "No existing release for $tag"
+            echo "skip=false" >> $GITHUB_OUTPUT
+            echo "replace=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Download month files
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          mkdir -p archive
+          rclone copy ":s3:${R2_BUCKET}" archive/ \
+            --include "wdpsnapshot_${MONTH}*.png" \
+            --include "wdpdiff_${MONTH}*.json" \
+            --s3-provider=Cloudflare \
+            --s3-endpoint="${R2_ENDPOINT}" \
+            --s3-access-key-id="${R2_ACCESS_KEY_ID}" \
+            --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
+            --s3-no-check-bucket --transfers 8
+          count=$(ls archive/ | wc -l)
+          if [ "$count" -eq 0 ]; then
+            echo "ERROR: no files found for $MONTH on R2"
+            exit 1
+          fi
+          echo "Downloaded $count files, $(du -sh archive/ | cut -f1)"
+
+      - name: Package into chunks
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          cd archive
+          tar -cf - * | split -b 1800M - "/tmp/backup-${MONTH}.tar.part"
+          cd ..
+          rm -rf archive
+          cd /tmp
+          sha256sum backup-${MONTH}.tar.part* > backup-${MONTH}.sha256
+          ls -lh backup-${MONTH}.tar.part*
+
+      - name: Delete existing release (force)
+        if: steps.check.outputs.replace == 'true'
+        run: |
+          gh release delete "r2-backup-${MONTH}" --yes --cleanup-tag --repo "${{ github.repository }}"
+          sleep 3
+
+      - name: Upload release
+        if: steps.check.outputs.skip == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: r2-backup-${{ needs.resolve.outputs.month }}
+          name: "R2 Archive ${{ needs.resolve.outputs.month }}"
+          files: |
+            /tmp/backup-${{ needs.resolve.outputs.month }}.tar.part*
+            /tmp/backup-${{ needs.resolve.outputs.month }}.sha256
