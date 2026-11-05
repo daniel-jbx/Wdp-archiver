@@ -11,9 +11,11 @@ on:
         description: 'Dry run — convert but no R2 writes'
         type: boolean
         default: true
- 
+  schedule:
+    - cron: '7,37 * * * *'
+
 concurrency:
-  group: update-map
+  group: backfill-day
   cancel-in-progress: false
 
 permissions:
@@ -48,7 +50,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          mkdir -p day publish
+          mkdir -p day publish prior-base
           rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
@@ -63,23 +65,14 @@ jobs:
         run: |
           if [ -n "${{ inputs.date }}" ]; then
             echo "day=${{ inputs.date }}" >> $GITHUB_OUTPUT
-            echo "mode=manual"
           else
-            day=$(python3 backfill-day.py --next-pending --main-timeline timeline.json || true)
+            day=$(python3 backfill-day.py --next-pending --main-timeline timeline.json 2>/dev/null || echo "")
             if [ -z "$day" ]; then
-              echo "No pending days remaining"
               echo "day=" >> $GITHUB_OUTPUT
             else
               echo "day=$day" >> $GITHUB_OUTPUT
-              echo "mode=auto (next pending: $day)"
             fi
           fi
-
-      - name: Announce skip if nothing to do
-        if: steps.target.outputs.day == ''
-        run: |
-          echo "All days backfilled. Nothing to do."
-          echo "### Backfill: all done" >> $GITHUB_STEP_SUMMARY
 
       - name: Download day's PNGs
         if: steps.target.outputs.day != ''
@@ -96,8 +89,49 @@ jobs:
             --s3-no-check-bucket
           echo "PNGs downloaded: $(ls day/*.png 2>/dev/null | wc -l)"
 
+      - name: Prepare prior chain state
+        if: steps.target.outputs.day != ''
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          TARGET_DAY: ${{ steps.target.outputs.day }}
+        run: |
+          python3 << 'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          timeline = json.load(open('timeline.json'))
+          day = os.environ['TARGET_DAY']
+          prior = [e for e in timeline if e['time'] < day + '_000000']
+          base_entry = next((e for e in reversed(prior) if e['kind'] == 'png'), None)
+          if base_entry is None:
+              print("No prior base — new chain will start")
+              sys.exit(0)
+          last_diff = next((e for e in reversed(prior) if e['kind'] == 'diff'), None)
+          env = {k: os.environ[k] for k in (
+              'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET')}
+          for fname in [base_entry['src']] + ([last_diff['src']] if last_diff else []):
+              subprocess.run(
+                  ['rclone', 'copyto',
+                   f':s3:{env["R2_BUCKET"]}/{fname}', f'prior-base/{fname}',
+                   '--s3-provider=Cloudflare',
+                   f'--s3-endpoint={env["R2_ENDPOINT"]}',
+                   f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
+                   f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
+                   '--s3-no-check-bucket'], check=True)
+          print(f"Prior base pre-downloaded: {base_entry['time']}")
+          if last_diff:
+              print(f"Prior last diff: {last_diff['time']}")
+          PY
+
       - name: Run backfill conversion
         if: steps.target.outputs.day != ''
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           python3 backfill-day.py \
             --date "${{ steps.target.outputs.day }}" \
@@ -106,9 +140,11 @@ jobs:
             --canonical-palette palette.json \
             --publish-dir publish \
             --merged-timeline-out merged-timeline.json \
-            --files-to-delete-out delete-list.txt
+            --files-to-delete-out delete-list.txt \
+            --prior-base-dir prior-base \
+            --recheck-timeline
 
-      - name: Effective dry run check
+      - name: Effective mode
         id: mode
         if: steps.target.outputs.day != ''
         run: |
@@ -128,9 +164,8 @@ jobs:
         run: |
           for f in publish/*.png publish/wdpdiff_*.json; do
             [ -e "$f" ] || continue
-            base=$(basename "$f")
-            echo "Uploading $base"
-            rclone copyto "$f" ":s3:${R2_BUCKET}/${base}" \
+            b=$(basename "$f")
+            rclone copyto "$f" ":s3:${R2_BUCKET}/${b}" \
               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
               --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
               --s3-no-check-bucket
@@ -159,14 +194,13 @@ jobs:
         run: |
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            echo "Deleting $f"
             rclone delete ":s3:${R2_BUCKET}/${f}" \
               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
               --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
               --s3-no-check-bucket
           done < delete-list.txt
 
-      - name: Upload backup artifact
+      - name: Upload artifact
         if: always() && steps.target.outputs.day != ''
         uses: actions/upload-artifact@v4
         with:
