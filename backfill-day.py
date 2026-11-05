@@ -138,17 +138,37 @@ def recheck_timeline(env, publish_dir, date, main_timeline):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--date', required=True)
-    ap.add_argument('--day-dir', required=True)
-    ap.add_argument('--main-timeline', required=True)
-    ap.add_argument('--canonical-palette', required=True)
-    ap.add_argument('--publish-dir', required=True)
-    ap.add_argument('--merged-timeline-out', required=True)
-    ap.add_argument('--files-to-delete-out', required=True)
-    ap.add_argument('--prior-base-dir', required=True)
+    ap.add_argument('--next-pending', action='store_true',
+                    help='Print next pending day (YYYYMMDD) and exit')
+    ap.add_argument('--main-timeline', required=True, help='Path to timeline.json')
+    ap.add_argument('--date', default=None)
+    ap.add_argument('--day-dir', default=None)
+    ap.add_argument('--canonical-palette', default=None)
+    ap.add_argument('--publish-dir', default=None)
+    ap.add_argument('--merged-timeline-out', default=None)
+    ap.add_argument('--files-to-delete-out', default=None)
+    ap.add_argument('--prior-base-dir', default=None)
     ap.add_argument('--recheck-timeline', action='store_true',
                     help='Re-download timeline from R2 before merge (requires R2 env vars)')
     args = ap.parse_args()
+
+    # next-pending mode: only needs --main-timeline, prints day and exits
+    if args.next_pending:
+        main_timeline = json.load(open(args.main_timeline))
+        day = next_pending(main_timeline)
+        if day is None:
+            print("No pending days", file=sys.stderr)
+            sys.exit(1)
+        print(day)
+        return
+
+    missing = [f.replace('_', '-') for f in
+               ['date', 'day_dir', 'canonical_palette', 'publish_dir',
+                'merged_timeline_out', 'files_to_delete_out', 'prior_base_dir']
+               if not getattr(args, f)]
+    if missing:
+        print(f"ERROR: missing required args: --{', --'.join(missing)}", file=sys.stderr)
+        sys.exit(1)
 
     day_dir = Path(args.day_dir)
     publish_dir = Path(args.publish_dir)
