@@ -10,7 +10,7 @@ on:
       dry_run:
         description: 'Dry run — convert but no R2 writes'
         type: boolean
-        default: false
+        default: true
   schedule:
     - cron: '7,37 * * * *'
 
@@ -71,13 +71,14 @@ jobs:
             day=$(python3 backfill-day.py --next-pending --main-timeline timeline.json)
             rc=$?
             set -e
-            if [ "$rc" -eq 1 ]; then
+            if [ "$rc" -ne 0 ]; then
+              echo "ERROR: next-pending exited with code $rc (crash or bug)"
+              exit 1
+            fi
+            if [ -z "$day" ]; then
               echo "No pending days - all backfill complete."
               echo "day=" >> $GITHUB_OUTPUT
               echo "### All backfill complete" >> $GITHUB_STEP_SUMMARY
-            elif [ "$rc" -ne 0 ]; then
-              echo "ERROR: next-pending exited with code $rc"
-              exit 1
             else
               echo "Auto-picked next pending day: $day"
               echo "day=$day" >> $GITHUB_OUTPUT
