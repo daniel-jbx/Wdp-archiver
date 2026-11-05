@@ -15,7 +15,7 @@ on:
     - cron: '7,37 * * * *'
 
 concurrency:
-  group: backfill-day
+  group: update-map
   cancel-in-progress: false
 
 permissions:
