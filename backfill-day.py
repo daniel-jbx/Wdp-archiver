@@ -23,6 +23,22 @@ def rclone(env, *args):
     )
 
 
+def next_pending(main_timeline):
+    """Return earliest YYYYMMDD that still has PNG entries but no diffs.
+    Days already backfilled have a base PNG + diffs, so they're skipped."""
+    by_day = {}
+    for e in main_timeline:
+        day = e['time'][:8]
+        by_day.setdefault(day, []).append(e)
+    for day in sorted(by_day.keys()):
+        entries = by_day[day]
+        has_png  = any(e['kind'] == 'png'  for e in entries)
+        has_diff = any(e['kind'] == 'diff' for e in entries)
+        if has_png and not has_diff:
+            return day
+    return None
+
+
 def run_make_diffs(day_dir, out_dir, chain_state_path=None):
     script = Path(__file__).parent / 'make-diffs.py'
     if not script.exists():
@@ -53,8 +69,6 @@ def log_size_composition(day_dir):
 
 
 def verify_palette_coverage(day_dir, palette):
-    """Check only the first snapshot. pngquant is deterministic per-run;
-    if snapshot 1 uses the canonical palette, they all do."""
     pngs = sorted(day_dir.glob('wdpsnapshot_*.png'))
     if not pngs:
         return
@@ -122,8 +136,6 @@ def validate(old_timeline, new_timeline, date):
 
 
 def recheck_timeline(env, publish_dir, date, main_timeline):
-    """Re-download current timeline from R2 just before merge. Returns fresh copy,
-    or None if this day was already backfilled by a concurrent run."""
     print("Re-checking timeline from R2 before merge (race guard)...")
     fresh_path = publish_dir / 'fresh-timeline.json'
     rclone(env, 'copyto', f':s3:{env["R2_BUCKET"]}/timeline.json', str(fresh_path))
@@ -140,7 +152,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--next-pending', action='store_true',
                     help='Print next pending day (YYYYMMDD) and exit')
-    ap.add_argument('--main-timeline', required=True, help='Path to timeline.json')
+    ap.add_argument('--main-timeline', required=True)
     ap.add_argument('--date', default=None)
     ap.add_argument('--day-dir', default=None)
     ap.add_argument('--canonical-palette', default=None)
@@ -148,19 +160,19 @@ def main():
     ap.add_argument('--merged-timeline-out', default=None)
     ap.add_argument('--files-to-delete-out', default=None)
     ap.add_argument('--prior-base-dir', default=None)
-    ap.add_argument('--recheck-timeline', action='store_true',
-                    help='Re-download timeline from R2 before merge (requires R2 env vars)')
+    ap.add_argument('--recheck-timeline', action='store_true')
     args = ap.parse_args()
 
-    # next-pending mode: only needs --main-timeline, prints day and exits
+    # next-pending mode: exit 0 with no output = nothing to do
+    #                    exit 0 with day    = work to do
+    #                    exit != 0          = error
     if args.next_pending:
         main_timeline = json.load(open(args.main_timeline))
         day = next_pending(main_timeline)
         if day is None:
-            print("No pending days", file=sys.stderr)
-            sys.exit(1)
+            sys.exit(0)   # silent success, no output
         print(day)
-        return
+        sys.exit(0)
 
     missing = [f.replace('_', '-') for f in
                ['date', 'day_dir', 'canonical_palette', 'publish_dir',
@@ -168,7 +180,7 @@ def main():
                if not getattr(args, f)]
     if missing:
         print(f"ERROR: missing required args: --{', --'.join(missing)}", file=sys.stderr)
-        sys.exit(1)
+        sys.exit(2)
 
     day_dir = Path(args.day_dir)
     publish_dir = Path(args.publish_dir)
