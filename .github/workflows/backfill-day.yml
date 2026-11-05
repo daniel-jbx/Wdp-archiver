@@ -11,8 +11,6 @@ on:
         description: 'Dry run — convert but no R2 writes'
         type: boolean
         default: false
-  schedule:
-    - cron: '1,2,3,4,16,17,18,19,31,32,33,34,46,47,48,49 * * * *'
 
 concurrency:
   group: update-map
