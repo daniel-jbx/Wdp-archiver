@@ -11,9 +11,7 @@ on:
         description: 'Dry run — convert but no R2 writes'
         type: boolean
         default: true
-  schedule:
-    - cron: '*/15 * * * *'
-
+ 
 concurrency:
   group: update-map
   cancel-in-progress: false
