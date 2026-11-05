@@ -1,0 +1,182 @@
+name: Backfill day to diffs
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Specific day (YYYYMMDD). Leave empty to auto-pick next pending.'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run — convert but no R2 writes'
+        type: boolean
+        default: true
+  schedule:
+    - cron: '*/15 * * * *'
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backfill:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            make-diffs.py
+            backfill-day.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python3 -m pip install --quiet pillow numpy
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download timeline and palette
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p day publish
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket
+          rclone copyto ":s3:${R2_BUCKET}/palette.json" palette.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket
+
+      - name: Determine target day
+        id: target
+        run: |
+          if [ -n "${{ inputs.date }}" ]; then
+            echo "day=${{ inputs.date }}" >> $GITHUB_OUTPUT
+            echo "mode=manual"
+          else
+            day=$(python3 backfill-day.py --next-pending --main-timeline timeline.json || true)
+            if [ -z "$day" ]; then
+              echo "No pending days remaining"
+              echo "day=" >> $GITHUB_OUTPUT
+            else
+              echo "day=$day" >> $GITHUB_OUTPUT
+              echo "mode=auto (next pending: $day)"
+            fi
+          fi
+
+      - name: Announce skip if nothing to do
+        if: steps.target.outputs.day == ''
+        run: |
+          echo "All days backfilled. Nothing to do."
+          echo "### Backfill: all done" >> $GITHUB_STEP_SUMMARY
+
+      - name: Download day's PNGs
+        if: steps.target.outputs.day != ''
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copy ":s3:${R2_BUCKET}" day/ \
+            --include "wdpsnapshot_${{ steps.target.outputs.day }}_*.png" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket
+          echo "PNGs downloaded: $(ls day/*.png 2>/dev/null | wc -l)"
+
+      - name: Run backfill conversion
+        if: steps.target.outputs.day != ''
+        run: |
+          python3 backfill-day.py \
+            --date "${{ steps.target.outputs.day }}" \
+            --day-dir day \
+            --main-timeline timeline.json \
+            --canonical-palette palette.json \
+            --publish-dir publish \
+            --merged-timeline-out merged-timeline.json \
+            --files-to-delete-out delete-list.txt
+
+      - name: Effective dry run check
+        id: mode
+        if: steps.target.outputs.day != ''
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "dry_run=false" >> $GITHUB_OUTPUT
+          else
+            echo "dry_run=${{ inputs.dry_run }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload base PNGs and diffs
+        if: steps.target.outputs.day != '' && steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          for f in publish/*.png publish/wdpdiff_*.json; do
+            [ -e "$f" ] || continue
+            base=$(basename "$f")
+            echo "Uploading $base"
+            rclone copyto "$f" ":s3:${R2_BUCKET}/${base}" \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket
+          done
+
+      - name: Update main timeline
+        if: steps.target.outputs.day != '' && steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto merged-timeline.json ":s3:${R2_BUCKET}/timeline.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket
+
+      - name: Delete original PNGs
+        if: steps.target.outputs.day != '' && steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            echo "Deleting $f"
+            rclone delete ":s3:${R2_BUCKET}/${f}" \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket
+          done < delete-list.txt
+
+      - name: Upload backup artifact
+        if: always() && steps.target.outputs.day != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: backfill-${{ steps.target.outputs.day }}-${{ github.run_id }}
+          path: |
+            day/
+            publish/
+            merged-timeline.json
+            delete-list.txt
+          retention-days: 90
+          if-no-files-found: warn
