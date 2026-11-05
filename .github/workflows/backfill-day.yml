@@ -64,12 +64,22 @@ jobs:
         id: target
         run: |
           if [ -n "${{ inputs.date }}" ]; then
+            echo "Mode: manual (${{ inputs.date }})"
             echo "day=${{ inputs.date }}" >> $GITHUB_OUTPUT
           else
-            day=$(python3 backfill-day.py --next-pending --main-timeline timeline.json 2>/dev/null || echo "")
-            if [ -z "$day" ]; then
+            set +e
+            day=$(python3 backfill-day.py --next-pending --main-timeline timeline.json)
+            rc=$?
+            set -e
+            if [ "$rc" -eq 1 ]; then
+              echo "No pending days - all backfill complete."
               echo "day=" >> $GITHUB_OUTPUT
+              echo "### All backfill complete" >> $GITHUB_STEP_SUMMARY
+            elif [ "$rc" -ne 0 ]; then
+              echo "ERROR: next-pending exited with code $rc"
+              exit 1
             else
+              echo "Auto-picked next pending day: $day"
               echo "day=$day" >> $GITHUB_OUTPUT
             fi
           fi
