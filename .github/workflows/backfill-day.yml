@@ -10,9 +10,9 @@ on:
       dry_run:
         description: 'Dry run — convert but no R2 writes'
         type: boolean
-        default: true
+        default: false
   schedule:
-    - cron: '7,37 * * * *'
+    - cron: '6,21,36,51 * * * *'
 
 concurrency:
   group: update-map
