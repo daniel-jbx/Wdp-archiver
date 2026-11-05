@@ -1,0 +1,188 @@
+name: Test backup retrieval
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Day to test (YYYYMMDD)'
+        required: true
+      target_time:
+        description: 'Closest-to time (HH:MM UTC) — leave empty for random'
+        required: false
+        default: ''
+      verify_against_r2:
+        description: 'Compare SHA256 against R2 original'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Derive month
+        id: m
+        run: |
+          d="${{ inputs.date }}"
+          if ! [[ "$d" =~ ^[0-9]{8}$ ]]; then
+            echo "ERROR: date must be YYYYMMDD, got: $d"
+            exit 1
+          fi
+          echo "month=${d:0:6}" >> $GITHUB_OUTPUT
+
+      - name: Install rclone
+        if: ${{ inputs.verify_against_r2 }}
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download release chunks
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p chunks restore
+          cd chunks
+          gh release download "r2-backup-${{ steps.m.outputs.month }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*.tar.part*" \
+            --pattern "*.sha256"
+          echo "Chunks:"
+          ls -lh
+
+      - name: Verify chunk checksums
+        working-directory: chunks
+        run: sha256sum -c "backup-${{ steps.m.outputs.month }}.sha256"
+
+      - name: Extract
+        working-directory: restore
+        run: |
+          cat ../chunks/backup-${{ steps.m.outputs.month }}.tar.part* | tar -xf -
+          echo "Extracted: $(ls | wc -l) files"
+
+      - name: Pick snapshot
+        id: pick
+        run: |
+          files=$(ls restore/wdpsnapshot_${{ inputs.date }}_*.png 2>/dev/null || true)
+          if [ -z "$files" ]; then
+            echo "ERROR: no PNGs for ${{ inputs.date }} in backup"
+            echo "Sample of what IS in this month's backup:"
+            ls restore/ | head -20
+            exit 1
+          fi
+          count=$(echo "$files" | wc -l)
+          echo "Found $count snapshot(s) for ${{ inputs.date }}"
+
+          target="${{ inputs.target_time }}"
+          if [ -n "$target" ]; then
+            if ! [[ "$target" =~ ^[0-9]{1,2}:[0-9]{2}$ ]]; then
+              echo "ERROR: target_time must be HH:MM, got: $target"
+              exit 1
+            fi
+            IFS=: read -r th tm <<< "$target"
+            target_sec=$(( 10#$th * 3600 + 10#$tm * 60 ))
+            echo "Target time: $target UTC (${target_sec}s into day)"
+
+            best_file=""
+            best_diff=99999999
+            best_time=""
+            for f in $files; do
+              base=$(basename "$f")
+              hhmmss=$(echo "$base" | grep -oE '_[0-9]{6}\.png$' | tr -d '_.png')
+              h=$(( 10#${hhmmss:0:2} ))
+              m=$(( 10#${hhmmss:2:2} ))
+              s=$(( 10#${hhmmss:4:2} ))
+              cand_sec=$(( h * 3600 + m * 60 + s ))
+              diff=$(( cand_sec - target_sec ))
+              [ "$diff" -lt 0 ] && diff=$(( -diff ))
+              if [ "$diff" -lt "$best_diff" ]; then
+                best_diff=$diff
+                best_file="$f"
+                best_time=$(printf "%02d:%02d:%02d" "$h" "$m" "$s")
+              fi
+            done
+
+            echo "Closest match: $(basename "$best_file") at $best_time (${best_diff}s from target)"
+            echo ""
+            echo "All candidates within 30 min of target:"
+            for f in $files; do
+              base=$(basename "$f")
+              hhmmss=$(echo "$base" | grep -oE '_[0-9]{6}\.png$' | tr -d '_.png')
+              h=$(( 10#${hhmmss:0:2} ))
+              m=$(( 10#${hhmmss:2:2} ))
+              s=$(( 10#${hhmmss:4:2} ))
+              cand_sec=$(( h * 3600 + m * 60 + s ))
+              diff=$(( cand_sec - target_sec ))
+              [ "$diff" -lt 0 ] && diff=$(( -diff ))
+              if [ "$diff" -le 1800 ]; then
+                printf "  %s (%+ds)\n" "$(basename "$f")" "$(( cand_sec - target_sec ))"
+              fi
+            done
+            chosen="$best_file"
+          else
+            chosen=$(echo "$files" | shuf -n 1)
+            echo "Random pick: $(basename "$chosen")"
+          fi
+
+          sha=$(sha256sum "$chosen" | awk '{print $1}')
+          size=$(stat -c%s "$chosen")
+          echo ""
+          echo "Selected: $(basename "$chosen")"
+          echo "Size:     $(echo "$size" | awk '{printf "%.2f MB\n", $1/1024/1024}')"
+          echo "SHA256:   $sha"
+          echo "chosen=$chosen" >> $GITHUB_OUTPUT
+          echo "basename=$(basename "$chosen")" >> $GITHUB_OUTPUT
+          echo "sha=$sha" >> $GITHUB_OUTPUT
+          echo "count=$count" >> $GITHUB_OUTPUT
+
+      - name: Validate PNG
+        run: |
+          chosen="${{ steps.pick.outputs.chosen }}"
+          info=$(file "$chosen")
+          echo "$info"
+          if ! echo "$info" | grep -q "PNG image data"; then
+            echo "ERROR: not a valid PNG"
+            exit 1
+          fi
+          dims=$(echo "$info" | grep -oE '[0-9]+ x [0-9]+')
+          echo "Dimensions: $dims"
+
+      - name: Compare with R2 original
+        if: ${{ inputs.verify_against_r2 }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p r2-original
+          if ! rclone copyto ":s3:${R2_BUCKET}/${{ steps.pick.outputs.basename }}" \
+              "r2-original/${{ steps.pick.outputs.basename }}" \
+              --s3-provider=Cloudflare \
+              --s3-endpoint="${R2_ENDPOINT}" \
+              --s3-access-key-id="${R2_ACCESS_KEY_ID}" \
+              --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
+              --s3-no-check-bucket; then
+            echo "WARNING: R2 original not present (already deleted by backfill)"
+            echo "Skipping byte comparison — backup extraction still validated as a real PNG"
+            exit 0
+          fi
+          r2_sha=$(sha256sum "r2-original/${{ steps.pick.outputs.basename }}" | awk '{print $1}')
+          local_sha="${{ steps.pick.outputs.sha }}"
+          echo "Backup SHA256: $local_sha"
+          echo "R2     SHA256: $r2_sha"
+          if [ "$local_sha" = "$r2_sha" ]; then
+            echo "MATCH — byte-identical to R2 original"
+          else
+            echo "MISMATCH — backup differs from R2 original"
+            exit 1
+          fi
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: retrieved-${{ inputs.date }}-${{ steps.pick.outputs.basename }}
+          path: ${{ steps.pick.outputs.chosen }}
+          retention-days: 30
+          if-no-files-found: error
