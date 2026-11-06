@@ -52,11 +52,11 @@ jobs:
           rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket
+            --s3-no-check-bucket --log-level ERROR
           rclone copyto ":s3:${R2_BUCKET}/palette.json" palette.json \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket
+            --s3-no-check-bucket --log-level ERROR
 
       - name: Determine target day
         id: target
@@ -95,7 +95,7 @@ jobs:
             --include "wdpsnapshot_${{ steps.target.outputs.day }}_*.png" \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket
+            --s3-no-check-bucket --log-level ERROR
           echo "PNGs downloaded: $(ls day/*.png 2>/dev/null | wc -l)"
 
       - name: Prepare prior chain state
@@ -128,7 +128,8 @@ jobs:
                    f'--s3-endpoint={env["R2_ENDPOINT"]}',
                    f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
                    f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
-                   '--s3-no-check-bucket'], check=True)
+                   '--s3-no-check-bucket',
+                   '--log-level', 'ERROR'], check=True)
           print(f"Prior base pre-downloaded: {base_entry['time']}")
           if last_diff:
               print(f"Prior last diff: {last_diff['time']}")
@@ -177,7 +178,7 @@ jobs:
             rclone copyto "$f" ":s3:${R2_BUCKET}/${b}" \
               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
               --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-              --s3-no-check-bucket
+              --s3-no-check-bucket --log-level ERROR
           done
 
       - name: Update main timeline
@@ -191,23 +192,25 @@ jobs:
           rclone copyto merged-timeline.json ":s3:${R2_BUCKET}/timeline.json" \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket
+            --s3-no-check-bucket --log-level ERROR
 
-      - name: Delete original PNGs
-        if: steps.target.outputs.day != '' && steps.mode.outputs.dry_run == 'false'
+      - name: Delete original PNGs from R2
+        run: |
+          if [ -s delete-list.txt ]; then
+            rclone delete ":s3:${R2_BUCKET}" \
+              --files-from delete-list.txt \
+              --s3-provider=Cloudflare \
+              --s3-endpoint="${R2_ENDPOINT}" \
+              --s3-access-key-id="${R2_ACCESS_KEY_ID}" \
+              --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
+              --s3-no-check-bucket \
+              --log-level ERROR
+          fi
         env:
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            rclone delete ":s3:${R2_BUCKET}/${f}" \
-              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
-              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-              --s3-no-check-bucket
-          done < delete-list.txt
 
       - name: Upload artifact
         if: always() && steps.target.outputs.day != ''
