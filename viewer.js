@@ -575,7 +575,10 @@
     if (filterCtrl.currentIndex < filterCtrl.filtered.length - 1) filterCtrl.load(filterCtrl.currentIndex + 1);
   };
 
+  let loadGeneration = 0;
+
   async function onLoadSnapshot(entry) {
+    const myGen = ++loadGeneration;
     try {
       let source;
       if (entry.kind === 'png') {
@@ -583,7 +586,6 @@
         compositor.registerBase(entry.time, p);
         source = await p;
       } else if (entry.kind === 'diff') {
-        // Ensure the base PNG for this diff has been loaded.
         if (!compositor.hasBase(entry.base)) {
           const baseEntry = filterCtrl.all.find(
             e => e.kind === 'png' && e.time === entry.base
@@ -598,10 +600,15 @@
       } else {
         source = await loadImage(BASE_URL + entry.name);
       }
+      if (myGen !== loadGeneration) {
+        return; // superseded by a newer load
+      }
       applySource(source);
     } catch (e) {
-      console.error('load failed:', entry, e);
-      tsLabel.textContent = 'load failed';
+      if (myGen === loadGeneration) {
+        console.error('load failed:', entry, e);
+        tsLabel.textContent = 'load failed';
+      }
     }
   }
   filterCtrl.onLoadSnapshot = onLoadSnapshot;
@@ -823,7 +830,22 @@
     return timeSel.value || null;
   }
 
-  slider.addEventListener('input', () => filterCtrl.load(parseInt(slider.value)));
+  let sliderDebounceTimer = null;
+  slider.addEventListener('input', () => {
+    const idx = parseInt(slider.value);
+    if (isNaN(idx) || idx < 0 || idx >= filterCtrl.filtered.length) return;
+
+    // Instant feedback: update the timestamp label immediately
+    const entry = filterCtrl.filtered[idx];
+    if (entry) {
+      const ts = parseTimestamp(entry.name);
+      tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : entry.name;
+    }
+
+    // Debounced load: only fire after the user stops dragging for 150ms
+    clearTimeout(sliderDebounceTimer);
+    sliderDebounceTimer = setTimeout(() => filterCtrl.load(idx), 150);
+  });
 
   function onResize() {
     const dpr = window.devicePixelRatio || 1;
