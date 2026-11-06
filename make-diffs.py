@@ -42,17 +42,19 @@ def ensure_palette(sample_png, palette_path):
 def compute_changes_np(base_arr, new_arr, palette):
     mask = np.any(base_arr != new_arr, axis=2)
     ys, xs = np.where(mask)
-    colors = new_arr[ys, xs] 
-    
-    packed = (colors[:, 0].astype(np.uint32) << 16) | (colors[:, 1].astype(np.uint32) << 8) | colors[:, 2].astype(np.uint32)
-    
+    colors = new_arr[ys, xs]
+
+    packed = (colors[:, 0].astype(np.uint32) << 16) | \
+             (colors[:, 1].astype(np.uint32) << 8) | \
+             colors[:, 2].astype(np.uint32)
+
     lookup = np.zeros(1 << 24, dtype=np.uint8)
     for i, hex_c in enumerate(palette):
         r = int(hex_c[1:3], 16)
         g = int(hex_c[3:5], 16)
         b = int(hex_c[5:7], 16)
         lookup[(r << 16) | (g << 8) | b] = i
-        
+
     idxs = lookup[packed]
     return xs, ys, idxs
 
@@ -60,37 +62,37 @@ def compute_changes_np(base_arr, new_arr, palette):
 def encode_rle_rows_np(xs, ys, idxs):
     if len(xs) == 0:
         return []
-        
+
     order = np.lexsort((xs, ys))
     xs = xs[order]
     ys = ys[order]
     idxs = idxs[order]
-    
+
     new_segment = np.ones(len(xs), dtype=bool)
     new_segment[1:] = (ys[1:] != ys[:-1]) | (xs[1:] != xs[:-1] + 1)
     segment_starts = np.where(new_segment)[0]
-    
+
     rows = []
     for i, start_idx in enumerate(segment_starts):
         y = int(ys[start_idx])
         x_start = int(xs[start_idx])
-        
+
         end_idx = segment_starts[i+1] if i+1 < len(segment_starts) else len(xs)
         seg_idxs = idxs[start_idx:end_idx]
-        
+
         idx_changes = np.ones(len(seg_idxs), dtype=bool)
         idx_changes[1:] = (seg_idxs[1:] != seg_idxs[:-1])
         run_starts = np.where(idx_changes)[0]
         run_lengths = np.diff(np.append(run_starts, len(seg_idxs)))
-        
+
         runs = []
         for j, r_start in enumerate(run_starts):
             idx_val = int(seg_idxs[r_start])
             run_len = int(run_lengths[j])
             runs.append([idx_val, run_len])
-            
+
         rows.append([y, x_start, runs])
-        
+
     return rows
 
 
@@ -99,21 +101,26 @@ def build_diff_payload(base_time, timestamp, xs, ys, idxs):
         payload = {'base': base_time, 'timestamp': timestamp,
                    'format': 'v2-flat', 'changes': []}
         return payload, json.dumps(payload, separators=(',', ':')).encode(), 'v2-flat'
-    
+
     flat = np.column_stack((xs, ys, idxs)).tolist()
     fp = {'base': base_time, 'timestamp': timestamp, 'format': 'v2-flat', 'changes': flat}
     fb = json.dumps(fp, separators=(',', ':')).encode()
-    
+
     rows = encode_rle_rows_np(xs, ys, idxs)
     rp = {'base': base_time, 'timestamp': timestamp, 'format': 'v3-rle', 'rows': rows}
     rb = json.dumps(rp, separators=(',', ':')).encode()
-    
+
     if len(rb) < len(fb):
         return rp, rb, 'v3-rle'
     return fp, fb, 'v2-flat'
 
 
 def diff_content_set(diff):
+    """Return set of int-packed (y<<32)|(x<<16)|idx for cross-run comparison.
+    Returns None if the diff format can't be compared (v1 hex strings)."""
+    fmt = diff.get('format', 'v1')
+    if fmt == 'v1':
+        return None
     if 'rows' in diff:
         s = set()
         for y, x0, runs in diff['rows']:
@@ -126,6 +133,17 @@ def diff_content_set(diff):
     if 'changes' in diff:
         return set((y << 32) | (x << 16) | idx for x, y, idx in diff['changes'])
     return None
+
+
+def pack_change_set(xs, ys, idxs):
+    """Vectorized int-pack of (x, y, idx) into (y<<32)|(x<<16)|idx.
+    Matches diff_content_set encoding so cross-run comparisons work."""
+    if len(xs) == 0:
+        return set()
+    packed = (ys.astype(np.int64) << 32) | \
+             (xs.astype(np.int64) << 16) | \
+             idxs.astype(np.int64)
+    return set(packed.tolist())
 
 
 def main():
@@ -171,11 +189,13 @@ def main():
         if prior.get('last_diff_local') and Path(prior['last_diff_local']).exists():
             prev_diff = json.load(open(prior['last_diff_local']))
             prev_changes_set = diff_content_set(prev_diff)
-            print(f"Loaded prior last diff for activity comparison", flush=True)
+            if prev_changes_set is not None:
+                print(f"Loaded prior last diff for activity comparison", flush=True)
+            else:
+                print(f"Prior last diff is v1 format — dedupe disabled for first snapshot", flush=True)
 
     initial_base_arr = base_arr
-    cumulative_prior = prior['cumulative_bytes'] if prior else 0
-    bytes_since_base = cumulative_prior  # <--- FIX: Track bytes since last base
+    bytes_since_base = prior['cumulative_bytes'] if prior else 0
 
     total_original = 0
     total_new = 0
@@ -189,15 +209,15 @@ def main():
         t = parse_ts(png_path.name)
         if not t:
             continue
-        
+
         print(f"Processing {png_path.name} ({idx+1}/{len(pngs)})...", flush=True)
-        
+
         orig_size = png_path.stat().st_size
         total_original += orig_size
         png_size = orig_size
 
         new_arr, has_trans = load_image(png_path)
-        
+
         if not has_trans:
             print(f"{t}: WARNING: Image has zero transparency (flattened). Culling from archive.", flush=True)
             culled_count += 1
@@ -229,13 +249,8 @@ def main():
             continue
 
         xs, ys, idxs = compute_changes_np(base_arr, new_arr, palette)
-        
-        if len(xs) > 0:
-            flat_changes = np.column_stack((xs, ys, idxs)).tolist()
-            curr_set = set(map(tuple, flat_changes))
-        else:
-            curr_set = set()
-            
+        curr_set = pack_change_set(xs, ys, idxs)
+
         activity = len(curr_set ^ prev_changes_set) if prev_changes_set is not None else None
 
         if prev_changes_set is not None and activity == 0 and timeline:
