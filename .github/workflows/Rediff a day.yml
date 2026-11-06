@@ -187,15 +187,38 @@ jobs:
               print(f"WARNING: count mismatch", file=sys.stderr)
           PY
 
-      - name: Revert timeline (remove target day's entries)
+      - name: Reset day in timeline to reconstructed PNGs
         run: |
           python3 << 'PY'
-          import json
+          import json, re
+          from pathlib import Path
+
           day = "${{ inputs.date }}"
-          t = json.load(open('timeline.json'))
-          reverted = [e for e in t if not e['time'].startswith(day)]
-          json.dump(reverted, open('timeline.json', 'w'), indent=2)
-          print(f"Reverted timeline: {len(t)} -> {len(reverted)} entries")
+          day_start = day + '_000000'
+          day_end = day + '_999999'
+
+          timeline = json.load(open('timeline.json'))
+          kept = [e for e in timeline if not (day_start <= e['time'] <= day_end)]
+
+          new_entries = []
+          for png in sorted(Path('day').glob(f'wdpsnapshot_{day}_*.png')):
+              m = re.search(r'(\d{8}_\d{6})', png.name)
+              if not m:
+                  continue
+              t = m.group(1)
+              new_entries.append({
+                  "time": t,
+                  "kind": "png",
+                  "src": png.name,
+                  "name": t,
+                  "bytes": png.stat().st_size,
+              })
+
+          merged = kept + new_entries
+          merged.sort(key=lambda e: e['time'])
+          json.dump(merged, open('timeline.json', 'w'), indent=2)
+          print(f"Timeline: {len(timeline)} -> {len(merged)} entries")
+          print(f"Injected {len(new_entries)} PNG entries for {day}")
           PY
 
       - name: Run backfill conversion with new make-diffs
