@@ -19,7 +19,7 @@ def rclone(env, *args):
          f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
          f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
          '--s3-no-check-bucket',
-         '--log-level', 'ERROR',   # <-- Suppress "Config file not found" NOTICE spam
+         '--log-level', 'ERROR',
          '--timeout', '15s',
          '--contimeout', '15s',
          '--retries', '3',
@@ -36,28 +36,26 @@ def next_pending(main_timeline):
     for day in sorted(by_day.keys()):
         entries = by_day[day]
         has_png  = any(e['kind'] == 'png'  for e in entries)
-        has_df = any(e['kind'] == 'df' for e in entries)
-         has_png and not has_df:
+        has_diff = any(e['kind'] == 'diff' for e in entries)
+        if has_png and not has_diff:
             return day
     return None
 
 
-def run_make_dfs(day_dir, out_dir, chain_state_path=None):
-    script = Path(__file__).parent / 'make-dfs.py'
+def run_make_diffs(day_dir, out_dir, chain_state_path=None):
+    script = Path(__file__).parent / 'make-diffs.py'
     if not script.exists():
         print(f"ERROR: make-diffs.py not found next to {__file__}", file=sys.stderr, flush=True)
         sys.exit(1)
     cmd = ['python3', str(script), '--input', str(day_dir), '--output', str(out_dir)]
     if chain_state_path:
         cmd.extend(['--chain-state', str(chain_state_path)])
-    
     try:
         print(f"Executing: {' '.join(cmd)}", flush=True)
         result = subprocess.run(cmd, check=False, timeout=1800)
     except subprocess.TimeoutExpired:
         print("ERROR: make-diffs.py timed out after 30 minutes!", file=sys.stderr, flush=True)
         sys.exit(1)
-
     if result.returncode != 0:
         print(f"ERROR: make-diffs.py failed with exit {result.returncode}", file=sys.stderr, flush=True)
         sys.exit(1)
@@ -86,10 +84,8 @@ def verify_palette_coverage(day_dir, palette):
     palette_set = set(palette)
     with Image.open(sample) as im:
         arr = np.array(im.convert('RGB'))
-        # FAST UNIQUE: Pack RGB into a single integer to avoid np.unique(axis=0)
         packed = (arr[:, :, 0].astype(np.uint32) << 16) | (arr[:, :, 1].astype(np.uint32) << 8) | arr[:, :, 2].astype(np.uint32)
         unique_packed = np.unique(packed)
-        
         for p in unique_packed:
             hex_c = '#%06x' % p
             if hex_c not in palette_set:
@@ -137,32 +133,22 @@ def merge_timelines(main_timeline, day_timeline, date):
 
 
 def validate(old_timeline, new_timeline, date):
-    """Verify that the merge is safe. The new day's timestamps must be a subset
-    of the old day's timestamps (culled entries are allowed to disappear), and
-    no entries from other days should have been added or removed."""
     old_day = [e for e in old_timeline if e['time'].startswith(date)]
     new_day = [e for e in new_timeline if e['time'].startswith(date)]
-    
     old_times = set(e['time'] for e in old_day)
     new_times = set(e['time'] for e in new_day)
-    
-    # Culling is allowed: new_times must be a subset of old_times
     unexpected_new = new_times - old_times
     if unexpected_new:
         print(f"ERROR: new timeline has unknown timestamps: {sorted(unexpected_new)[:5]}", file=sys.stderr, flush=True)
         return False
-    
     culled_count = len(old_times - new_times)
     if culled_count:
         print(f"  Note: {culled_count} timestamp(s) culled from {date}", flush=True)
-    
-    # Non-day entries must be unchanged
     old_non_day = [e for e in old_timeline if not e['time'].startswith(date)]
     new_non_day = [e for e in new_timeline if not e['time'].startswith(date)]
     if len(old_non_day) != len(new_non_day):
         print("ERROR: non-day entries count changed", file=sys.stderr, flush=True)
         return False
-    
     return True
 
 
@@ -181,8 +167,7 @@ def recheck_timeline(env, publish_dir, date, main_timeline):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--next-pending', action='store_true',
-                    help='Print next pending day (YYYYMMDD) and exit')
+    ap.add_argument('--next-pending', action='store_true')
     ap.add_argument('--main-timeline', required=True)
     ap.add_argument('--date', default=None)
     ap.add_argument('--day-dir', default=None)
