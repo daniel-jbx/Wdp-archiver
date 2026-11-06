@@ -36,14 +36,14 @@ def next_pending(main_timeline):
     for day in sorted(by_day.keys()):
         entries = by_day[day]
         has_png  = any(e['kind'] == 'png'  for e in entries)
-        has_diff = any(e['kind'] == 'diff' for e in entries)
-        if has_png and not has_diff:
+        has_df = any(e['kind'] == 'df' for e in entries)
+         has_png and not has_df:
             return day
     return None
 
 
-def run_make_diffs(day_dir, out_dir, chain_state_path=None):
-    script = Path(__file__).parent / 'make-diffs.py'
+def run_make_dfs(day_dir, out_dir, chain_state_path=None):
+    script = Path(__file__).parent / 'make-dfs.py'
     if not script.exists():
         print(f"ERROR: make-diffs.py not found next to {__file__}", file=sys.stderr, flush=True)
         sys.exit(1)
@@ -282,7 +282,8 @@ def main():
     if args.recheck_timeline:
         fresh = recheck_timeline(env, publish_dir, args.date, main_timeline)
         if fresh is None:
-            sys.exit(0)
+            print("Aborted: concurrent modification detected.", flush=True)
+            sys.exit(3)
         main_timeline = fresh
 
     merged = merge_timelines(main_timeline, day_timeline, args.date)
