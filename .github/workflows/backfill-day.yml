@@ -22,6 +22,7 @@ permissions:
 jobs:
   backfill:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
@@ -172,14 +173,16 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          for f in publish/*.png publish/wdpdiff_*.json; do
-            [ -e "$f" ] || continue
-            b=$(basename "$f")
-            rclone copyto "$f" ":s3:${R2_BUCKET}/${b}" \
+          find publish -maxdepth 1 -type f \( -name '*.png' -o -name 'wdpdiff_*.json' \) -printf '%f\n' > upload-list.txt
+          echo "Files to upload: $(wc -l < upload-list.txt)"
+          if [ -s upload-list.txt ]; then
+            rclone copy publish/ ":s3:${R2_BUCKET}" \
+              --files-from upload-list.txt \
+              --transfers 16 \
               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
               --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
               --s3-no-check-bucket --log-level ERROR
-          done
+          fi
 
       - name: Update main timeline
         if: steps.target.outputs.day != '' && steps.mode.outputs.dry_run == 'false'
@@ -195,8 +198,15 @@ jobs:
             --s3-no-check-bucket --log-level ERROR
 
       - name: Delete original PNGs from R2
+        if: steps.target.outputs.day != '' && steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           if [ -s delete-list.txt ]; then
+            echo "Deleting $(wc -l < delete-list.txt) files"
             rclone delete ":s3:${R2_BUCKET}" \
               --files-from delete-list.txt \
               --s3-provider=Cloudflare \
@@ -205,12 +215,9 @@ jobs:
               --s3-secret-access-key="${R2_SECRET_ACCESS_KEY}" \
               --s3-no-check-bucket \
               --log-level ERROR
+          else
+            echo "Delete list empty — nothing to delete"
           fi
-        env:
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
       - name: Upload artifact
         if: always() && steps.target.outputs.day != ''
