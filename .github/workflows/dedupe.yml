@@ -1,0 +1,435 @@
+name: Find duplicate archive content
+
+on:
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: 'Scan scope'
+        type: choice
+        default: recent
+        options:
+          - recent
+          - all
+          - custom
+      date_start:
+        description: 'Custom start (YYYYMMDD) — only when scope=custom'
+        required: false
+        default: ''
+      date_end:
+        description: 'Custom end (YYYYMMDD) — only when scope=custom'
+        required: false
+        default: ''
+      include_pngs:
+        description: 'Also scan base PNGs for duplicate content (slower)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download timeline
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: List R2 files with sizes
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone lsf ":s3:${R2_BUCKET}" \
+            --include "wdpsnapshot_*.png" \
+            --include "wdpdiff_*.json" \
+            --format "sp" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR > r2-files.txt
+          echo "R2 files listed: $(wc -l < r2-files.txt)"
+          head -3 r2-files.txt
+
+      - name: Determine scope boundaries
+        id: scope
+        run: |
+          case "${{ inputs.scope }}" in
+            custom)
+              if [ -z "${{ inputs.date_start }}" ] || [ -z "${{ inputs.date_end }}" ]; then
+                echo "ERROR: date_start and date_end required when scope=custom"
+                exit 1
+              fi
+              echo "start=${{ inputs.date_start }}" >> $GITHUB_OUTPUT
+              echo "end=${{ inputs.date_end }}" >> $GITHUB_OUTPUT
+              ;;
+            all)
+              echo "start=19700101" >> $GITHUB_OUTPUT
+              echo "end=29991231" >> $GITHUB_OUTPUT
+              ;;
+            recent)
+              END=$(date -u +%Y%m%d)
+              START=$(date -u -d "30 days ago" +%Y%m%d)
+              echo "start=$START" >> $GITHUB_OUTPUT
+              echo "end=$END" >> $GITHUB_OUTPUT
+              echo "Recent scope: $START to $END"
+              ;;
+          esac
+
+      - name: Timeline integrity checks
+        run: |
+          python3 -u << 'PY'
+          import json
+          from collections import Counter
+
+          timeline = json.load(open('timeline.json'))
+          print(f"Timeline: {len(timeline)} entries")
+
+          times = [e['time'] for e in timeline]
+          dupe_times = [t for t, c in Counter(times).items() if c > 1]
+
+          png_by_time = {e['time'] for e in timeline if e['kind'] == 'png'}
+          missing_base = 0
+          base_after = 0
+          missing_fields = 0
+          for e in timeline:
+              if e.get('kind') == 'diff':
+                  if 'base' not in e:
+                      missing_base += 1
+                  elif e['base'] not in png_by_time:
+                      missing_base += 1
+                  elif e['base'] > e['time']:
+                      base_after += 1
+              for f in ('time', 'kind', 'src', 'name'):
+                  if f not in e:
+                      missing_fields += 1
+
+          print()
+          print("=== Timeline integrity ===")
+          print(f"  Duplicate timestamps:         {len(dupe_times)}")
+          if dupe_times[:5]:
+              for t in dupe_times[:5]:
+                  print(f"    {t}")
+          print(f"  Diff entries missing base:    {missing_base}")
+          print(f"  Diff entries base > time:     {base_after}")
+          print(f"  Entries missing fields:       {missing_fields}")
+
+          with open('integrity.txt', 'w') as f:
+              f.write(f"Duplicate timestamps: {len(dupe_times)}\n")
+              f.write(f"Missing base: {missing_base}\n")
+              f.write(f"Base after entry: {base_after}\n")
+              f.write(f"Missing fields: {missing_fields}\n")
+          PY
+
+      - name: Orphan and broken reference check
+        run: |
+          python3 -u << 'PY'
+          import json
+
+          timeline = json.load(open('timeline.json'))
+          timeline_srcs = set(e['src'] for e in timeline)
+
+          r2_files = set()
+          r2_sizes = {}
+          for line in open('r2-files.txt'):
+              line = line.rstrip('\n')
+              if ';' not in line:
+                  continue
+              size, name = line.split(';', 1)
+              r2_files.add(name)
+              r2_sizes[name] = int(size)
+
+          orphaned = sorted(r2_files - timeline_srcs)
+          broken = sorted(timeline_srcs - r2_files)
+          orphan_size = sum(r2_sizes.get(f, 0) for f in orphaned)
+
+          print()
+          print("=== R2 consistency ===")
+          print(f"  R2 files:                     {len(r2_files)}")
+          print(f"  Timeline unique srcs:         {len(timeline_srcs)}")
+          print(f"  Orphaned (on R2, not in tl):  {len(orphaned)}  ({orphan_size/1024:.1f} KB)")
+          print(f"  Broken refs (in tl, not R2):  {len(broken)}")
+
+          if orphaned[:10]:
+              print("  Sample orphaned files:")
+              for f in orphaned[:10]:
+                  print(f"    {f} ({r2_sizes.get(f, 0)/1024:.1f} KB)")
+          if broken[:10]:
+              print("  Sample broken refs:")
+              for f in broken[:10]:
+                  print(f"    {f}")
+
+          with open('orphans.txt', 'w') as f:
+              f.write('\n'.join(orphaned))
+          with open('broken.txt', 'w') as f:
+              f.write('\n'.join(broken))
+          with open('consistency.txt', 'w') as f:
+              f.write(f"R2 files: {len(r2_files)}\n")
+              f.write(f"Timeline srcs: {len(timeline_srcs)}\n")
+              f.write(f"Orphaned: {len(orphaned)} ({orphan_size/1024:.1f} KB)\n")
+              f.write(f"Broken refs: {len(broken)}\n")
+          PY
+
+      - name: Identify size-collision candidates
+        env:
+          SCAN_START: ${{ steps.scope.outputs.start }}
+          SCAN_END: ${{ steps.scope.outputs.end }}
+          INCLUDE_PNGS: ${{ inputs.include_pngs }}
+        run: |
+          python3 -u << 'PY'
+          import json
+          import os
+          from collections import defaultdict
+
+          scan_start = os.environ['SCAN_START']
+          scan_end = os.environ['SCAN_END']
+          include_pngs = os.environ.get('INCLUDE_PNGS', 'false').lower() == 'true'
+
+          r2_sizes = {}
+          for line in open('r2-files.txt'):
+              line = line.rstrip('\n')
+              if ';' not in line:
+                  continue
+              size, name = line.split(';', 1)
+              r2_sizes[name] = int(size)
+
+          def in_scope(name):
+              parts = name.split('_')
+              if len(parts) < 2 or len(parts[1]) < 8:
+                  return False
+              d = parts[1][:8]
+              return scan_start <= d <= scan_end
+
+          def is_png(name):
+              return name.startswith('wdpsnapshot_')
+
+          def is_diff(name):
+              return name.startswith('wdpdiff_')
+
+          diff_size_groups = defaultdict(list)
+          for name, size in r2_sizes.items():
+              if is_diff(name) and in_scope(name):
+                  diff_size_groups[size].append(name)
+
+          png_size_groups = defaultdict(list)
+          if include_pngs:
+              for name, size in r2_sizes.items():
+                  if is_png(name) and in_scope(name):
+                      png_size_groups[size].append(name)
+
+          candidates = []
+          for size, names in diff_size_groups.items():
+              if len(names) > 1:
+                  candidates.extend(names)
+          for size, names in png_size_groups.items():
+              if len(names) > 1:
+                  candidates.extend(names)
+
+          print(f"Scope: {scan_start} to {scan_end}")
+          print(f"Diff size collision groups: {sum(1 for v in diff_size_groups.values() if len(v)>1)}")
+          if include_pngs:
+              print(f"PNG size collision groups:  {sum(1 for v in png_size_groups.values() if len(v)>1)}")
+          print(f"Candidate files to download: {len(candidates)}")
+
+          with open('candidates.txt', 'w') as f:
+              f.write('\n'.join(candidates))
+
+          with open('size-groups.json', 'w') as f:
+              json.dump({
+                  'diffs': {str(k): v for k, v in diff_size_groups.items() if len(v) > 1},
+                  'pngs':  {str(k): v for k, v in png_size_groups.items() if len(v) > 1},
+              }, f)
+          PY
+
+      - name: Download candidates
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          if [ ! -s candidates.txt ]; then
+            echo "No candidates to download"
+            exit 0
+          fi
+          mkdir -p candidates
+          rclone copy ":s3:${R2_BUCKET}" candidates/ \
+            --files-from candidates.txt \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR --transfers 16
+          echo "Downloaded $(ls candidates/ | wc -l) files"
+
+      - name: Hash and group by content
+        run: |
+          python3 -u << 'PY'
+          import hashlib
+          import json
+          from collections import defaultdict
+          from pathlib import Path
+
+          cand_dir = Path('candidates')
+          if not cand_dir.exists():
+              print("No candidates — skipping content dedupe")
+              raise SystemExit(0)
+
+          hash_groups = defaultdict(list)
+          for f in cand_dir.iterdir():
+              if not f.is_file():
+                  continue
+              h = hashlib.sha256(f.read_bytes()).hexdigest()
+              hash_groups[h].append(f.name)
+
+          dupe_groups = {h: names for h, names in hash_groups.items() if len(names) > 1}
+
+          print()
+          print("=== Content duplicates (files with identical bytes) ===")
+          print(f"  Duplicate groups: {len(dupe_groups)}")
+
+          if not dupe_groups:
+              print("  (none — every file has unique content)")
+              json.dump({'dupe_groups': {}, 'samples': [],
+                         'summary': {'groups': 0, 'redundant_files': 0, 'redundant_bytes': 0}},
+                        open('dupes.json', 'w'))
+              raise SystemExit(0)
+
+          timeline = json.load(open('timeline.json'))
+          timeline_by_src = defaultdict(list)
+          for e in timeline:
+              timeline_by_src[e['src']].append(e)
+
+          total_redundant_files = 0
+          total_redundant_bytes = 0
+          samples = []
+
+          for h, names in sorted(dupe_groups.items(), key=lambda kv: -len(kv[1])):
+              names = sorted(names)
+              size = (cand_dir / names[0]).stat().st_size
+              redundant_files = len(names) - 1
+              redundant_bytes = size * redundant_files
+              total_redundant_files += redundant_files
+              total_redundant_bytes += redundant_bytes
+
+              refs_by_file = {}
+              for name in names:
+                  entries = timeline_by_src.get(name, [])
+                  if entries:
+                      refs_by_file[name] = sorted(e['time'] for e in entries)
+
+              all_ref_times = sorted(t for times in refs_by_file.values() for t in times)
+              day_boundary_hits = 0
+              for i in range(len(all_ref_times) - 1):
+                  a, b = all_ref_times[i], all_ref_times[i+1]
+                  if a[:8] != b[:8]:
+                      day_boundary_hits += 1
+
+              samples.append({
+                  'hash': h[:12],
+                  'count': len(names),
+                  'size_kb': size / 1024,
+                  'redundant_kb': redundant_bytes / 1024,
+                  'day_boundary_hits': day_boundary_hits,
+                  'filenames': names,
+              })
+
+          print(f"  Total duplicate files (beyond 1 each): {total_redundant_files}")
+          print(f"  Total redundant bytes: {total_redundant_bytes/1024:.1f} KB")
+          print(f"  Potential monthly backup savings: {total_redundant_bytes/1024/1024:.2f} MB")
+          print()
+          print("  Sample groups (top 10 by count):")
+          for s in samples[:10]:
+              print(f"    {s['count']} copies x {s['size_kb']:.1f} KB = {s['redundant_kb']:.1f} KB redundant")
+              print(f"      files: {', '.join(s['filenames'][:5])}{'...' if len(s['filenames'])>5 else ''}")
+              if s['day_boundary_hits'] > 0:
+                  print(f"      ^^ {s['day_boundary_hits']} cross-day reference(s) — missed dedupe at boundary")
+
+          json.dump({
+              'dupe_groups': {h: names for h, names in dupe_groups.items()},
+              'samples': samples,
+              'summary': {
+                  'groups': len(dupe_groups),
+                  'redundant_files': total_redundant_files,
+                  'redundant_bytes': total_redundant_bytes,
+              }
+          }, open('dupes.json', 'w'))
+          PY
+
+      - name: Write step summary
+        if: always()
+        run: |
+          {
+            echo "## Duplicate archive content scan"
+            echo ""
+            echo "Scope: ${{ steps.scope.outputs.start }} to ${{ steps.scope.outputs.end }}"
+            echo ""
+            echo "### Timeline integrity"
+            if [ -f integrity.txt ]; then
+              while IFS= read -r line; do echo "- $line"; done < integrity.txt
+            else
+              echo "- (no data)"
+            fi
+            echo ""
+            echo "### R2 consistency"
+            if [ -f consistency.txt ]; then
+              while IFS= read -r line; do echo "- $line"; done < consistency.txt
+            else
+              echo "- (no data)"
+            fi
+            echo ""
+            echo "### Content duplicates"
+            if [ -f dupes.json ]; then
+              GROUPS=$(jq -r '.summary.groups' dupes.json)
+              FILES=$(jq -r '.summary.redundant_files' dupes.json)
+              BYTES=$(jq -r '.summary.redundant_bytes' dupes.json)
+              KB=$(awk "BEGIN {printf \"%.1f\", $BYTES / 1024}")
+              echo "- Groups with identical content: $GROUPS"
+              echo "- Total redundant files: $FILES"
+              echo "- Total redundant bytes: $KB KB"
+              if [ "$GROUPS" -gt 0 ]; then
+                echo ""
+                echo "| Files | Size each | Redundant | Cross-day |"
+                echo "|---|---|---|---|"
+                jq -r '.samples[:15][] | "| \(.count) | \(.size_kb|floor) KB | \(.redundant_kb|floor) KB | \(.day_boundary_hits) |"' dupes.json
+              fi
+            else
+              echo "- (skipped or no data)"
+            fi
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dupe-scan-${{ steps.scope.outputs.start }}-${{ steps.scope.outputs.end }}-${{ github.run_id }}
+          path: |
+            integrity.txt
+            consistency.txt
+            dupes.json
+            orphans.txt
+            broken.txt
+            candidates.txt
+          retention-days: 30
+          if-no-files-found: warn
