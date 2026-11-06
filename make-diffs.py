@@ -35,20 +35,25 @@ def ensure_palette(sample_png, palette_path):
     return palette
 
 
-def compute_changes(base_arr, new_arr):
+def compute_changes(base_arr, new_arr, color_to_idx):
     mask = np.any(base_arr != new_arr, axis=2)
     ys, xs = np.where(mask)
     colors = new_arr[ys, xs]
+    
+    # Convert to indices immediately to save memory
+    hex_colors = ['#%02x%02x%02x' % (int(c[0]), int(c[1]), int(c[2])) for c in colors.tolist()]
+    
+    # Return list of (x, y, idx) directly
     return [
-        (int(x), int(y), '#%02x%02x%02x' % (int(c[0]), int(c[1]), int(c[2])))
-        for x, y, c in zip(xs.tolist(), ys.tolist(), colors.tolist())
+        (int(x), int(y), color_to_idx[c])
+        for x, y, c in zip(xs.tolist(), ys.tolist(), hex_colors)
     ]
 
 
-def encode_rle_rows(changes, color_to_idx):
+def encode_rle_rows(changes):
     by_row = {}
-    for x, y, c in changes:
-        by_row.setdefault(y, []).append((x, color_to_idx[c]))
+    for x, y, idx in changes:
+        by_row.setdefault(y, []).append((x, idx))
     rows = []
     for y in sorted(by_row):
         pixels = sorted(by_row[y])
@@ -72,17 +77,20 @@ def encode_rle_rows(changes, color_to_idx):
     return rows
 
 
-def build_diff_payload(base_time, timestamp, changes, color_to_idx):
+def build_diff_payload(base_time, timestamp, changes):
     if not changes:
         payload = {'base': base_time, 'timestamp': timestamp,
                    'format': 'v2-flat', 'changes': []}
         return payload, json.dumps(payload, separators=(',', ':')).encode(), 'v2-flat'
-    flat = [[x, y, color_to_idx[c]] for x, y, c in changes]
+    
+    flat = [[x, y, idx] for x, y, idx in changes]
     fp = {'base': base_time, 'timestamp': timestamp, 'format': 'v2-flat', 'changes': flat}
     fb = json.dumps(fp, separators=(',', ':')).encode()
-    rows = encode_rle_rows(changes, color_to_idx)
+    
+    rows = encode_rle_rows(changes)
     rp = {'base': base_time, 'timestamp': timestamp, 'format': 'v3-rle', 'rows': rows}
     rb = json.dumps(rp, separators=(',', ':')).encode()
+    
     if len(rb) < len(fb):
         return rp, rb, 'v3-rle'
     return fp, fb, 'v2-flat'
@@ -163,6 +171,10 @@ def main():
         t = parse_ts(png_path.name)
         if not t:
             continue
+        
+        # Added flush=True so you can see progress in GitHub Actions logs
+        print(f"Processing {png_path.name} ({idx+1}/{len(pngs)})...", flush=True)
+        
         orig_size = png_path.stat().st_size
         total_original += orig_size
         png_size = orig_size
@@ -193,8 +205,8 @@ def main():
             print(f"{t}: size change -> base png")
             continue
 
-        changes = compute_changes(base_arr, new_arr)
-        curr_set = set((x, y, color_to_idx[c]) for x, y, c in changes)
+        changes = compute_changes(base_arr, new_arr, color_to_idx)
+        curr_set = set(changes)
         activity = len(curr_set ^ prev_changes_set) if prev_changes_set is not None else None
 
         if prev_changes_set is not None and activity == 0 and timeline:
@@ -210,7 +222,7 @@ def main():
                 print(f"{t}: unchanged -> reuse {prev_entry['src']}")
                 continue
 
-        payload, encoded, fmt = build_diff_payload(base_time, t, changes, color_to_idx)
+        payload, encoded, fmt = build_diff_payload(base_time, t, changes)
         if fmt == 'v3-rle': rle_wins += 1
         else:               flat_wins += 1
 
