@@ -6,6 +6,16 @@ on:
       date:
         description: 'Day to rediff (YYYYMMDD)'
         required: true
+      source:
+        description: 'auto: try release→artifact→reconstruct. release: require backup release. artifact: require GH Actions artifact. reconstruct: from current R2 bases+diffs.'
+        required: true
+        default: auto
+        type: choice
+        options:
+          - auto
+          - release
+          - artifact
+          - reconstruct
       dry_run:
         description: 'Dry run — reconstruct and re-diff locally, no R2 writes'
         type: boolean
@@ -17,6 +27,7 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   rediff:
@@ -35,10 +46,16 @@ jobs:
 
       - run: python3 -m pip install --quiet pillow numpy
 
-      - name: Install rclone
+      - name: Install rclone (and pngquant best-effort)
         run: |
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
-          sudo dpkg -i rclone-current-linux-amd64.deb
+          timeout 300 curl -fsSL -o rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone.deb
+          rm -f rclone.deb
+          if ! command -v pngquant >/dev/null 2>&1; then
+            timeout 300 sudo apt-get update -qq || true
+            timeout 300 sudo apt-get install -y --no-install-recommends pngquant \
+              || echo "WARN: pngquant unavailable; reconstruct path will fail if reached"
+          fi
 
       - name: Download timeline and palette
         env:
@@ -59,7 +76,7 @@ jobs:
 
       - name: Determine required files
         run: |
-          python3 << 'PY'
+          python3 -u << 'PY'
           import json, sys
           timeline = json.load(open('timeline.json'))
           day = "${{ inputs.date }}"
@@ -93,11 +110,11 @@ jobs:
           with open('old-day-files.txt', 'w') as f:
               f.write('\n'.join(old_day_files))
 
-          print(f"Will download {len(download_files)} files for reconstruction")
+          print(f"Will download {len(download_files)} files")
           print(f"Day has {len(day_entries)} existing files (bases + diffs)")
           PY
 
-      - name: Download reconstruction assets
+      - name: Download prior base + last diff from R2
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -111,9 +128,111 @@ jobs:
             --s3-no-check-bucket --log-level ERROR
           echo "Downloaded $(ls assets/ | wc -l) files"
 
-      - name: Reconstruct PNGs from bases + diffs
+      - name: Try release archive
+        id: release
+        if: inputs.source == 'release' || inputs.source == 'auto'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DATE: ${{ inputs.date }}
         run: |
-          python3 << 'PY'
+          set -euo pipefail
+          MONTH="${DATE:0:6}"
+          TAG="r2-backup-${MONTH}"
+
+          if ! gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            echo "No release $TAG for date $DATE"
+            exit 1
+          fi
+
+          mkdir -p /tmp/archive
+          cd /tmp/archive
+          trap 'cd -; rm -f /tmp/archive/backup-*.tar.part* /tmp/archive/backup-*.sha256' EXIT
+
+          gh release download "$TAG" --repo "$REPO" \
+            --pattern "*.tar.part*" --pattern "*.sha256"
+
+          if grep -q '\.tar\.part' "backup-${MONTH}.sha256"; then
+            sha256sum -c "backup-${MONTH}.sha256"
+          else
+            EXPECTED=$(awk '{print $1}' "backup-${MONTH}.sha256")
+            ACTUAL=$(cat backup-${MONTH}.tar.part* | sha256sum | awk '{print $1}')
+            [ "$EXPECTED" = "$ACTUAL" ] && echo "Full-tar checksum OK" \
+              || { echo "SHA256 mismatch"; exit 1; }
+          fi
+
+          rm -rf "$GITHUB_WORKSPACE/day"
+          mkdir -p "$GITHUB_WORKSPACE/day"
+          cat backup-${MONTH}.tar.part* | tar -xf - -C "$GITHUB_WORKSPACE/day" \
+            --wildcards --no-anchored "wdpsnapshot_${DATE}_*.png"
+
+          COUNT=$(ls "$GITHUB_WORKSPACE/day"/wdpsnapshot_${DATE}_*.png 2>/dev/null | wc -l)
+          echo "Extracted $COUNT snapshots for $DATE from $TAG"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No snapshots in release for $DATE"
+            exit 1
+          fi
+          if [ "$COUNT" -lt 2 ]; then
+            echo "ERROR: only $COUNT PNG(s) for $DATE in release"
+            echo "       Release likely postdates backfill — contains base+diffs, not originals"
+            exit 1
+          fi
+
+      - name: Try artifact archive
+        id: artifact
+        if: |
+          (inputs.source == 'artifact' || inputs.source == 'auto') &&
+          steps.release.outcome != 'success'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DATE: ${{ inputs.date }}
+        run: |
+          set -euo pipefail
+          ARTIFACT_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"backfill-${DATE}-\")) | select(.expired == false) | \"\(.created_at) \(.id)\"" \
+            | sort -r | head -1 | awk '{print $2}')
+
+          if [ -z "${ARTIFACT_ID:-}" ]; then
+            echo "No unexpired artifact matching backfill-${DATE}-*"
+            exit 1
+          fi
+          echo "Using artifact ID: $ARTIFACT_ID"
+
+          mkdir -p /tmp/artifact
+          cd /tmp/artifact
+          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$REPO/actions/artifacts/${ARTIFACT_ID}/zip" \
+            -o artifact.zip
+          unzip -q artifact.zip
+
+          FOUND=$(find . -name "wdpsnapshot_${DATE}_*.png" | head -1)
+          if [ -z "$FOUND" ]; then
+            echo "Artifact does not contain wdpsnapshot_${DATE}_*.png"
+            exit 1
+          fi
+
+          rm -rf "$GITHUB_WORKSPACE/day"
+          mkdir -p "$GITHUB_WORKSPACE/day"
+          find . -name "wdpsnapshot_${DATE}_*.png" -exec cp {} "$GITHUB_WORKSPACE/day/" \;
+
+          COUNT=$(ls "$GITHUB_WORKSPACE/day"/*.png 2>/dev/null | wc -l)
+          echo "Extracted $COUNT snapshots for $DATE from artifact $ARTIFACT_ID"
+          if [ "$COUNT" -lt 2 ]; then
+            echo "ERROR: only $COUNT PNG(s) in artifact"
+            exit 1
+          fi
+
+      - name: Reconstruct PNGs from bases + diffs
+        id: reconstruct
+        if: |
+          inputs.source == 'reconstruct' ||
+          (inputs.source == 'auto' && steps.release.outcome != 'success' && steps.artifact.outcome != 'success')
+        run: |
+          python3 -u << 'PY'
           import json, sys
           from pathlib import Path
           import numpy as np
@@ -158,38 +277,67 @@ jobs:
 
           src_dir = Path('assets')
           out_dir = Path('day')
+          out_dir.mkdir(exist_ok=True)
 
-          current_rgba = np.array(Image.open(src_dir / start_base['src']).convert('RGBA'))
-          current_time = start_base['time']
+          base_cache = {}
+          def get_base(src_name):
+              if src_name not in base_cache:
+                  base_cache[src_name] = np.array(Image.open(src_dir / src_name).convert('RGBA'))
+              return base_cache[src_name].copy()
 
-          def save_if_in_day(arr, t):
-              if t.startswith(day):
-                  out = out_dir / f"wdpsnapshot_{t}.png"
-                  Image.fromarray(arr, 'RGBA').save(out)
-                  print(f"  Saved {out.name}")
-
-          save_if_in_day(current_rgba, current_time)
-
-          for entry in timeline[start_idx+1:end_idx+1]:
-              if entry['kind'] == 'diff':
+          for entry in timeline[start_idx:end_idx+1]:
+              t = entry['time']
+              if not t.startswith(day):
+                  continue
+              if entry['kind'] == 'png':
+                  arr = np.array(Image.open(src_dir / entry['src']).convert('RGBA'))
+                  Image.fromarray(arr, 'RGBA').save(out_dir / f"wdpsnapshot_{t}.png")
+                  print(f"  Saved PNG (base): {t}")
+              elif entry['kind'] == 'diff':
                   diff = json.load(open(src_dir / entry['src']))
-                  apply_diff(current_rgba, diff, palette)
-                  current_time = entry['time']
-                  save_if_in_day(current_rgba, current_time)
-              elif entry['kind'] == 'png':
-                  current_rgba = np.array(Image.open(src_dir / entry['src']).convert('RGBA'))
-                  current_time = entry['time']
-                  save_if_in_day(current_rgba, current_time)
+                  base_entry = next((e for e in timeline if e['time'] == diff['base'] and e['kind'] == 'png'), None)
+                  if base_entry is None:
+                      print(f"ERROR: no base PNG for diff {entry['src']} (base={diff['base']})")
+                      sys.exit(1)
+                  base_arr = get_base(base_entry['src'])
+                  apply_diff(base_arr, diff, palette)
+                  Image.fromarray(base_arr, 'RGBA').save(out_dir / f"wdpsnapshot_{t}.png")
+                  print(f"  Saved PNG (diff): {t}")
 
           count = len(list(out_dir.glob('*.png')))
           print(f"\nReconstructed {count} PNGs (expected {len(day_entries)})")
           if count != len(day_entries):
-              print(f"WARNING: count mismatch", file=sys.stderr)
+              print("ERROR: count mismatch", file=sys.stderr)
+              sys.exit(1)
           PY
 
-      - name: Reset day in timeline to reconstructed PNGs
+      - name: Fail if no source succeeded
+        if: |
+          steps.release.outcome != 'success' &&
+          steps.artifact.outcome != 'success' &&
+          steps.reconstruct.outcome != 'success'
         run: |
-          python3 << 'PY'
+          echo "ERROR: no source produced PNGs for ${{ inputs.date }}"
+          exit 1
+
+      - name: Quantize reconstructed PNGs (reconstruct path only)
+        if: steps.reconstruct.outcome == 'success'
+        run: |
+          if ! command -v pngquant >/dev/null 2>&1; then
+            echo "ERROR: pngquant required for reconstruct path but not installed"
+            exit 1
+          fi
+          count=$(ls day/*.png 2>/dev/null | wc -l)
+          echo "Quantizing $count reconstructed PNGs to 64-color palette"
+          for f in day/*.png; do
+            pngquant --quality=80-100 --speed=1 --force 64 "$f" --output "$f"
+          done
+          echo "Sample sizes after quantization:"
+          ls -lh day/*.png | head -5
+
+      - name: Reset day in timeline to extracted PNGs
+        run: |
+          python3 -u << 'PY'
           import json, re
           from pathlib import Path
 
@@ -227,8 +375,9 @@ jobs:
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          PYTHONUNBUFFERED: "1"
         run: |
-          python3 backfill-day.py \
+          python3 -u backfill-day.py \
             --date "${{ inputs.date }}" \
             --day-dir day \
             --main-timeline timeline.json \
@@ -277,7 +426,7 @@ jobs:
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR
 
-      - name: Delete stale old bases + diffs from R2
+      - name: Delete stale old files
         if: steps.mode.outputs.dry_run == 'false'
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -285,7 +434,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          python3 << 'PY'
+          python3 -u << 'PY'
           from pathlib import Path
           old = [line.strip() for line in open('old-day-files.txt') if line.strip()]
           new = set(p.name for p in Path('publish').iterdir()
