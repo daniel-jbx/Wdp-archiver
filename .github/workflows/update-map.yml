@@ -26,7 +26,7 @@ jobs:
             incremental-diff.py
           sparse-checkout-cone-mode: false
 
-      - name: Install ImageMagick, pngquant and rclone
+      - name: Install pngquant and rclone
         run: |
           # Disable flaky third-party repositories that can cause hash mismatches
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
@@ -36,10 +36,10 @@ jobs:
           sudo tee /etc/apt/apt.conf.d/99timeout-retries > /dev/null <<'EOF'
           Acquire::http::Timeout "15";
           Acquire::https::Timeout "15";
-          Acquire::Retries "3";
+          Acquire::Retries "5";
           EOF
 
-          # Update apt with retries, wrapped in a hard 5-minute timeout to prevent infinite hangs
+          # Update apt with retries, wrapped in a hard 5-minute timeout
           for i in 1 2 3; do
             echo "Attempt $i to update apt package lists..."
             if sudo timeout 300 apt-get update; then
@@ -48,15 +48,36 @@ jobs:
             else
               echo "apt-get update failed or timed out (attempt $i)"
               if [ $i -eq 3 ]; then
-                echo "All attempts failed, exiting."
+                echo "All update attempts failed, exiting."
                 exit 1
               fi
               sleep $((i * 10))
             fi
           done
 
-          # Install packages with a hard 10-minute timeout
-          sudo timeout 600 apt-get install -y imagemagick pngquant
+          # Install pngquant only (no imagemagick — the stitch script uses Python/PIL).
+          # --no-install-recommends + single small package = ~500 KB download.
+          # Multi-layered retry: Acquire::Retries at the HTTP layer, timeout 180 per attempt,
+          # outer loop for apt-level failures.
+          if ! sudo timeout 180 apt-get install -y --no-install-recommends \
+                 -o Acquire::Retries=5 pngquant; then
+            echo "First install attempt failed; cleaning and retrying..."
+            sudo apt-get clean
+            for i in 1 2 3; do
+              echo "Retry $i..."
+              if sudo timeout 180 apt-get install -y --no-install-recommends \
+                   -o Acquire::Retries=5 pngquant; then
+                echo "Install succeeded on retry $i"
+                break
+              fi
+              sudo apt-get clean
+              sleep $((i * 15))
+              if [ $i -eq 3 ]; then
+                echo "All install attempts failed"
+                exit 1
+              fi
+            done
+          fi
 
           # Install rclone
           RCLONE_VERSION="1.65.0"
