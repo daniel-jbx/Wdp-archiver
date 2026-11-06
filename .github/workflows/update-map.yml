@@ -31,14 +31,21 @@ jobs:
           sudo rm -f /etc/apt/sources.list.d/google-chrome.list
           sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list
 
-          # Update apt with retries
+          # Add APT timeouts to prevent indefinite hangs on Azure mirrors
+          sudo tee /etc/apt/apt.conf.d/99timeout-retries > /dev/null <<'EOF'
+          Acquire::http::Timeout "15";
+          Acquire::https::Timeout "15";
+          Acquire::Retries "3";
+          EOF
+
+          # Update apt with retries, wrapped in a hard 5-minute timeout to prevent infinite hangs
           for i in 1 2 3; do
             echo "Attempt $i to update apt package lists..."
-            if sudo apt-get update -o Acquire::Retries=3; then
+            if sudo timeout 300 apt-get update; then
               echo "apt-get update succeeded"
               break
             else
-              echo "apt-get update failed (attempt $i)"
+              echo "apt-get update failed or timed out (attempt $i)"
               if [ $i -eq 3 ]; then
                 echo "All attempts failed, exiting."
                 exit 1
@@ -47,8 +54,10 @@ jobs:
             fi
           done
 
-          sudo apt-get install -y imagemagick pngquant
+          # Install packages with a hard 10-minute timeout
+          sudo timeout 600 apt-get install -y imagemagick pngquant
 
+          # Install rclone
           RCLONE_VERSION="1.65.0"
           curl -L --retry 5 --retry-delay 5 \
             -o rclone.deb \
