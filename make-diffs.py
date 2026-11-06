@@ -10,8 +10,7 @@ except ImportError:
     sys.exit(1)
 
 SINGLE_DIFF_MULTIPLIER   = 1.0
-CUMULATIVE_MULTIPLIER    = 2.0
-ACTIVITY_FRACTION        = 0.02
+CUMULATIVE_MULTIPLIER    = 1.0
 
 
 def parse_ts(name):
@@ -20,7 +19,6 @@ def parse_ts(name):
 
 
 def load_image(path):
-    """Loads image, returns RGB array and a boolean indicating if it has transparency."""
     with Image.open(path) as im:
         arr_rgba = np.array(im.convert('RGBA'))
         has_transparency = np.any(arr_rgba[:, :, 3] == 0)
@@ -42,19 +40,16 @@ def ensure_palette(sample_png, palette_path):
 def compute_changes_np(base_arr, new_arr, palette):
     mask = np.any(base_arr != new_arr, axis=2)
     ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return xs, ys, np.zeros(0, dtype=np.uint8)
     colors = new_arr[ys, xs]
-
     packed = (colors[:, 0].astype(np.uint32) << 16) | \
              (colors[:, 1].astype(np.uint32) << 8) | \
              colors[:, 2].astype(np.uint32)
-
     lookup = np.zeros(1 << 24, dtype=np.uint8)
     for i, hex_c in enumerate(palette):
-        r = int(hex_c[1:3], 16)
-        g = int(hex_c[3:5], 16)
-        b = int(hex_c[5:7], 16)
+        r = int(hex_c[1:3], 16); g = int(hex_c[3:5], 16); b = int(hex_c[5:7], 16)
         lookup[(r << 16) | (g << 8) | b] = i
-
     idxs = lookup[packed]
     return xs, ys, idxs
 
@@ -62,37 +57,22 @@ def compute_changes_np(base_arr, new_arr, palette):
 def encode_rle_rows_np(xs, ys, idxs):
     if len(xs) == 0:
         return []
-
     order = np.lexsort((xs, ys))
-    xs = xs[order]
-    ys = ys[order]
-    idxs = idxs[order]
-
+    xs, ys, idxs = xs[order], ys[order], idxs[order]
     new_segment = np.ones(len(xs), dtype=bool)
     new_segment[1:] = (ys[1:] != ys[:-1]) | (xs[1:] != xs[:-1] + 1)
     segment_starts = np.where(new_segment)[0]
-
     rows = []
     for i, start_idx in enumerate(segment_starts):
-        y = int(ys[start_idx])
-        x_start = int(xs[start_idx])
-
+        y = int(ys[start_idx]); x_start = int(xs[start_idx])
         end_idx = segment_starts[i+1] if i+1 < len(segment_starts) else len(xs)
         seg_idxs = idxs[start_idx:end_idx]
-
         idx_changes = np.ones(len(seg_idxs), dtype=bool)
         idx_changes[1:] = (seg_idxs[1:] != seg_idxs[:-1])
         run_starts = np.where(idx_changes)[0]
         run_lengths = np.diff(np.append(run_starts, len(seg_idxs)))
-
-        runs = []
-        for j, r_start in enumerate(run_starts):
-            idx_val = int(seg_idxs[r_start])
-            run_len = int(run_lengths[j])
-            runs.append([idx_val, run_len])
-
+        runs = [[int(seg_idxs[r]), int(run_lengths[j])] for j, r in enumerate(run_starts)]
         rows.append([y, x_start, runs])
-
     return rows
 
 
@@ -101,23 +81,18 @@ def build_diff_payload(base_time, timestamp, xs, ys, idxs):
         payload = {'base': base_time, 'timestamp': timestamp,
                    'format': 'v2-flat', 'changes': []}
         return payload, json.dumps(payload, separators=(',', ':')).encode(), 'v2-flat'
-
     flat = np.column_stack((xs, ys, idxs)).tolist()
     fp = {'base': base_time, 'timestamp': timestamp, 'format': 'v2-flat', 'changes': flat}
     fb = json.dumps(fp, separators=(',', ':')).encode()
-
     rows = encode_rle_rows_np(xs, ys, idxs)
     rp = {'base': base_time, 'timestamp': timestamp, 'format': 'v3-rle', 'rows': rows}
     rb = json.dumps(rp, separators=(',', ':')).encode()
-
     if len(rb) < len(fb):
         return rp, rb, 'v3-rle'
     return fp, fb, 'v2-flat'
 
 
 def diff_content_set(diff):
-    """Return set of int-packed (y<<32)|(x<<16)|idx for cross-run comparison.
-    Returns None if the diff format can't be compared (v1 hex strings)."""
     fmt = diff.get('format', 'v1')
     if fmt == 'v1':
         return None
@@ -136,13 +111,9 @@ def diff_content_set(diff):
 
 
 def pack_change_set(xs, ys, idxs):
-    """Vectorized int-pack of (x, y, idx) into (y<<32)|(x<<16)|idx.
-    Matches diff_content_set encoding so cross-run comparisons work."""
     if len(xs) == 0:
         return set()
-    packed = (ys.astype(np.int64) << 32) | \
-             (xs.astype(np.int64) << 16) | \
-             idxs.astype(np.int64)
+    packed = (ys.astype(np.int64) << 32) | (xs.astype(np.int64) << 16) | idxs.astype(np.int64)
     return set(packed.tolist())
 
 
@@ -150,8 +121,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', required=True)
     ap.add_argument('--output', required=True)
-    ap.add_argument('--chain-state', default=None,
-                    help='JSON file with prior chain state (base PNG, cumulative bytes, last diff)')
+    ap.add_argument('--chain-state', default=None)
     args = ap.parse_args()
 
     in_dir = Path(args.input)
@@ -274,16 +244,12 @@ def main():
 
         single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
         cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
-        churning = (activity is None) or (activity > len(curr_set) * ACTIVITY_FRACTION)
 
         promote_reason = None
         if single_exceeded:
             promote_reason = 'single-diff'
-        elif cumulative_exceeded and churning:
+        elif cumulative_exceeded:
             promote_reason = 'cumulative'
-        elif cumulative_exceeded and not churning:
-            print(f"{t}: {fmt} {len(curr_set):,} changes -> {len(encoded)/1024:.1f} KB "
-                  f"(deferred promote; activity={activity})", flush=True)
 
         if promote_reason:
             shutil.copy2(png_path, out_dir / png_path.name)
