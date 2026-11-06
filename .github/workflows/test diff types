@@ -1,0 +1,220 @@
+name: Analyze diff compression ratios
+
+on:
+  workflow_dispatch:
+    inputs:
+      sample_size:
+        description: 'Number of diff files to sample'
+        required: false
+        default: '30'
+      include_days:
+        description: 'Comma-separated dates (YYYYMMDD) to sample from, blank = random across archive'
+        required: false
+        default: ''
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install tools
+        run: |
+          python3 -m pip install --quiet brotli
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xz-utils zstd
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download timeline
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Select sample
+        env:
+          SAMPLE_SIZE: ${{ inputs.sample_size }}
+          INCLUDE_DAYS: ${{ inputs.include_days }}
+        run: |
+          python3 -u << 'PY'
+          import json, os, random
+          timeline = json.load(open('timeline.json'))
+          diffs = [e for e in timeline if e['kind'] == 'diff']
+          print(f"Total diffs on R2: {len(diffs)}")
+
+          n = int(os.environ.get('SAMPLE_SIZE', '30'))
+          days_input = os.environ.get('INCLUDE_DAYS', '').strip()
+
+          if days_input:
+              day_set = {d.strip() for d in days_input.split(',') if d.strip()}
+              candidates = [e for e in diffs if e['time'][:8] in day_set]
+          else:
+              candidates = diffs
+
+          random.seed(42)
+          sample = random.sample(candidates, min(n, len(candidates)))
+
+          with open('sample.txt', 'w') as f:
+              for e in sample:
+                  f.write(e['src'] + '\n')
+          print(f"Sampled {len(sample)} diffs")
+          for e in sample[:5]:
+              print(f"  {e['src']}  ({e.get('bytes', 0)} bytes on R2)")
+          PY
+
+      - name: Download sample
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p sample
+          rclone copy ":s3:${R2_BUCKET}" sample/ \
+            --files-from sample.txt \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Measure compression
+        run: |
+          python3 -u << 'PY'
+          import brotli, gzip, json, subprocess
+          from pathlib import Path
+
+          def xz_size(b):
+              return len(subprocess.check_output(['xz', '-9', '-c'], input=b))
+
+          def zstd_size(b):
+              return len(subprocess.check_output(['zstd', '-19', '-c'], input=b))
+
+          files = sorted(Path('sample').glob('wdpdiff_*.json'))
+          print(f"Analyzing {len(files)} files\n")
+
+          by_fmt = {}
+          rows = []
+
+          for f in files:
+              raw = f.read_bytes()
+              try:
+                  data = json.loads(raw)
+                  fmt = data.get('format', 'v1')
+              except Exception:
+                  fmt = 'unknown'
+
+              row = {
+                  'file': f.name,
+                  'format': fmt,
+                  'raw': len(raw),
+                  'gz': len(gzip.compress(raw, compresslevel=9)),
+                  'br': len(brotli.compress(raw, quality=11)),
+                  'xz': xz_size(raw),
+                  'zstd': zstd_size(raw),
+              }
+
+              # Binary format estimate
+              if fmt == 'v2-flat':
+                  n_changes = len(data.get('changes', []))
+                  row['binary'] = n_changes * 5  # x:u16, y:u16, idx:u8
+              elif fmt == 'v3-rle':
+                  n_rows = len(data.get('rows', []))
+                  n_runs = sum(len(runs) for _, _, runs in data.get('rows', []))
+                  row['binary'] = n_rows * 6 + n_runs * 3  # y:u16, x0:u16, n:u16 + per-run idx:u8, len:u16
+              else:
+                  row['binary'] = None
+
+              rows.append(row)
+              by_fmt.setdefault(fmt, []).append(row)
+
+          print("=" * 100)
+          print(f"{'File':<44} {'Format':<8} {'Raw':>8} {'gz':>8} {'br':>8} {'xz':>8} {'zstd':>8} {'bin':>8}")
+          print("=" * 100)
+          for r in rows[:20]:
+              print(f"{r['file']:<44} {r['format']:<8} {r['raw']:>8} {r['gz']:>8} "
+                    f"{r['br']:>8} {r['xz']:>8} {r['zstd']:>8} "
+                    f"{(r['binary'] or 0):>8}")
+
+          print("\n" + "=" * 100)
+          print("AGGREGATE COMPRESSION RATIOS")
+          print("=" * 100)
+          for fmt, recs in sorted(by_fmt.items()):
+              n = len(recs)
+              raw = sum(r['raw'] for r in recs)
+              gz = sum(r['gz'] for r in recs)
+              br = sum(r['br'] for r in recs)
+              xz = sum(r['xz'] for r in recs)
+              zstd = sum(r['zstd'] for r in recs)
+              bins = [r['binary'] for r in recs if r['binary']]
+              bintot = sum(bins) if bins else 0
+
+              print(f"\n{fmt}: {n} files")
+              print(f"  raw:     {raw:>10} bytes (avg {raw//n} / file)")
+              print(f"  gzip-9:  {gz:>10} bytes  ({raw/gz:5.2f}x, saves {(1-gz/raw)*100:4.0f}%)")
+              print(f"  brotli:  {br:>10} bytes  ({raw/br:5.2f}x, saves {(1-br/raw)*100:4.0f}%)")
+              print(f"  xz:      {xz:>10} bytes  ({raw/xz:5.2f}x, saves {(1-xz/raw)*100:4.0f}%)")
+              print(f"  zstd:    {zstd:>10} bytes  ({raw/zstd:5.2f}x, saves {(1-zstd/raw)*100:4.0f}%)")
+              if bintot:
+                  print(f"  binary:  {bintot:>10} bytes  ({raw/bintot:5.2f}x, saves {(1-bintot/raw)*100:4.0f}%)")
+
+          # Combined estimate: which compression helps most
+          print("\n" + "=" * 100)
+          print("COMBINED FORMAT + COMPRESSION ESTIMATES")
+          print("=" * 100)
+          total_raw = sum(r['raw'] for r in rows)
+          print(f"Baseline (raw JSON as-is): {total_raw:>10} bytes")
+
+          if rows[0]['binary']:
+              total_bin = sum(r['binary'] for r in rows if r['binary'])
+              print(f"Binary alone (no compression): {total_bin:>10} bytes  ({total_raw/total_bin:.2f}x)")
+
+              # Binary + gzip: compressing the binary rarely helps much because
+              # it's already dense. Estimate as ~equal to binary.
+              print(f"Binary + gzip (est):           {total_bin:>10} bytes (gzip won't help much on packed binary)")
+
+          total_gz = sum(r['gz'] for r in rows)
+          total_br = sum(r['br'] for r in rows)
+          total_xz = sum(r['xz'] for r in rows)
+          print(f"gzip-at-rest (JSON.gz):        {total_gz:>10} bytes  ({total_raw/total_gz:.2f}x)")
+          print(f"brotli-at-rest (JSON.br):      {total_br:>10} bytes  ({total_raw/total_br:.2f}x)")
+          print(f"xz-at-rest (JSON.xz):          {total_xz:>10} bytes  ({total_raw/total_xz:.2f}x)")
+
+          # Recommendation
+          print("\n" + "=" * 100)
+          print("RECOMMENDATION")
+          print("=" * 100)
+          best = min(
+              [('gzip', total_raw/total_gz), ('brotli', total_raw/total_br), ('xz', total_raw/total_xz)] +
+              ([('binary', total_raw/sum(r['binary'] for r in rows if r['binary']))] if rows[0]['binary'] else []),
+              key=lambda x: -x[1]
+          )
+          print(f"Best single approach: {best[0]} ({best[1]:.2f}x)")
+          if best[1] >= 2.0:
+              print(f"  → Halving storage is achievable with {best[0]}")
+          else:
+              print(f"  → Sub-2x, not worth the format change on its own")
+
+          with open('compression-report.json', 'w') as f:
+              json.dump({'rows': rows, 'by_format': by_fmt}, f, indent=2)
+          PY
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compression-analysis-${{ github.run_id }}
+          path: compression-report.json
+          retention-days: 30
+          if-no-files-found: warn
