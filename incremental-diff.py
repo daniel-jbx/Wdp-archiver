@@ -10,8 +10,7 @@ except ImportError:
     sys.exit(1)
 
 SINGLE_DIFF_MULTIPLIER   = 1.0
-CUMULATIVE_MULTIPLIER    = 2.0
-ACTIVITY_FRACTION        = 0.02
+CUMULATIVE_MULTIPLIER    = 1.0
 
 
 def rclone(env, *args):
@@ -40,7 +39,6 @@ def upload(env, local, remote):
 
 
 def load_image(path):
-    """Load as RGBA, check transparency, return RGB + has_transparency flag."""
     with Image.open(path) as im:
         arr_rgba = np.array(im.convert('RGBA'))
         has_transparency = np.any(arr_rgba[:, :, 3] == 0)
@@ -49,7 +47,6 @@ def load_image(path):
 
 
 def ensure_palette(env, sample_arr, tmp):
-    """Load palette from R2 or generate from the (already-validated) sample RGB array."""
     local = tmp / 'palette.json'
     try:
         download(env, 'palette.json', str(local))
@@ -69,7 +66,6 @@ def ensure_palette(env, sample_arr, tmp):
 
 
 def compute_changes_np(base_arr, new_arr, palette):
-    """Vectorized: RGB→index via 16MB lookup table. Returns (xs, ys, idxs)."""
     mask = np.any(base_arr != new_arr, axis=2)
     ys, xs = np.where(mask)
     if len(xs) == 0:
@@ -87,7 +83,6 @@ def compute_changes_np(base_arr, new_arr, palette):
 
 
 def encode_rle_rows_np(xs, ys, idxs):
-    """Vectorized row grouping + RLE. Matches make-diffs.py output exactly."""
     if len(xs) == 0:
         return []
     order = np.lexsort((xs, ys))
@@ -126,7 +121,6 @@ def build_diff_payload(base_time, timestamp, xs, ys, idxs):
 
 
 def diff_content_set(diff):
-    """Return int-packed set of (y<<32)|(x<<16)|idx. Returns None for v1."""
     fmt = diff.get('format', 'v1')
     if fmt == 'v1':
         return None
@@ -145,7 +139,6 @@ def diff_content_set(diff):
 
 
 def pack_change_set(xs, ys, idxs):
-    """Match diff_content_set encoding for cross-run comparison."""
     if len(xs) == 0:
         return set()
     packed = (ys.astype(np.int64) << 32) | (xs.astype(np.int64) << 16) | idxs.astype(np.int64)
@@ -186,7 +179,6 @@ def main():
     print(f"New snapshot: {snap_name} ({png_size/1024/1024:.2f} MB)", flush=True)
     print(f"Timestamp:    {new_time}", flush=True)
 
-    # --- Cull check FIRST — before palette, before anything that could write
     new_arr, has_trans = load_image(snap_path)
     if not has_trans:
         print(f"{new_time}: WARNING: Image has zero transparency (flattened)", flush=True)
@@ -252,7 +244,6 @@ def main():
         print(f"Changes vs base: {len(xs):,}", flush=True)
         curr_set = pack_change_set(xs, ys, idxs)
 
-        # --- Activity + dedupe
         activity = None
         prev_diff_set = None
         if last['kind'] == 'diff' and last.get('base') == base_entry['time']:
@@ -296,20 +287,11 @@ def main():
         single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
         cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
 
-        if activity is None:
-            churning = True
-        else:
-            churning = activity > len(curr_set) * ACTIVITY_FRACTION
-
         promote_reason = None
         if single_exceeded:
             promote_reason = 'single-diff'
-        elif cumulative_exceeded and churning:
+        elif cumulative_exceeded:
             promote_reason = 'cumulative'
-        elif cumulative_exceeded and not churning:
-            print(f"  (deferred promote: cumulative over threshold but chain settled; "
-                  f"activity={activity or 0:,} < {ACTIVITY_FRACTION*100:.0f}% of {len(curr_set):,})",
-                  flush=True)
 
         if promote_reason:
             print(f"Promoting to PNG ({promote_reason}).", flush=True)
