@@ -13,7 +13,7 @@ on:
         default: ''
 
 concurrency:
-  group: update-map
+  group: update-mapwsgrdfgdas
   cancel-in-progress: false
 
 permissions:
