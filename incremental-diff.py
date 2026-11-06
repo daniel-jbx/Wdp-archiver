@@ -6,13 +6,12 @@ try:
     import numpy as np
     from PIL import Image
 except ImportError:
-    print("ERROR: needs Pillow and numpy", file=sys.stderr)
+    print("ERROR: needs Pillow and numpy", file=sys.stderr, flush=True)
     sys.exit(1)
 
-# Promote thresholds (all relative to the size of a freshly-compressed PNG)
-SINGLE_DIFF_MULTIPLIER   = 1.0   # promote if any single diff exceeds P
-CUMULATIVE_MULTIPLIER    = 2.0   # promote if chain since base exceeds 2*P
-ACTIVITY_FRACTION        = 0.02  # promote only if activity > 2% of chain
+SINGLE_DIFF_MULTIPLIER   = 1.0
+CUMULATIVE_MULTIPLIER    = 2.0
+ACTIVITY_FRACTION        = 0.02
 
 
 def rclone(env, *args):
@@ -22,7 +21,12 @@ def rclone(env, *args):
          f'--s3-endpoint={env["R2_ENDPOINT"]}',
          f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
          f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
-         '--s3-no-check-bucket', *args],
+         '--s3-no-check-bucket',
+         '--log-level', 'ERROR',
+         '--timeout', '15s',
+         '--contimeout', '15s',
+         '--retries', '3',
+         *args],
         check=True,
     )
 
@@ -35,12 +39,17 @@ def upload(env, local, remote):
     rclone(env, 'copyto', local, f':s3:{env["R2_BUCKET"]}/{remote}')
 
 
-def load_rgb(path):
+def load_image(path):
+    """Load as RGBA, check transparency, return RGB + has_transparency flag."""
     with Image.open(path) as im:
-        return np.array(im.convert('RGB'))
+        arr_rgba = np.array(im.convert('RGBA'))
+        has_transparency = np.any(arr_rgba[:, :, 3] == 0)
+        arr_rgb = arr_rgba[:, :, :3].copy()
+    return arr_rgb, has_transparency
 
 
-def ensure_palette(env, sample_png, tmp):
+def ensure_palette(env, sample_arr, tmp):
+    """Load palette from R2 or generate from the (already-validated) sample RGB array."""
     local = tmp / 'palette.json'
     try:
         download(env, 'palette.json', str(local))
@@ -48,64 +57,67 @@ def ensure_palette(env, sample_png, tmp):
         pass
     if local.exists():
         palette = json.load(open(local))
-        print(f"Palette: loaded {len(palette)} colors from R2")
+        print(f"Palette: loaded {len(palette)} colors from R2", flush=True)
         return palette
-    arr = load_rgb(sample_png)
-    unique = np.unique(arr.reshape(-1, 3), axis=0)
+    unique = np.unique(sample_arr.reshape(-1, 3), axis=0)
     palette = ['#%02x%02x%02x' % tuple(int(v) for v in c) for c in unique]
     with open(local, 'w') as f:
         json.dump(palette, f)
     upload(env, str(local), 'palette.json')
-    print(f"Palette: generated {len(palette)} colors and uploaded to R2")
+    print(f"Palette: generated {len(palette)} colors and uploaded to R2", flush=True)
     return palette
 
 
-def compute_changes(base_arr, new_arr):
+def compute_changes_np(base_arr, new_arr, palette):
+    """Vectorized: RGB→index via 16MB lookup table. Returns (xs, ys, idxs)."""
     mask = np.any(base_arr != new_arr, axis=2)
     ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return xs, ys, np.zeros(0, dtype=np.uint8)
     colors = new_arr[ys, xs]
-    return [
-        (int(x), int(y), '#%02x%02x%02x' % (int(c[0]), int(c[1]), int(c[2])))
-        for x, y, c in zip(xs.tolist(), ys.tolist(), colors.tolist())
-    ]
+    packed = (colors[:, 0].astype(np.uint32) << 16) | \
+             (colors[:, 1].astype(np.uint32) << 8) | \
+             colors[:, 2].astype(np.uint32)
+    lookup = np.zeros(1 << 24, dtype=np.uint8)
+    for i, hex_c in enumerate(palette):
+        r = int(hex_c[1:3], 16); g = int(hex_c[3:5], 16); b = int(hex_c[5:7], 16)
+        lookup[(r << 16) | (g << 8) | b] = i
+    idxs = lookup[packed]
+    return xs, ys, idxs
 
 
-def encode_rle_rows(changes, color_to_idx):
-    by_row = {}
-    for x, y, c in changes:
-        by_row.setdefault(y, []).append((x, color_to_idx[c]))
+def encode_rle_rows_np(xs, ys, idxs):
+    """Vectorized row grouping + RLE. Matches make-diffs.py output exactly."""
+    if len(xs) == 0:
+        return []
+    order = np.lexsort((xs, ys))
+    xs, ys, idxs = xs[order], ys[order], idxs[order]
+    new_segment = np.ones(len(xs), dtype=bool)
+    new_segment[1:] = (ys[1:] != ys[:-1]) | (xs[1:] != xs[:-1] + 1)
+    segment_starts = np.where(new_segment)[0]
     rows = []
-    for y in sorted(by_row):
-        pixels = sorted(by_row[y])
-        segments, current = [], []
-        for x, idx in pixels:
-            if current and x != current[-1][0] + 1:
-                segments.append(current); current = []
-            current.append((x, idx))
-        if current: segments.append(current)
-        for seg in segments:
-            x_start = seg[0][0]
-            runs, i = [], 0
-            while i < len(seg):
-                idx = seg[i][1]
-                j = i + 1
-                while j < len(seg) and seg[j][1] == idx:
-                    j += 1
-                runs.append([idx, j - i])
-                i = j
-            rows.append([y, x_start, runs])
+    for i, start_idx in enumerate(segment_starts):
+        y = int(ys[start_idx]); x_start = int(xs[start_idx])
+        end_idx = segment_starts[i+1] if i+1 < len(segment_starts) else len(xs)
+        seg_idxs = idxs[start_idx:end_idx]
+        idx_changes = np.ones(len(seg_idxs), dtype=bool)
+        idx_changes[1:] = (seg_idxs[1:] != seg_idxs[:-1])
+        run_starts = np.where(idx_changes)[0]
+        run_lengths = np.diff(np.append(run_starts, len(seg_idxs)))
+        runs = [[int(seg_idxs[r]), int(run_lengths[j])] for j, r in enumerate(run_starts)]
+        rows.append([y, x_start, runs])
     return rows
 
 
-def build_diff_payload(base_time, timestamp, changes, color_to_idx):
-    if not changes:
+def build_diff_payload(base_time, timestamp, xs, ys, idxs):
+    if len(xs) == 0:
         payload = {'base': base_time, 'timestamp': timestamp,
                    'format': 'v2-flat', 'changes': []}
         return payload, json.dumps(payload, separators=(',', ':')).encode(), 'v2-flat'
-    flat = [[x, y, color_to_idx[c]] for x, y, c in changes]
+    flat = np.column_stack((xs, ys, idxs)).tolist()
     fp = {'base': base_time, 'timestamp': timestamp, 'format': 'v2-flat', 'changes': flat}
     fb = json.dumps(fp, separators=(',', ':')).encode()
-    rows = encode_rle_rows(changes, color_to_idx)
+    rows = encode_rle_rows_np(xs, ys, idxs)
     rp = {'base': base_time, 'timestamp': timestamp, 'format': 'v3-rle', 'rows': rows}
     rb = json.dumps(rp, separators=(',', ':')).encode()
     if len(rb) < len(fb):
@@ -114,18 +126,30 @@ def build_diff_payload(base_time, timestamp, changes, color_to_idx):
 
 
 def diff_content_set(diff):
+    """Return int-packed set of (y<<32)|(x<<16)|idx. Returns None for v1."""
+    fmt = diff.get('format', 'v1')
+    if fmt == 'v1':
+        return None
     if 'rows' in diff:
         s = set()
         for y, x0, runs in diff['rows']:
             x = x0
             for idx, length in runs:
                 for i in range(length):
-                    s.add((x + i, y, idx))
+                    s.add((y << 32) | ((x + i) << 16) | idx)
                 x += length
         return s
     if 'changes' in diff:
-        return set(tuple(c) for c in diff['changes'])
+        return set((y << 32) | (x << 16) | idx for x, y, idx in diff['changes'])
     return None
+
+
+def pack_change_set(xs, ys, idxs):
+    """Match diff_content_set encoding for cross-run comparison."""
+    if len(xs) == 0:
+        return set()
+    packed = (ys.astype(np.int64) << 32) | (xs.astype(np.int64) << 16) | idxs.astype(np.int64)
+    return set(packed.tolist())
 
 
 def parse_ts(name):
@@ -150,22 +174,30 @@ def main():
 
     snap_path = Path(args.snapshot)
     if not snap_path.exists():
-        print(f"ERROR: snapshot not found: {snap_path}", file=sys.stderr)
+        print(f"ERROR: snapshot not found: {snap_path}", file=sys.stderr, flush=True)
         sys.exit(1)
     snap_name = snap_path.name
     new_time = parse_ts(snap_name)
     if not new_time:
-        print(f"ERROR: cannot parse timestamp from {snap_name}", file=sys.stderr)
+        print(f"ERROR: cannot parse timestamp from {snap_name}", file=sys.stderr, flush=True)
         sys.exit(1)
     png_size = snap_path.stat().st_size
 
-    print(f"New snapshot: {snap_name} ({png_size/1024/1024:.2f} MB)")
-    print(f"Timestamp:    {new_time}")
+    print(f"New snapshot: {snap_name} ({png_size/1024/1024:.2f} MB)", flush=True)
+    print(f"Timestamp:    {new_time}", flush=True)
+
+    # --- Cull check FIRST — before palette, before anything that could write
+    new_arr, has_trans = load_image(snap_path)
+    if not has_trans:
+        print(f"{new_time}: WARNING: Image has zero transparency (flattened)", flush=True)
+        print(f"  This indicates a stitcher/pngquant failure — the PNG was likely produced incorrectly", flush=True)
+        print(f"  Snapshot will NOT be uploaded and NOT added to timeline", flush=True)
+        print(f"  Next scheduled run will proceed normally", flush=True)
+        sys.exit(0)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        palette = ensure_palette(env, snap_path, tmp)
-        color_to_idx = {c: i for i, c in enumerate(palette)}
+        palette = ensure_palette(env, new_arr, tmp)
 
         timeline_path = tmp / 'timeline.json'
         try:
@@ -173,25 +205,25 @@ def main():
         except subprocess.CalledProcessError:
             pass
         if not timeline_path.exists():
-            print("No existing timeline.json; initializing with this snapshot as base.")
+            print("No existing timeline.json; initializing with this snapshot as base.", flush=True)
             upload(env, str(snap_path), snap_name)
             timeline = [{"time": new_time, "kind": "png", "src": snap_name,
                          "name": new_time, "bytes": png_size}]
             save_timeline(env, tmp, timeline)
-            print("Done (first entry).")
+            print("Done (first entry).", flush=True)
             return
         timeline = json.load(open(timeline_path))
-        print(f"Loaded timeline: {len(timeline)} entries")
+        print(f"Loaded timeline: {len(timeline)} entries", flush=True)
 
         if not timeline:
-            print("ERROR: timeline.json is empty", file=sys.stderr)
+            print("ERROR: timeline.json is empty", file=sys.stderr, flush=True)
             sys.exit(1)
 
         last = timeline[-1]
         if last['time'] >= new_time:
-            print(f"ERROR: {new_time} not newer than {last['time']}", file=sys.stderr)
+            print(f"ERROR: {new_time} not newer than {last['time']}", file=sys.stderr, flush=True)
             sys.exit(1)
-        print(f"Previous tip: {last['time']} ({last['kind']})")
+        print(f"Previous tip: {last['time']} ({last['kind']})", flush=True)
 
         base_entry = None
         for entry in reversed(timeline):
@@ -199,28 +231,28 @@ def main():
                 base_entry = entry
                 break
         if not base_entry:
-            print("ERROR: no PNG base in timeline", file=sys.stderr)
+            print("ERROR: no PNG base in timeline", file=sys.stderr, flush=True)
             sys.exit(1)
 
         base_path = tmp / base_entry['src']
-        print(f"Downloading base: {base_entry['src']}")
+        print(f"Downloading base: {base_entry['src']}", flush=True)
         download(env, base_entry['src'], str(base_path))
-        base_arr = load_rgb(base_path)
-        new_arr = load_rgb(snap_path)
+        base_arr, _ = load_image(base_path)
 
         if base_arr.shape != new_arr.shape:
-            print(f"Size change {base_arr.shape} -> {new_arr.shape}; uploading as new base PNG.")
+            print(f"Size change {base_arr.shape} -> {new_arr.shape}; uploading as new base PNG.", flush=True)
             upload(env, str(snap_path), snap_name)
             timeline.append({"time": new_time, "kind": "png", "src": snap_name,
                              "name": new_time, "bytes": png_size})
             save_timeline(env, tmp, timeline)
-            print(f"Done. Timeline: {len(timeline)} entries.")
+            print(f"Done. Timeline: {len(timeline)} entries.", flush=True)
             return
 
-        changes = compute_changes(base_arr, new_arr)
-        print(f"Changes vs base: {len(changes):,}")
+        xs, ys, idxs = compute_changes_np(base_arr, new_arr, palette)
+        print(f"Changes vs base: {len(xs):,}", flush=True)
+        curr_set = pack_change_set(xs, ys, idxs)
 
-        # --- Activity: pixels changed since previous snapshot (symmetric diff of chains)
+        # --- Activity + dedupe
         activity = None
         prev_diff_set = None
         if last['kind'] == 'diff' and last.get('base') == base_entry['time']:
@@ -229,18 +261,17 @@ def main():
                 download(env, last['src'], str(prev_path))
                 prev_diff = json.load(open(prev_path))
                 prev_diff_set = diff_content_set(prev_diff)
-                curr_set = set((x, y, color_to_idx[c]) for x, y, c in changes)
-                activity = len(curr_set ^ prev_diff_set)
+                if prev_diff_set is not None:
+                    activity = len(curr_set ^ prev_diff_set)
+                else:
+                    print("Prior diff is v1 format — dedupe disabled for this run", flush=True)
             except Exception as e:
-                print(f"Warning: activity check skipped ({e})")
+                print(f"Warning: activity check skipped ({e})", flush=True)
         if activity is not None:
-            print(f"Activity: {activity:,} pixels changed since previous snapshot")
+            print(f"Activity: {activity:,} pixels changed since previous snapshot", flush=True)
 
-        # --- Dedupe
-        if (prev_diff_set is not None
-                and activity is not None
-                and activity == 0):
-            print(f"Identical to previous snapshot; reusing {last['src']}")
+        if prev_diff_set is not None and activity == 0:
+            print(f"Identical to previous snapshot; reusing {last['src']}", flush=True)
             timeline.append({
                 "time": new_time, "kind": "diff",
                 "format": last.get('format', 'v1'),
@@ -248,20 +279,19 @@ def main():
                 "name": new_time, "bytes": 0,
             })
             save_timeline(env, tmp, timeline)
-            print(f"Done (reused). Timeline: {len(timeline)} entries.")
+            print(f"Done (reused). Timeline: {len(timeline)} entries.", flush=True)
             return
 
         payload, encoded, fmt = build_diff_payload(
-            base_entry['time'], new_time, changes, color_to_idx)
-        print(f"Encoded: {fmt}, {len(encoded)/1024:.1f} KB")
+            base_entry['time'], new_time, xs, ys, idxs)
+        print(f"Encoded: {fmt}, {len(encoded)/1024:.1f} KB", flush=True)
 
-        # --- Promote decision
         cumulative = sum(e.get('bytes', 0) for e in timeline
                          if e['kind'] == 'diff' and e.get('base') == base_entry['time'])
         cumulative += len(encoded)
         print(f"Cumulative chain: {cumulative/1024/1024:.2f} MB "
               f"(PNG size {png_size/1024/1024:.2f} MB, "
-              f"threshold {CUMULATIVE_MULTIPLIER:.1f}x)")
+              f"threshold {CUMULATIVE_MULTIPLIER:.1f}x)", flush=True)
 
         single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
         cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
@@ -269,7 +299,7 @@ def main():
         if activity is None:
             churning = True
         else:
-            churning = activity > len(changes) * ACTIVITY_FRACTION
+            churning = activity > len(curr_set) * ACTIVITY_FRACTION
 
         promote_reason = None
         if single_exceeded:
@@ -278,17 +308,18 @@ def main():
             promote_reason = 'cumulative'
         elif cumulative_exceeded and not churning:
             print(f"  (deferred promote: cumulative over threshold but chain settled; "
-                  f"activity={activity or 0:,} < {ACTIVITY_FRACTION*100:.0f}% of {len(changes):,})")
+                  f"activity={activity or 0:,} < {ACTIVITY_FRACTION*100:.0f}% of {len(curr_set):,})",
+                  flush=True)
 
         if promote_reason:
-            print(f"Promoting to PNG ({promote_reason}).")
+            print(f"Promoting to PNG ({promote_reason}).", flush=True)
             upload(env, str(snap_path), snap_name)
             timeline.append({"time": new_time, "kind": "png", "src": snap_name,
                              "name": new_time, "bytes": png_size})
         else:
             diff_name = f"wdpdiff_{new_time}.json"
             (tmp / diff_name).write_bytes(encoded)
-            print(f"Uploading diff: {diff_name}")
+            print(f"Uploading diff: {diff_name}", flush=True)
             upload(env, str(tmp / diff_name), diff_name)
             timeline.append({
                 "time": new_time, "kind": "diff", "format": fmt,
@@ -297,7 +328,7 @@ def main():
             })
 
         save_timeline(env, tmp, timeline)
-        print(f"Done. Timeline: {len(timeline)} entries.")
+        print(f"Done. Timeline: {len(timeline)} entries.", flush=True)
 
 
 if __name__ == '__main__':
