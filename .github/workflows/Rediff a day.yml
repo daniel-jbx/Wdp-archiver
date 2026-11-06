@@ -1,0 +1,296 @@
+name: Rediff a day
+
+on:
+  workflow_dispatch:
+    inputs:
+      date:
+        description: 'Day to rediff (YYYYMMDD)'
+        required: true
+      dry_run:
+        description: 'Dry run — reconstruct and re-diff locally, no R2 writes'
+        type: boolean
+        default: false
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  rediff:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            make-diffs.py
+            backfill-day.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python3 -m pip install --quiet pillow numpy
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download timeline and palette
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p assets day publish
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          rclone copyto ":s3:${R2_BUCKET}/palette.json" palette.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Determine required files
+        run: |
+          python3 << 'PY'
+          import json, sys
+          timeline = json.load(open('timeline.json'))
+          day = "${{ inputs.date }}"
+          day_start = day + '_000000'
+          day_end = day + '_999999'
+
+          day_entries = [e for e in timeline if day_start <= e['time'] <= day_end]
+          if not day_entries:
+              print(f"ERROR: no entries for {day} in timeline")
+              sys.exit(1)
+
+          prior = [e for e in timeline if e['time'] < day_start]
+          start_base = next((e for e in reversed(prior) if e['kind'] == 'png'), None)
+          if start_base is None:
+              start_base = next((e for e in day_entries if e['kind'] == 'png'), None)
+              if start_base is None:
+                  print("ERROR: no base found at or before target day")
+                  sys.exit(1)
+
+          start_idx = next(i for i, e in enumerate(timeline)
+                           if e['time'] == start_base['time'] and e['kind'] == 'png')
+          last_time = day_entries[-1]['time']
+          end_idx = next(i for i, e in enumerate(timeline) if e['time'] == last_time)
+
+          relevant = timeline[start_idx:end_idx+1]
+          download_files = [e['src'] for e in relevant]
+          old_day_files = [e['src'] for e in day_entries]
+
+          with open('download-list.txt', 'w') as f:
+              f.write('\n'.join(download_files))
+          with open('old-day-files.txt', 'w') as f:
+              f.write('\n'.join(old_day_files))
+
+          print(f"Will download {len(download_files)} files for reconstruction")
+          print(f"Day has {len(day_entries)} existing files (bases + diffs)")
+          PY
+
+      - name: Download reconstruction assets
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copy ":s3:${R2_BUCKET}" assets/ \
+            --files-from download-list.txt \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "Downloaded $(ls assets/ | wc -l) files"
+
+      - name: Reconstruct PNGs from bases + diffs
+        run: |
+          python3 << 'PY'
+          import json, sys
+          from pathlib import Path
+          import numpy as np
+          from PIL import Image
+
+          def hex_to_rgb(h):
+              return int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+
+          def apply_diff(arr_rgba, diff, palette):
+              if 'rows' in diff:
+                  for y, x_start, runs in diff['rows']:
+                      x = x_start
+                      for idx, length in runs:
+                          r, g, b = hex_to_rgb(palette[idx])
+                          arr_rgba[y, x:x+length, 0] = r
+                          arr_rgba[y, x:x+length, 1] = g
+                          arr_rgba[y, x:x+length, 2] = b
+                          x += length
+              elif 'changes' in diff:
+                  for x, y, idx in diff['changes']:
+                      r, g, b = hex_to_rgb(palette[idx])
+                      arr_rgba[y, x, 0] = r
+                      arr_rgba[y, x, 1] = g
+                      arr_rgba[y, x, 2] = b
+
+          timeline = json.load(open('timeline.json'))
+          palette = json.load(open('palette.json'))
+          day = "${{ inputs.date }}"
+          day_start = day + '_000000'
+          day_end = day + '_999999'
+
+          day_entries = [e for e in timeline if day_start <= e['time'] <= day_end]
+          prior = [e for e in timeline if e['time'] < day_start]
+          start_base = next((e for e in reversed(prior) if e['kind'] == 'png'), None)
+          if start_base is None:
+              start_base = next((e for e in day_entries if e['kind'] == 'png'), None)
+
+          start_idx = next(i for i, e in enumerate(timeline)
+                           if e['time'] == start_base['time'] and e['kind'] == 'png')
+          last_time = day_entries[-1]['time']
+          end_idx = next(i for i, e in enumerate(timeline) if e['time'] == last_time)
+
+          src_dir = Path('assets')
+          out_dir = Path('day')
+
+          current_rgba = np.array(Image.open(src_dir / start_base['src']).convert('RGBA'))
+          current_time = start_base['time']
+
+          def save_if_in_day(arr, t):
+              if t.startswith(day):
+                  out = out_dir / f"wdpsnapshot_{t}.png"
+                  Image.fromarray(arr, 'RGBA').save(out)
+                  print(f"  Saved {out.name}")
+
+          save_if_in_day(current_rgba, current_time)
+
+          for entry in timeline[start_idx+1:end_idx+1]:
+              if entry['kind'] == 'diff':
+                  diff = json.load(open(src_dir / entry['src']))
+                  apply_diff(current_rgba, diff, palette)
+                  current_time = entry['time']
+                  save_if_in_day(current_rgba, current_time)
+              elif entry['kind'] == 'png':
+                  current_rgba = np.array(Image.open(src_dir / entry['src']).convert('RGBA'))
+                  current_time = entry['time']
+                  save_if_in_day(current_rgba, current_time)
+
+          count = len(list(out_dir.glob('*.png')))
+          print(f"\nReconstructed {count} PNGs (expected {len(day_entries)})")
+          if count != len(day_entries):
+              print(f"WARNING: count mismatch", file=sys.stderr)
+          PY
+
+      - name: Revert timeline (remove target day's entries)
+        run: |
+          python3 << 'PY'
+          import json
+          day = "${{ inputs.date }}"
+          t = json.load(open('timeline.json'))
+          reverted = [e for e in t if not e['time'].startswith(day)]
+          json.dump(reverted, open('timeline.json', 'w'), indent=2)
+          print(f"Reverted timeline: {len(t)} -> {len(reverted)} entries")
+          PY
+
+      - name: Run backfill conversion with new make-diffs
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python3 backfill-day.py \
+            --date "${{ inputs.date }}" \
+            --day-dir day \
+            --main-timeline timeline.json \
+            --canonical-palette palette.json \
+            --publish-dir publish \
+            --merged-timeline-out merged-timeline.json \
+            --files-to-delete-out delete-list.txt \
+            --prior-base-dir assets
+
+      - name: Effective mode
+        id: mode
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "dry_run=false" >> $GITHUB_OUTPUT
+          else
+            echo "dry_run=${{ inputs.dry_run }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload new bases + diffs
+        if: steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          for f in publish/*.png publish/wdpdiff_*.json; do
+            [ -e "$f" ] || continue
+            b=$(basename "$f")
+            rclone copyto "$f" ":s3:${R2_BUCKET}/${b}" \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket --log-level ERROR
+          done
+
+      - name: Update main timeline
+        if: steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto merged-timeline.json ":s3:${R2_BUCKET}/timeline.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Delete stale old bases + diffs from R2
+        if: steps.mode.outputs.dry_run == 'false'
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python3 << 'PY'
+          from pathlib import Path
+          old = [line.strip() for line in open('old-day-files.txt') if line.strip()]
+          new = set(p.name for p in Path('publish').iterdir()
+                    if p.name.startswith('wdpsnapshot_') or p.name.startswith('wdpdiff_'))
+          stale = [f for f in old if f not in new]
+          with open('delete-old.txt', 'w') as f:
+              f.write('\n'.join(stale))
+          print(f"Stale old files to delete: {len(stale)}")
+          PY
+          if [ -s delete-old.txt ]; then
+            rclone delete ":s3:${R2_BUCKET}" \
+              --files-from delete-old.txt \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket --log-level ERROR
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rediff-${{ inputs.date }}-${{ github.run_id }}
+          path: |
+            day/
+            publish/
+            merged-timeline.json
+            download-list.txt
+            old-day-files.txt
+            delete-old.txt
+          retention-days: 90
+          if-no-files-found: warn
