@@ -19,6 +19,7 @@ def rclone(env, *args):
          f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
          f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
          '--s3-no-check-bucket',
+         '--log-level', 'ERROR',   # <-- Suppress "Config file not found" NOTICE spam
          '--timeout', '15s',
          '--contimeout', '15s',
          '--retries', '3',
