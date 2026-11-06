@@ -21,7 +21,7 @@ on:
         default: '2.0'
 
 concurrency:
-  group: update-map
+  group: update-mapadss
   cancel-in-progress: false
 
 permissions:
