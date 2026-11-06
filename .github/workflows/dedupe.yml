@@ -25,7 +25,7 @@ on:
         default: false
 
 concurrency:
-  group: update-map
+  group: update-maps
   cancel-in-progress: false
 
 permissions:
