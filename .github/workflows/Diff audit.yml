@@ -1,0 +1,265 @@
+name: Audit timeline for bloat and broken refs
+
+on:
+  workflow_dispatch:
+    inputs:
+      date_start:
+        description: 'Range start (YYYYMMDD) — blank = earliest'
+        required: false
+        default: ''
+      date_end:
+        description: 'Range end (YYYYMMDD) — blank = today'
+        required: false
+        default: ''
+      threshold_multiplier:
+        description: 'Cumulative bloat threshold (multiple of P)'
+        required: false
+        default: '1.0'
+      major_bloat_multiplier:
+        description: 'Severity cutoff for MAJOR flag (multiple of P)'
+        required: false
+        default: '2.0'
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download timeline
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Analyze
+        env:
+          DATE_START: ${{ inputs.date_start }}
+          DATE_END: ${{ inputs.date_end }}
+          THRESHOLD_MULT: ${{ inputs.threshold_multiplier }}
+          MAJOR_MULT: ${{ inputs.major_bloat_multiplier }}
+        run: |
+          python3 -u << 'PY'
+          import json, os
+          from collections import defaultdict, OrderedDict
+          from pathlib import Path
+
+          threshold_mult = float(os.environ['THRESHOLD_MULT'])
+          major_mult = float(os.environ['MAJOR_MULT'])
+          date_start = os.environ.get('DATE_START', '').strip() or '00000000'
+          date_end = os.environ.get('DATE_END', '').strip() or '99999999'
+
+          timeline = json.load(open('timeline.json'))
+          print(f"Timeline: {len(timeline)} entries")
+
+          png_entries = {e['time']: e for e in timeline if e['kind'] == 'png'}
+          png_times = set(png_entries.keys())
+
+          by_day = OrderedDict()
+          for e in timeline:
+              by_day.setdefault(e['time'][:8], []).append(e)
+
+          day_info = {}
+          for day, entries in by_day.items():
+              if day < date_start or day > date_end:
+                  continue
+              first = entries[0]
+              inherited_base = first.get('base') if first['kind'] == 'diff' else None
+
+              if inherited_base and inherited_base in png_entries:
+                  base_bytes = png_entries[inherited_base].get('bytes', 0)
+                  pre_day_diffs = [
+                      e for e in timeline
+                      if e['kind'] == 'diff'
+                      and e.get('base') == inherited_base
+                      and e['time'] < day + '_000000'
+                  ]
+                  start_cumulative = sum(e.get('bytes', 0) for e in pre_day_diffs)
+              elif first['kind'] == 'png':
+                  base_bytes = first.get('bytes', 0)
+                  start_cumulative = 0
+              else:
+                  base_bytes = 0
+                  start_cumulative = 0
+
+              cumulative = start_cumulative
+              max_cumulative = cumulative
+              over_count = 0
+              major_count = 0
+              broken_base_count = 0
+              promotes = 0
+              diffs_written = 0
+              total_diff_bytes = 0
+              broken_samples = []
+              current_base_bytes = base_bytes
+
+              for e in entries:
+                  if e['kind'] == 'png':
+                      current_base_bytes = e.get('bytes', 0)
+                      cumulative = 0
+                      promotes += 1
+                  elif e['kind'] == 'diff':
+                      base_ref = e.get('base')
+                      if base_ref and base_ref not in png_times:
+                          broken_base_count += 1
+                          if len(broken_samples) < 3:
+                              broken_samples.append((e['time'], base_ref))
+                          continue
+                      cumulative += e.get('bytes', 0)
+                      if cumulative > max_cumulative:
+                          max_cumulative = cumulative
+                      if current_base_bytes and cumulative > threshold_mult * current_base_bytes:
+                          over_count += 1
+                      if current_base_bytes and cumulative > major_mult * current_base_bytes:
+                          major_count += 1
+                      diffs_written += 1
+                      total_diff_bytes += e.get('bytes', 0)
+
+              if broken_base_count > 0:
+                  status = 'BROKEN'
+              elif major_count > 0:
+                  status = 'MAJOR'
+              elif over_count > 0:
+                  status = 'SUSPICIOUS'
+              elif start_cumulative > threshold_mult * base_bytes and base_bytes > 0:
+                  status = 'INHERITED'
+              else:
+                  status = 'CLEAN'
+
+              needs_rediff = over_count > 0 or broken_base_count > 0
+
+              day_info[day] = {
+                  'status': status,
+                  'entries': len(entries),
+                  'promotes': promotes,
+                  'diffs_written': diffs_written,
+                  'total_diff_bytes': total_diff_bytes,
+                  'inherited_base': inherited_base,
+                  'start_cumulative': start_cumulative,
+                  'base_png_size': base_bytes,
+                  'max_cumulative': max_cumulative,
+                  'over_threshold_count': over_count,
+                  'major_bloat_count': major_count,
+                  'broken_base_count': broken_base_count,
+                  'broken_samples': broken_samples,
+                  'needs_rediff': needs_rediff,
+              }
+
+          statuses = defaultdict(list)
+          for day, info in day_info.items():
+              statuses[info['status']].append(day)
+
+          print()
+          print("=" * 72)
+          print("SUMMARY")
+          print("=" * 72)
+          for status in ['BROKEN', 'MAJOR', 'SUSPICIOUS', 'INHERITED', 'CLEAN']:
+              days = statuses.get(status, [])
+              print(f"  {status:<12} {len(days):>4} days")
+              if days and status != 'CLEAN' and len(days) <= 20:
+                  print(f"    {', '.join(days)}")
+
+          print()
+          print("=" * 72)
+          print("REDIFF RECOMMENDATION")
+          print("=" * 72)
+
+          need_rediff = sorted(d for d, i in day_info.items() if i['needs_rediff'])
+          all_days_sorted = sorted(day_info.keys())
+
+          if not need_rediff:
+              print("  No days need rediffing under the new 1x P threshold.")
+          else:
+              earliest = need_rediff[0]
+              latest = all_days_sorted[-1]
+              cascade_days = [d for d in all_days_sorted if d >= earliest]
+              print(f"  Earliest day whose promote points would change: {earliest}")
+              print(f"  Rediff must span from {earliest} through {latest}")
+              print(f"  Total days to rediff: {len(cascade_days)}")
+              print()
+              print("  Why the whole range:")
+              print("  - Rediffing day X changes its promote points under 1x P.")
+              print("  - Day X+1's diffs reference a PNG that may no longer exist in X.")
+              print("  - So X+1 must be rediffed too, even if it looked clean.")
+              print("  - Cascade continues until a day that starts below 1x P.")
+              print(f"  - This archive's cascade boundary is day {latest}.")
+
+          non_clean = sorted(d for d, i in day_info.items() if i['status'] != 'CLEAN')
+          if non_clean:
+              print()
+              print("=" * 72)
+              print("NON-CLEAN DAYS")
+              print("=" * 72)
+              print(f"{'Day':<10} {'Status':<12} {'StartKB':>9} {'MaxKB':>9} {'PNG_KB':>8} {'#Over':>6} {'#Major':>7} {'#Broken':>8} {'Promotes':>9}")
+              for day in non_clean:
+                  info = day_info[day]
+                  print(f"{day:<10} {info['status']:<12} "
+                        f"{info['start_cumulative']/1024:>9.0f} "
+                        f"{info['max_cumulative']/1024:>9.0f} "
+                        f"{info['base_png_size']/1024:>8.0f} "
+                        f"{info['over_threshold_count']:>6} "
+                        f"{info['major_bloat_count']:>7} "
+                        f"{info['broken_base_count']:>8} "
+                        f"{info['promotes']:>9}")
+
+          broken_days = statuses.get('BROKEN', [])
+          if broken_days:
+              print()
+              print("=" * 72)
+              print("BROKEN BASE REFERENCES (fix immediately)")
+              print("=" * 72)
+              for day in broken_days[:10]:
+                  info = day_info[day]
+                  print(f"  {day}: {info['broken_base_count']} broken ref(s)")
+                  for t, base in info['broken_samples']:
+                      print(f"    {t} -> base={base}")
+
+          report = {
+              'summary': {s: len(days) for s, days in statuses.items()},
+              'rediff': {
+                  'earliest': need_rediff[0] if need_rediff else None,
+                  'end': all_days_sorted[-1] if need_rediff else None,
+                  'range_days': len([d for d in all_days_sorted if need_rediff and d >= need_rediff[0]]),
+              },
+              'days': {day: {
+                  'status': info['status'],
+                  'needs_rediff': info['needs_rediff'],
+                  'promotes': info['promotes'],
+                  'start_cumulative': info['start_cumulative'],
+                  'max_cumulative': info['max_cumulative'],
+                  'base_png_size': info['base_png_size'],
+                  'over_threshold_count': info['over_threshold_count'],
+                  'broken_base_count': info['broken_base_count'],
+              } for day, info in day_info.items()},
+          }
+          with open('audit-report.json', 'w') as f:
+              json.dump(report, f, indent=2)
+          print()
+          print(f"Report saved: audit-report.json ({Path('audit-report.json').stat().st_size} bytes)")
+          PY
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: audit-${{ github.run_id }}
+          path: audit-report.json
+          retention-days: 30
+          if-no-files-found: warn
