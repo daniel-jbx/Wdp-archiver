@@ -22,15 +22,9 @@ def parse_ts(name):
 def load_image(path):
     """Loads image, returns RGB array and a boolean indicating if it has transparency."""
     with Image.open(path) as im:
-        # Convert to RGBA to safely check for an alpha channel
         arr_rgba = np.array(im.convert('RGBA'))
-        
-        # Check if any pixel is fully transparent (Alpha == 0)
         has_transparency = np.any(arr_rgba[:, :, 3] == 0)
-        
-        # Extract RGB for the diffing process
         arr_rgb = arr_rgba[:, :, :3].copy()
-        
     return arr_rgb, has_transparency
 
 
@@ -46,9 +40,7 @@ def ensure_palette(sample_png, palette_path):
 
 
 def compute_changes_np(base_arr, new_arr, palette):
-    # STRICT CHECK: Any pixel that differs by even 1 value is a change
     mask = np.any(base_arr != new_arr, axis=2)
-    
     ys, xs = np.where(mask)
     colors = new_arr[ys, xs] 
     
@@ -183,6 +175,7 @@ def main():
 
     initial_base_arr = base_arr
     cumulative_prior = prior['cumulative_bytes'] if prior else 0
+    bytes_since_base = cumulative_prior  # <--- FIX: Track bytes since last base
 
     total_original = 0
     total_new = 0
@@ -205,13 +198,11 @@ def main():
 
         new_arr, has_trans = load_image(png_path)
         
-        # CULL FLATTENED IMAGES
         if not has_trans:
             print(f"{t}: WARNING: Image has zero transparency (flattened). Culling from archive.", flush=True)
             culled_count += 1
             continue
 
-        # If we haven't set a base yet, this image becomes the base
         if initial_base_arr is None and base_arr is None:
             shutil.copy2(png_path, out_dir / png_path.name)
             base_arr = new_arr
@@ -220,6 +211,7 @@ def main():
                              "name": t, "bytes": png_size})
             prev_changes_set = set()
             total_new += orig_size
+            bytes_since_base = 0
             print(f"{t}: base png ({orig_size/1024/1024:.2f} MB)", flush=True)
             continue
 
@@ -227,7 +219,7 @@ def main():
             shutil.copy2(png_path, out_dir / png_path.name)
             base_arr = new_arr
             base_time = t
-            cumulative_prior = 0
+            bytes_since_base = 0
             prev_changes_set = set()
             timeline.append({"time": t, "kind": "png", "src": png_path.name,
                              "name": t, "bytes": png_size})
@@ -263,8 +255,7 @@ def main():
         if fmt == 'v3-rle': rle_wins += 1
         else:               flat_wins += 1
 
-        cumulative_this_run = sum(e.get('bytes', 0) for e in timeline if e['kind'] == 'diff')
-        cumulative = cumulative_prior + cumulative_this_run + len(encoded)
+        cumulative = bytes_since_base + len(encoded)
 
         single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
         cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
@@ -283,7 +274,7 @@ def main():
             shutil.copy2(png_path, out_dir / png_path.name)
             base_arr = new_arr
             base_time = t
-            cumulative_prior = 0
+            bytes_since_base = 0
             prev_changes_set = curr_set
             timeline.append({"time": t, "kind": "png", "src": png_path.name,
                              "name": t, "bytes": png_size})
@@ -300,6 +291,7 @@ def main():
             })
             prev_changes_set = curr_set
             total_new += len(encoded)
+            bytes_since_base += len(encoded)
             print(f"{t}: {fmt} {len(curr_set):,} changes -> {len(encoded)/1024:.1f} KB", flush=True)
 
     (out_dir / 'timeline.json').write_text(json.dumps(timeline, indent=2))
