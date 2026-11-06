@@ -14,6 +14,7 @@ permissions:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout main branch (to get scripts)
         uses: actions/checkout@v4
@@ -69,13 +70,17 @@ jobs:
         run: python3 -m pip install --quiet --disable-pip-version-check pillow numpy
 
       - name: Download and stitch tiles
+        timeout-minutes: 10
         run: bash download-and-stitch.sh
 
       - name: Compress to 64-color indexed PNG (preserves transparency)
         run: |
           echo "Original size:"
           ls -lh output.png
-          pngquant --quality=80-100 --speed=1 --force --verbose 64 output.png --output output.png
+          # --quality=100 forces lossless quantization: fails (exit 99) if source has >64 colors.
+          # This catches upstream corruption (anti-aliasing, rendering bugs) loudly rather than
+          # silently degrading. Current data is losslessly quantizable (MSE=0.000 in logs).
+          pngquant --quality=100 --speed=1 --force --verbose 64 output.png --output output.png
           echo "Compressed size:"
           ls -lh output.png
 
@@ -91,3 +96,12 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
+
+      - name: Preserve snapshot on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-snapshot-${{ github.run_id }}
+          path: wdpsnapshot_*.png
+          retention-days: 7
+          if-no-files-found: warn
