@@ -1,0 +1,178 @@
+name: Reconcile timelines
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Analyze only, no R2 writes'
+        type: boolean
+        default: true
+
+concurrency:
+  group: reconcile
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download both timelines
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline-prod.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          rclone copyto ":s3:${R2_BUCKET}/timeline-rediff.json" timeline-rediff.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Merge and validate
+        run: |
+          python3 -u << 'PY'
+          import json, sys
+          from pathlib import Path
+
+          rediff = json.load(open('timeline-rediff.json'))
+          prod = json.load(open('timeline-prod.json'))
+
+          print(f"Rediff timeline:  {len(rediff)} entries")
+          print(f"Production:       {len(prod)} entries")
+
+          if not rediff:
+              print("ERROR: rediff timeline empty")
+              sys.exit(1)
+
+          T_rediff_end = rediff[-1]['time']
+          print(f"Rediff ends at:   {T_rediff_end}")
+
+          prod_after = [e for e in prod if e['time'] > T_rediff_end]
+          print(f"Production entries after T_rediff_end: {len(prod_after)}")
+
+          # Sanity check: production and rediff share history up to T_rediff_end
+          prod_at_boundary = [e for e in prod if e['time'] == T_rediff_end]
+          if not prod_at_boundary:
+              print(f"WARNING: no production entry exactly at {T_rediff_end}")
+              # That's OK — the boundary may be off by a few seconds
+
+          merged = rediff + prod_after
+          merged.sort(key=lambda e: e['time'])
+
+          # Validate: check for broken base refs
+          png_times = {e['time'] for e in merged if e['kind'] == 'png'}
+          broken_days = set()
+          for e in merged:
+              if e['kind'] == 'diff':
+                  base = e.get('base')
+                  if base and base not in png_times:
+                      broken_days.add(e['time'][:8])
+
+          # Duplicates
+          times = [e['time'] for e in merged]
+          dupes = set(t for t in times if times.count(t) > 1)
+
+          print()
+          print(f"Merged: {len(merged)} entries")
+          print(f"Days with broken base refs (need re-clean): {len(broken_days)}")
+          if broken_days:
+              for d in sorted(broken_days)[:20]:
+                  print(f"  {d}")
+          print(f"Duplicate timestamps: {len(dupes)}")
+          if dupes:
+              for t in sorted(dupes)[:5]:
+                  print(f"  {t}")
+              print("ERROR: duplicate timestamps in merged timeline")
+              sys.exit(1)
+
+          json.dump(merged, open('timeline-merged.json', 'w'), indent=2)
+          with open('broken-days.txt', 'w') as f:
+              f.write('\n'.join(sorted(broken_days)))
+
+          with open('summary.txt', 'w') as f:
+              f.write(f"rediff_end: {T_rediff_end}\n")
+              f.write(f"merged_entries: {len(merged)}\n")
+              f.write(f"broken_days: {len(broken_days)}\n")
+          PY
+
+      - name: Upload merged timeline
+        if: ${{ !inputs.dry_run }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          # Race guard: re-check timeline.json hasn't changed since we downloaded it
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline-check.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+          OLD_LAST=$(python3 -c "import json; print(json.load(open('timeline-prod.json'))[-1]['time'])")
+          NEW_LAST=$(python3 -c "import json; print(json.load(open('timeline-check.json'))[-1]['time'])")
+          if [ "$OLD_LAST" != "$NEW_LAST" ]; then
+            echo "Timeline changed since merge started (production wrote during merge)."
+            echo "Old last: $OLD_LAST"
+            echo "New last: $NEW_LAST"
+            echo "Re-run reconcile to pick up the new production entries."
+            exit 1
+          fi
+
+          # Upload merged as timeline.json
+          rclone copyto timeline-merged.json ":s3:${R2_BUCKET}/timeline.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "Uploaded merged timeline as timeline.json"
+
+          # Delete timeline-rediff.json so future rediff runs fall back to timeline.json
+          rclone delete ":s3:${R2_BUCKET}/timeline-rediff.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR || true
+          echo "Deleted timeline-rediff.json (rediff now targets timeline.json)"
+
+      - name: Report
+        if: always()
+        run: |
+          if [ -f summary.txt ]; then
+            echo "### Reconcile summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            sed 's/^/- /' summary.txt >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            if [ -s broken-days.txt ]; then
+              echo "### Days needing re-clean" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+              while IFS= read -r d; do echo "- \`$d\`" >> $GITHUB_STEP_SUMMARY; done < broken-days.txt
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "Re-enable rediff cron — it will auto-pick these days." >> $GITHUB_STEP_SUMMARY
+            else
+              echo "### No broken days — merge complete" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reconcile-${{ github.run_id }}
+          path: |
+            timeline-merged.json
+            broken-days.txt
+            summary.txt
+          retention-days: 30
+          if-no-files-found: warn
