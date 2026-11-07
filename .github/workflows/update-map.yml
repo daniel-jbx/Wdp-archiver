@@ -57,8 +57,7 @@ jobs:
 
           # Install pngquant only (no imagemagick — the stitch script uses Python/PIL).
           # --no-install-recommends + single small package = ~500 KB download.
-          # Multi-layered retry: Acquire::Retries at the HTTP layer, timeout 180 per attempt,
-          # outer loop for apt-level failures.
+          # Multi-layered retry: Acquire::Retries at HTTP layer, timeout per attempt, outer loop.
           if ! sudo timeout 180 apt-get install -y --no-install-recommends \
                  -o Acquire::Retries=5 pngquant; then
             echo "First install attempt failed; cleaning and retrying..."
@@ -87,8 +86,8 @@ jobs:
           sudo dpkg -i rclone.deb
           rm rclone.deb
 
-      - name: Install Python deps (pillow, numpy)
-        run: python3 -m pip install --quiet --disable-pip-version-check pillow numpy
+      - name: Install Python deps (pillow, numpy, brotli)
+        run: python3 -m pip install --quiet --disable-pip-version-check pillow numpy brotli
 
       - name: Download and stitch tiles
         timeout-minutes: 10
@@ -108,6 +107,7 @@ jobs:
       - name: Generate diff and upload to R2
         run: |
           TIMESTAMP=$(date -u +'%Y%m%d_%H%M%S')
+          echo "SNAP_TIMESTAMP=${TIMESTAMP}" >> $GITHUB_ENV
           SNAPSHOT_FILE="wdpsnapshot_${TIMESTAMP}.png"
           mv output.png "${SNAPSHOT_FILE}"
           echo "Processing ${SNAPSHOT_FILE}..."
@@ -118,11 +118,22 @@ jobs:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
 
+      - name: Archive snapshot for rediff window
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: snap-${{ env.SNAP_TIMESTAMP }}
+          path: wdpsnapshot_*.png
+          retention-days: 90
+          if-no-files-found: warn
+
       - name: Preserve snapshot on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: failed-snapshot-${{ github.run_id }}
-          path: wdpsnapshot_*.png
+          path: |
+            output.png
+            wdpsnapshot_*.png
           retention-days: 7
           if-no-files-found: warn
