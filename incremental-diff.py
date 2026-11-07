@@ -56,12 +56,29 @@ def upload_brotli(env, compressed_bytes, remote):
 
 
 def read_diff(path):
-    """Read brotli-compressed or plain-JSON diff (backward compat with pre-migration files)."""
+    """Read brotli-compressed or plain-JSON diff."""
     raw = path.read_bytes()
     try:
         return json.loads(brotli.decompress(raw))
     except Exception:
         return json.loads(raw)
+
+
+def recheck_or_abort(env, tmp, timeline):
+    """Re-download timeline.json from R2 and compare against what we loaded at start.
+    If a concurrent writer (reconciler or rediff-fallback) modified it, abort without
+    saving — the snapshot will be re-captured on the next scheduled run."""
+    recheck_path = tmp / 'timeline-recheck.json'
+    try:
+        download(env, 'timeline.json', str(recheck_path))
+        fresh = json.load(open(recheck_path))
+        if len(fresh) != len(timeline) or (fresh and timeline and fresh[-1]['time'] != timeline[-1]['time']):
+            print(f"ABORT: timeline modified by concurrent writer "
+                  f"({len(timeline)}→{len(fresh)} entries). "
+                  f"Snapshot will be captured on next run.", flush=True)
+            sys.exit(0)
+    except subprocess.CalledProcessError:
+        pass  # can't recheck, proceed
 
 
 def load_image(path):
@@ -287,8 +304,10 @@ def main():
         if activity is not None:
             print(f"Activity: {activity:,} pixels changed since previous snapshot", flush=True)
 
+        # Dedupe path
         if prev_diff_set is not None and activity == 0:
             print(f"Identical to previous snapshot; reusing {last['src']}", flush=True)
+            recheck_or_abort(env, tmp, timeline)
             timeline.append({
                 "time": new_time, "kind": "diff",
                 "format": last.get('format', 'v1'),
@@ -299,6 +318,7 @@ def main():
             print(f"Done (reused). Timeline: {len(timeline)} entries.", flush=True)
             return
 
+        # Compute diff + promote decision
         payload, encoded_raw, fmt = build_diff_payload(
             base_entry['time'], new_time, xs, ys, idxs)
         encoded = brotli.compress(encoded_raw, quality=BROTLI_QUALITY)
@@ -319,6 +339,9 @@ def main():
             promote_reason = 'single-diff'
         elif cumulative_exceeded:
             promote_reason = 'cumulative'
+
+        # Recheck before any R2 write
+        recheck_or_abort(env, tmp, timeline)
 
         if promote_reason:
             print(f"Promoting to PNG ({promote_reason}).", flush=True)
