@@ -18,8 +18,12 @@ def rclone(env, *args):
          f'--s3-endpoint={env["R2_ENDPOINT"]}',
          f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
          f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
-         '--s3-no-check-bucket', '--log-level', 'ERROR',
-         '--timeout', '15s', '--contimeout', '15s', '--retries', '3', *args],
+         '--s3-no-check-bucket',
+         '--log-level', 'ERROR',
+         '--timeout', '15s',
+         '--contimeout', '15s',
+         '--retries', '3',
+         *args],
         check=True,
     )
 
@@ -58,7 +62,8 @@ def run_make_diffs(day_dir, out_dir, chain_state_path=None):
 
 def log_size_composition(day_dir):
     pngs = sorted(day_dir.glob('wdpsnapshot_*.png'))
-    if not pngs: return
+    if not pngs:
+        return
     sizes = {}
     for p in pngs:
         with Image.open(p) as im:
@@ -67,40 +72,53 @@ def log_size_composition(day_dir):
     for s, n in sorted(sizes.items()):
         print(f"  {n:>3} snapshots of {s[0]}x{s[1]}", flush=True)
     if len(sizes) > 1:
-        print(f"  Mixed sizes detected — expect {len(sizes)} base PNG(s)", flush=True)
+        print(f"  Mixed sizes detected — expect {len(sizes)} base PNG(s) from size transitions", flush=True)
 
 
 def verify_palette_coverage(day_dir, palette):
     pngs = sorted(day_dir.glob('wdpsnapshot_*.png'))
-    if not pngs: return
+    if not pngs:
+        return
     sample = pngs[0]
     palette_set = set(palette)
     with Image.open(sample) as im:
         arr = np.array(im.convert('RGB'))
         packed = (arr[:, :, 0].astype(np.uint32) << 16) | (arr[:, :, 1].astype(np.uint32) << 8) | arr[:, :, 2].astype(np.uint32)
-        for p in np.unique(packed):
+        unique_packed = np.unique(packed)
+        for p in unique_packed:
             hex_c = '#%06x' % p
             if hex_c not in palette_set:
                 print(f"ERROR: {sample.name} contains color {hex_c} not in canonical palette.", file=sys.stderr, flush=True)
                 sys.exit(1)
-    print(f"Palette check: {sample.name} verified ({len(pngs)} snapshots)", flush=True)
+    print(f"Palette check: {sample.name} verified against canonical palette "
+          f"(spot-check of 1 of {len(pngs)} snapshots)", flush=True)
 
 
 def find_chain_state(main_timeline, date):
     day_start = date + '_000000'
     prior = [e for e in main_timeline if e['time'] < day_start]
-    if not prior: return None
+    if not prior:
+        return None
     base_entry = None
     for e in reversed(prior):
         if e['kind'] == 'png':
             base_entry = e
             break
-    if base_entry is None: return None
+    if base_entry is None:
+        return None
     base_idx = next(i for i, e in enumerate(main_timeline)
                     if e['time'] == base_entry['time'] and e['kind'] == 'png')
-    cumulative = sum(e.get('bytes', 0) for e in main_timeline[base_idx+1:]
-                     if e['kind'] == 'diff' and e.get('base') == base_entry['time'])
-    last_diff_src = next((e['src'] for e in reversed(prior) if e['kind'] == 'diff'), None)
+    diffs_since_base = [e for e in main_timeline[base_idx+1:]
+                        if e['kind'] == 'diff' and e.get('base') == base_entry['time']]
+    cumulative = sum(e.get('bytes', 0) for e in diffs_since_base)
+    # last_diff must belong to the SAME chain (base == base_entry['time']).
+    # If the prior day's last entry was a promote PNG, there are no diffs after
+    # it in this chain — return None and let make-diffs skip activity comparison.
+    last_diff_src = next(
+        (e['src'] for e in reversed(prior)
+         if e['kind'] == 'diff' and e.get('base') == base_entry['time']),
+        None
+    )
     return {
         'base_time': base_entry['time'],
         'base_png_src': base_entry['src'],
@@ -125,12 +143,12 @@ def validate(old_timeline, new_timeline, date):
     if unexpected_new:
         print(f"ERROR: new timeline has unknown timestamps: {sorted(unexpected_new)[:5]}", file=sys.stderr, flush=True)
         return False
-    culled = len(old_times - new_times)
-    if culled:
-        print(f"  Note: {culled} timestamp(s) culled from {date}", flush=True)
-    old_non = [e for e in old_timeline if not e['time'].startswith(date)]
-    new_non = [e for e in new_timeline if not e['time'].startswith(date)]
-    if len(old_non) != len(new_non):
+    culled_count = len(old_times - new_times)
+    if culled_count:
+        print(f"  Note: {culled_count} timestamp(s) culled from {date}", flush=True)
+    old_non_day = [e for e in old_timeline if not e['time'].startswith(date)]
+    new_non_day = [e for e in new_timeline if not e['time'].startswith(date)]
+    if len(old_non_day) != len(new_non_day):
         print("ERROR: non-day entries count changed", file=sys.stderr, flush=True)
         return False
     return True
@@ -144,16 +162,18 @@ def recheck_timeline(env, publish_dir, date, main_timeline, timeline_name='timel
     print(f"  Fresh: {len(fresh)} entries (started with {len(main_timeline)})", flush=True)
     fresh_day = [e for e in fresh if e['time'].startswith(date)]
     if any(e['kind'] == 'diff' for e in fresh_day):
-        print(f"Day {date} was backfilled by a concurrent run. Aborting.", flush=True)
+        print(f"Day {date} was backfilled by a concurrent run. Aborting to avoid clobber.", flush=True)
         return None
     return fresh
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--next-pending', action='store_true')
+    ap.add_argument('--next-pending', action='store_true',
+                    help='Print next pending day (YYYYMMDD) and exit')
     ap.add_argument('--main-timeline', required=True)
-    ap.add_argument('--timeline-name', default='timeline.json')
+    ap.add_argument('--timeline-name', default='timeline.json',
+                    help='R2 filename of the timeline (default: timeline.json)')
     ap.add_argument('--date', default=None)
     ap.add_argument('--day-dir', default=None)
     ap.add_argument('--canonical-palette', default=None)
@@ -167,7 +187,8 @@ def main():
     if args.next_pending:
         main_timeline = json.load(open(args.main_timeline))
         day = next_pending(main_timeline)
-        if day is None: sys.exit(0)
+        if day is None:
+            sys.exit(0)
         print(day, flush=True)
         sys.exit(0)
 
@@ -194,7 +215,7 @@ def main():
 
     day_entries = [e for e in main_timeline if e['time'].startswith(args.date)]
     if not day_entries:
-        print(f"ERROR: no entries for {args.date}", file=sys.stderr, flush=True)
+        print(f"ERROR: no entries for {args.date} in main timeline", file=sys.stderr, flush=True)
         sys.exit(1)
     if any(e['kind'] == 'diff' for e in day_entries):
         print(f"Day {args.date} already has diff entries — nothing to do.", flush=True)
@@ -202,6 +223,7 @@ def main():
     print(f"Day {args.date}: {len(day_entries)} entries, all PNGs", flush=True)
 
     log_size_composition(day_dir)
+
     palette = json.load(open(args.canonical_palette))
     print(f"Canonical palette: {len(palette)} colors", flush=True)
     verify_palette_coverage(day_dir, palette)
@@ -222,11 +244,14 @@ def main():
             sys.exit(1)
         last_diff_local = None
         if chain_state['last_diff_src']:
-            last_diff_local = prior_base_dir / chain_state['last_diff_src']
-            if not last_diff_local.exists():
-                print(f"ERROR: prior last diff not pre-downloaded: {last_diff_local}",
-                      file=sys.stderr, flush=True)
-                sys.exit(1)
+            candidate = prior_base_dir / chain_state['last_diff_src']
+            if candidate.exists():
+                last_diff_local = candidate
+            else:
+                # Graceful degradation: activity comparison skipped for first snapshot.
+                # One extra small diff for the day, but the batch continues.
+                print(f"WARNING: prior last diff not pre-downloaded: {candidate} "
+                      f"— activity comparison skipped for first snapshot", flush=True)
         chain_state['base_png_local'] = str(base_local)
         chain_state['last_diff_local'] = str(last_diff_local) if last_diff_local else None
         chain_state_path = publish_dir / 'chain_state.json'
