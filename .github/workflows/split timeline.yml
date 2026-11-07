@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       confirm:
-        description: 'Type OVERWRITE to overwrite existing timeline-rediff.json'
-        required: true
+        description: 'Enter OVERWRITE only if timeline-rediff.json already exists (leave blank otherwise)'
+        required: false
         default: ''
       dry_run:
         description: 'Check state without uploading'
@@ -125,4 +125,4 @@ jobs:
         run: |
           echo "=== DRY RUN — no upload ==="
           echo "timeline-rediff.json exists: ${{ steps.check.outputs.exists }}"
-          echo "To proceed: re-run with dry_run=false and confirm=OVERWRITE (if it already exists)"
+          echo "To proceed: re-run with dry_run=false (confirm=OVERWRITE only if it already exists)"
