@@ -1,0 +1,128 @@
+name: Initialize timeline-rediff.json
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type OVERWRITE to overwrite existing timeline-rediff.json'
+        required: true
+        default: ''
+      dry_run:
+        description: 'Check state without uploading'
+        type: boolean
+        default: true
+
+concurrency:
+  group: initialize-rediff
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  init:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Check current state
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          echo "=== Current R2 state ==="
+          rclone lsf ":s3:${R2_BUCKET}" \
+            --include "timeline*.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+      - name: Check for existing rediff timeline
+        id: check
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          if rclone lsf ":s3:${R2_BUCKET}" \
+               --include "timeline-rediff.json" \
+               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+               --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+               --s3-no-check-bucket --log-level ERROR | grep -q "timeline-rediff.json"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "timeline-rediff.json already exists on R2"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "timeline-rediff.json does not exist yet (safe to initialize)"
+          fi
+
+      - name: Require confirmation for overwrite
+        if: steps.check.outputs.exists == 'true' && inputs.confirm != 'OVERWRITE'
+        run: |
+          echo "ERROR: timeline-rediff.json already exists."
+          echo "Enter 'OVERWRITE' in the confirm input to proceed anyway."
+          exit 1
+
+      - name: Download timeline.json
+        if: ${{ !inputs.dry_run }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          ENTRIES=$(python3 -c "import json; print(len(json.load(open('timeline.json'))))")
+          echo "Downloaded timeline.json: $ENTRIES entries"
+
+      - name: Upload as timeline-rediff.json
+        if: ${{ !inputs.dry_run }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto timeline.json ":s3:${R2_BUCKET}/timeline-rediff.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "Uploaded timeline-rediff.json"
+
+      - name: Verify
+        if: ${{ !inputs.dry_run }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto ":s3:${R2_BUCKET}/timeline-rediff.json" verify.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          EXPECTED=$(python3 -c "import json; print(len(json.load(open('timeline.json'))))")
+          ACTUAL=$(python3 -c "import json; print(len(json.load(open('verify.json'))))")
+          echo "Expected $EXPECTED entries, got $ACTUAL"
+          if [ "$EXPECTED" != "$ACTUAL" ]; then
+            echo "ERROR: entry count mismatch"
+            exit 1
+          fi
+          echo "OK — timeline-rediff.json matches timeline.json"
+
+      - name: Dry run summary
+        if: ${{ inputs.dry_run }}
+        run: |
+          echo "=== DRY RUN — no upload ==="
+          echo "timeline-rediff.json exists: ${{ steps.check.outputs.exists }}"
+          echo "To proceed: re-run with dry_run=false and confirm=OVERWRITE (if it already exists)"
