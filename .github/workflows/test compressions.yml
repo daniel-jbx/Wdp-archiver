@@ -1,0 +1,199 @@
+name: Test compression codecs through R2
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: update-mapasrfd
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: python3 -m pip install --quiet brotli requests
+
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download sample diff
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          # Find a recent diff to use as sample
+          SAMPLE=$(rclone lsf ":s3:${R2_BUCKET}" \
+            --include "wdpdiff_*.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR | sort | tail -1)
+          echo "Using sample: $SAMPLE"
+          rclone copyto ":s3:${R2_BUCKET}/${SAMPLE}" sample.json \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          ls -lh sample.json
+
+      - name: Compress and upload test files
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          python3 - << 'PY'
+          import brotli, gzip
+          raw = open('sample.json', 'rb').read()
+          open('test-gzip.json', 'wb').write(gzip.compress(raw, compresslevel=9))
+          open('test-br.json', 'wb').write(brotli.compress(raw, quality=11))
+          open('test-plain.json', 'wb').write(raw)
+          print(f"raw: {len(raw)}  gzip: {len(open('test-gzip.json','rb').read())}  brotli: {len(open('test-br.json','rb').read())}")
+          PY
+
+          # Plain control: no Content-Encoding header
+          rclone copyto test-plain.json ":s3:${R2_BUCKET}/_test-plain.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+          # Gzip with Content-Encoding header
+          rclone copyto test-gzip.json ":s3:${R2_BUCKET}/_test-gzip.json" \
+            --header-upload "Content-Encoding: gzip" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+          # Brotli with Content-Encoding header
+          rclone copyto test-br.json ":s3:${R2_BUCKET}/_test-br.json" \
+            --header-upload "Content-Encoding: br" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+            --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+          echo "Uploaded 3 test files"
+
+      - name: Test each URL
+        run: |
+          python3 -u << 'PY'
+          import gzip, brotli, requests, json, sys
+
+          BASE = "https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev"
+          TESTS = [
+              ("_test-plain.json", None, None),
+              ("_test-gzip.json",  "gzip", gzip.decompress),
+              ("_test-br.json",    "br",   brotli.decompress),
+          ]
+
+          all_ok = True
+          results = []
+
+          for path, expected_ce, decompress_fn in TESTS:
+              url = f"{BASE}/{path}"
+              name = path.replace('_test-', '').replace('.json', '')
+              print("=" * 70)
+              print(f"Testing {path}")
+              print("=" * 70)
+
+              # 1. Header check via HEAD
+              h = requests.head(url, timeout=10)
+              ce = h.headers.get('content-encoding', '')
+              cl = h.headers.get('content-length', '?')
+              ct = h.headers.get('content-type', '?')
+              print(f"  HEAD status:           {h.status_code}")
+              print(f"  content-encoding:      {ce or '(none)'}")
+              print(f"  content-length:        {cl}")
+              print(f"  content-type:          {ct}")
+
+              header_ok = (ce == expected_ce) if expected_ce else (ce == '' or ce == 'identity')
+              print(f"  header preserved:      {'✓' if header_ok else '✗ expected ' + str(expected_ce)}")
+
+              # 2. Full GET — requests auto-decompresses based on Content-Encoding
+              r = requests.get(url, timeout=10)
+              print(f"  GET status:            {r.status_code}")
+              print(f"  GET content-length:    {len(r.content)} (post-decompression by requests)")
+
+              try:
+                  data = json.loads(r.content)
+                  parsed_ok = True
+                  n_bytes = len(r.content)
+                  fmt = data.get('format', '?')
+                  print(f"  JSON parse:            ✓ ({n_bytes} bytes, format={fmt})")
+              except Exception as e:
+                  parsed_ok = False
+                  print(f"  JSON parse:            ✗ {e}")
+                  # Check if the raw bytes are still compressed
+                  try:
+                      decompressed = decompress_fn(r.content) if decompress_fn else None
+                      if decompressed:
+                          json.loads(decompressed)
+                          print(f"  → but manual decompress works. Browser may not auto-decompress.")
+                  except Exception:
+                      pass
+
+              # 3. Also test raw fetch with Accept-Encoding disabled — simulates non-auto clients
+              r2 = requests.get(url, headers={'Accept-Encoding': 'identity'}, timeout=10)
+              ce2 = r2.headers.get('content-encoding', '')
+              raw_len = len(r2.content)
+              raw_parse_ok = False
+              try:
+                  json.loads(r2.content)
+                  raw_parse_ok = True
+              except Exception:
+                  pass
+              print(f"  Identity GET:          ce={ce2 or '(none)'}, {raw_len} bytes, "
+                    f"parses={raw_parse_ok}")
+
+              overall_ok = header_ok and parsed_ok
+              print(f"  VERDICT:               {'✓ WORKS' if overall_ok else '✗ FAILS'}")
+              print()
+
+              results.append((name, header_ok, parsed_ok, overall_ok))
+              if not overall_ok:
+                  all_ok = False
+
+          # Summary
+          print("=" * 70)
+          print("SUMMARY")
+          print("=" * 70)
+          for name, header_ok, parsed_ok, overall_ok in results:
+              print(f"  {name:<8} header={header_ok!s:<5} parse={parsed_ok!s:<5} overall={overall_ok!s:<5}")
+          print()
+          print(f"Recommendation: {'brotli' if results[2][3] else ('gzip' if results[1][3] else 'neither — investigate')}")
+
+          if not all_ok:
+              sys.exit(1)
+          PY
+
+      - name: Cleanup test files
+        if: always()
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          for f in _test-plain.json _test-gzip.json _test-br.json; do
+            rclone delete ":s3:${R2_BUCKET}/${f}" \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" \
+              --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket --log-level ERROR || true
+          done
+          echo "Cleaned up"
