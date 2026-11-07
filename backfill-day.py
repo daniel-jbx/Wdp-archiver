@@ -152,10 +152,10 @@ def validate(old_timeline, new_timeline, date):
     return True
 
 
-def recheck_timeline(env, publish_dir, date, main_timeline):
-    print("Re-checking timeline from R2 before merge (race guard)...", flush=True)
+def recheck_timeline(env, publish_dir, date, main_timeline, timeline_name='timeline.json'):
+    print(f"Re-checking {timeline_name} from R2 before merge (race guard)...", flush=True)
     fresh_path = publish_dir / 'fresh-timeline.json'
-    rclone(env, 'copyto', f':s3:{env["R2_BUCKET"]}/timeline.json', str(fresh_path))
+    rclone(env, 'copyto', f':s3:{env["R2_BUCKET"]}/{timeline_name}', str(fresh_path))
     fresh = json.load(open(fresh_path))
     print(f"  Fresh: {len(fresh)} entries (started with {len(main_timeline)})", flush=True)
     fresh_day = [e for e in fresh if e['time'].startswith(date)]
@@ -167,8 +167,11 @@ def recheck_timeline(env, publish_dir, date, main_timeline):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--next-pending', action='store_true')
+    ap.add_argument('--next-pending', action='store_true',
+                    help='Print next pending day (YYYYMMDD) and exit')
     ap.add_argument('--main-timeline', required=True)
+    ap.add_argument('--timeline-name', default='timeline.json',
+                    help='R2 filename of the timeline (default: timeline.json)')
     ap.add_argument('--date', default=None)
     ap.add_argument('--day-dir', default=None)
     ap.add_argument('--canonical-palette', default=None)
@@ -265,7 +268,7 @@ def main():
     print(f"Day timeline: {len(day_timeline)} entries ({n_png} bases, {n_diff} diffs)", flush=True)
 
     if args.recheck_timeline:
-        fresh = recheck_timeline(env, publish_dir, args.date, main_timeline)
+        fresh = recheck_timeline(env, publish_dir, args.date, main_timeline, args.timeline_name)
         if fresh is None:
             print("Aborted: concurrent modification detected.", flush=True)
             sys.exit(3)
