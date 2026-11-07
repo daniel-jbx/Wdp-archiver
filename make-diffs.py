@@ -51,8 +51,7 @@ def compute_changes_np(base_arr, new_arr, palette):
     for i, hex_c in enumerate(palette):
         r = int(hex_c[1:3], 16); g = int(hex_c[3:5], 16); b = int(hex_c[5:7], 16)
         lookup[(r << 16) | (g << 8) | b] = i
-    idxs = lookup[packed]
-    return xs, ys, idxs
+    return xs, ys, lookup[packed]
 
 
 def encode_rle_rows_np(xs, ys, idxs):
@@ -94,8 +93,7 @@ def build_diff_payload(base_time, timestamp, xs, ys, idxs):
 
 
 def diff_content_set(diff):
-    fmt = diff.get('format', 'v1')
-    if fmt == 'v1':
+    if diff.get('format') == 'v1':
         return None
     if 'rows' in diff:
         s = set()
@@ -119,7 +117,6 @@ def pack_change_set(xs, ys, idxs):
 
 
 def read_diff(path):
-    """Read brotli-compressed or plain-JSON diff."""
     raw = path.read_bytes()
     try:
         return json.loads(brotli.decompress(raw))
@@ -153,10 +150,7 @@ def main():
     palette = ensure_palette(pngs[0], out_dir / 'palette.json')
     print(f"Palette: {len(palette)} colors", flush=True)
 
-    timeline = []
-    base_time = None
-    base_arr = None
-    prev_changes_set = None
+    timeline, base_time, base_arr, prev_changes_set = [], None, None, None
 
     if prior:
         base_time = prior['base_time']
@@ -169,27 +163,17 @@ def main():
         if prior.get('last_diff_local') and Path(prior['last_diff_local']).exists():
             prev_diff = read_diff(Path(prior['last_diff_local']))
             prev_changes_set = diff_content_set(prev_diff)
-            if prev_changes_set is not None:
-                print(f"Loaded prior last diff for activity comparison", flush=True)
-            else:
-                print(f"Prior last diff is v1 format — dedupe disabled for first snapshot", flush=True)
+            print("Loaded prior last diff for activity comparison", flush=True)
 
     initial_base_arr = base_arr
     bytes_since_base = prior['cumulative_bytes'] if prior else 0
 
-    total_original = 0
-    total_new = 0
-    reused_count = 0
-    promoted_count = 0
-    flat_wins = 0
-    rle_wins = 0
-    culled_count = 0
+    total_original = total_new = reused_count = promoted_count = flat_wins = rle_wins = culled_count = 0
 
     for idx, png_path in enumerate(pngs):
         t = parse_ts(png_path.name)
         if not t:
             continue
-
         print(f"Processing {png_path.name} ({idx+1}/{len(pngs)})...", flush=True)
 
         orig_size = png_path.stat().st_size
@@ -197,7 +181,6 @@ def main():
         png_size = orig_size
 
         new_arr, has_trans = load_image(png_path)
-
         if not has_trans:
             print(f"{t}: WARNING: Image has zero transparency (flattened). Culling from archive.", flush=True)
             culled_count += 1
@@ -205,32 +188,25 @@ def main():
 
         if initial_base_arr is None and base_arr is None:
             shutil.copy2(png_path, out_dir / png_path.name)
-            base_arr = new_arr
-            base_time = t
+            base_arr, base_time = new_arr, t
             timeline.append({"time": t, "kind": "png", "src": png_path.name,
                              "name": t, "bytes": png_size})
-            prev_changes_set = set()
-            total_new += orig_size
-            bytes_since_base = 0
+            prev_changes_set = set(); total_new += orig_size; bytes_since_base = 0
             print(f"{t}: base png ({orig_size/1024/1024:.2f} MB)", flush=True)
             continue
 
         if new_arr.shape != base_arr.shape:
             shutil.copy2(png_path, out_dir / png_path.name)
-            base_arr = new_arr
-            base_time = t
-            bytes_since_base = 0
-            prev_changes_set = set()
+            base_arr, base_time = new_arr, t
+            bytes_since_base = 0; prev_changes_set = set()
             timeline.append({"time": t, "kind": "png", "src": png_path.name,
                              "name": t, "bytes": png_size})
-            total_new += orig_size
-            promoted_count += 1
+            total_new += orig_size; promoted_count += 1
             print(f"{t}: size change -> base png", flush=True)
             continue
 
         xs, ys, idxs = compute_changes_np(base_arr, new_arr, palette)
         curr_set = pack_change_set(xs, ys, idxs)
-
         activity = len(curr_set ^ prev_changes_set) if prev_changes_set is not None else None
 
         if prev_changes_set is not None and activity == 0 and timeline:
@@ -238,11 +214,11 @@ def main():
             if prev_entry['kind'] == 'diff':
                 timeline.append({
                     "time": t, "kind": "diff", "format": prev_entry["format"],
+                    "codec": "br",
                     "base": base_time, "src": prev_entry["src"],
                     "name": t, "bytes": 0,
                 })
-                prev_changes_set = curr_set
-                reused_count += 1
+                prev_changes_set = curr_set; reused_count += 1
                 print(f"{t}: unchanged -> reuse {prev_entry['src']}", flush=True)
                 continue
 
@@ -252,7 +228,6 @@ def main():
         else:               flat_wins += 1
 
         cumulative = bytes_since_base + len(encoded)
-
         single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
         cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
 
@@ -264,20 +239,17 @@ def main():
 
         if promote_reason:
             shutil.copy2(png_path, out_dir / png_path.name)
-            base_arr = new_arr
-            base_time = t
-            bytes_since_base = 0
-            prev_changes_set = curr_set
+            base_arr, base_time = new_arr, t
+            bytes_since_base = 0; prev_changes_set = curr_set
             timeline.append({"time": t, "kind": "png", "src": png_path.name,
                              "name": t, "bytes": png_size})
-            total_new += orig_size
-            promoted_count += 1
+            total_new += orig_size; promoted_count += 1
             print(f"{t}: promote ({promote_reason}, {len(curr_set):,} changes)", flush=True)
         else:
             diff_name = f"wdpdiff_{t}.json"
             (out_dir / diff_name).write_bytes(encoded)
             timeline.append({
-                "time": t, "kind": "diff", "format": fmt,
+                "time": t, "kind": "diff", "format": fmt, "codec": "br",
                 "base": base_time, "src": diff_name,
                 "name": t, "bytes": len(encoded),
             })
@@ -287,7 +259,6 @@ def main():
             print(f"{t}: {fmt} {len(curr_set):,} changes -> {len(encoded)/1024:.1f} KB (br)", flush=True)
 
     (out_dir / 'timeline.json').write_text(json.dumps(timeline, indent=2))
-
     print("\nReport:", flush=True)
     print(f"  Original: {total_original/1024/1024:.2f} MB ({len(pngs)} PNGs)", flush=True)
     npng = sum(1 for e in timeline if e['kind'] == 'png')
