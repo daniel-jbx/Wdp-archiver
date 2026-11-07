@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, os, re, subprocess, sys, tempfile
+import argparse, brotli, json, os, re, subprocess, sys, tempfile
 from pathlib import Path
 
 try:
@@ -11,6 +11,7 @@ except ImportError:
 
 SINGLE_DIFF_MULTIPLIER   = 1.0
 CUMULATIVE_MULTIPLIER    = 1.0
+BROTLI_QUALITY           = 11
 
 
 def rclone(env, *args):
@@ -36,6 +37,31 @@ def download(env, remote, local):
 
 def upload(env, local, remote):
     rclone(env, 'copyto', local, f':s3:{env["R2_BUCKET"]}/{remote}')
+
+
+def upload_brotli(env, compressed_bytes, remote):
+    """Upload brotli-compressed bytes with Content-Encoding: br.
+    Browsers and R2 both handle this transparently."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
+        tmp.write(compressed_bytes)
+        tmp_path = tmp.name
+    try:
+        rclone(env, 'copyto', tmp_path, f':s3:{env["R2_BUCKET"]}/{remote}',
+               '--header-upload', 'Content-Encoding: br')
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
+def read_diff(path):
+    """Read brotli-compressed or plain-JSON diff (backward compat with pre-migration files)."""
+    raw = path.read_bytes()
+    try:
+        return json.loads(brotli.decompress(raw))
+    except Exception:
+        return json.loads(raw)
 
 
 def load_image(path):
@@ -250,7 +276,7 @@ def main():
             try:
                 prev_path = tmp / last['src']
                 download(env, last['src'], str(prev_path))
-                prev_diff = json.load(open(prev_path))
+                prev_diff = read_diff(prev_path)
                 prev_diff_set = diff_content_set(prev_diff)
                 if prev_diff_set is not None:
                     activity = len(curr_set ^ prev_diff_set)
@@ -273,9 +299,10 @@ def main():
             print(f"Done (reused). Timeline: {len(timeline)} entries.", flush=True)
             return
 
-        payload, encoded, fmt = build_diff_payload(
+        payload, encoded_raw, fmt = build_diff_payload(
             base_entry['time'], new_time, xs, ys, idxs)
-        print(f"Encoded: {fmt}, {len(encoded)/1024:.1f} KB", flush=True)
+        encoded = brotli.compress(encoded_raw, quality=BROTLI_QUALITY)
+        print(f"Encoded: {fmt}, {len(encoded)/1024:.1f} KB (br from {len(encoded_raw)/1024:.1f} KB)", flush=True)
 
         cumulative = sum(e.get('bytes', 0) for e in timeline
                          if e['kind'] == 'diff' and e.get('base') == base_entry['time'])
@@ -300,9 +327,8 @@ def main():
                              "name": new_time, "bytes": png_size})
         else:
             diff_name = f"wdpdiff_{new_time}.json"
-            (tmp / diff_name).write_bytes(encoded)
             print(f"Uploading diff: {diff_name}", flush=True)
-            upload(env, str(tmp / diff_name), diff_name)
+            upload_brotli(env, encoded, diff_name)
             timeline.append({
                 "time": new_time, "kind": "diff", "format": fmt,
                 "base": base_entry['time'], "src": diff_name,
