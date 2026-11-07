@@ -40,8 +40,6 @@ def upload(env, local, remote):
 
 
 def upload_brotli(env, compressed_bytes, remote):
-    """Upload brotli-compressed bytes with Content-Encoding: br.
-    Browsers and R2 both handle this transparently."""
     with tempfile.NamedTemporaryFile(delete=False, suffix='.json') as tmp:
         tmp.write(compressed_bytes)
         tmp_path = tmp.name
@@ -56,7 +54,6 @@ def upload_brotli(env, compressed_bytes, remote):
 
 
 def read_diff(path):
-    """Read brotli-compressed or plain-JSON diff."""
     raw = path.read_bytes()
     try:
         return json.loads(brotli.decompress(raw))
@@ -65,9 +62,6 @@ def read_diff(path):
 
 
 def recheck_or_abort(env, tmp, timeline):
-    """Re-download timeline.json from R2 and compare against what we loaded at start.
-    If a concurrent writer (reconciler or rediff-fallback) modified it, abort without
-    saving — the snapshot will be re-captured on the next scheduled run."""
     recheck_path = tmp / 'timeline-recheck.json'
     try:
         download(env, 'timeline.json', str(recheck_path))
@@ -78,7 +72,7 @@ def recheck_or_abort(env, tmp, timeline):
                   f"Snapshot will be captured on next run.", flush=True)
             sys.exit(0)
     except subprocess.CalledProcessError:
-        pass  # can't recheck, proceed
+        pass
 
 
 def load_image(path):
@@ -121,8 +115,7 @@ def compute_changes_np(base_arr, new_arr, palette):
     for i, hex_c in enumerate(palette):
         r = int(hex_c[1:3], 16); g = int(hex_c[3:5], 16); b = int(hex_c[5:7], 16)
         lookup[(r << 16) | (g << 8) | b] = i
-    idxs = lookup[packed]
-    return xs, ys, idxs
+    return xs, ys, lookup[packed]
 
 
 def encode_rle_rows_np(xs, ys, idxs):
@@ -164,8 +157,7 @@ def build_diff_payload(base_time, timestamp, xs, ys, idxs):
 
 
 def diff_content_set(diff):
-    fmt = diff.get('format', 'v1')
-    if fmt == 'v1':
+    if diff.get('format') == 'v1':
         return None
     if 'rows' in diff:
         s = set()
@@ -225,9 +217,7 @@ def main():
     new_arr, has_trans = load_image(snap_path)
     if not has_trans:
         print(f"{new_time}: WARNING: Image has zero transparency (flattened)", flush=True)
-        print(f"  This indicates a stitcher/pngquant failure — the PNG was likely produced incorrectly", flush=True)
         print(f"  Snapshot will NOT be uploaded and NOT added to timeline", flush=True)
-        print(f"  Next scheduled run will proceed normally", flush=True)
         sys.exit(0)
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -304,21 +294,22 @@ def main():
         if activity is not None:
             print(f"Activity: {activity:,} pixels changed since previous snapshot", flush=True)
 
-        # Dedupe path
         if prev_diff_set is not None and activity == 0:
             print(f"Identical to previous snapshot; reusing {last['src']}", flush=True)
             recheck_or_abort(env, tmp, timeline)
-            timeline.append({
+            reused = {
                 "time": new_time, "kind": "diff",
                 "format": last.get('format', 'v1'),
                 "base": base_entry['time'], "src": last['src'],
                 "name": new_time, "bytes": 0,
-            })
+            }
+            if "codec" in last:
+                reused["codec"] = last["codec"]
+            timeline.append(reused)
             save_timeline(env, tmp, timeline)
             print(f"Done (reused). Timeline: {len(timeline)} entries.", flush=True)
             return
 
-        # Compute diff + promote decision
         payload, encoded_raw, fmt = build_diff_payload(
             base_entry['time'], new_time, xs, ys, idxs)
         encoded = brotli.compress(encoded_raw, quality=BROTLI_QUALITY)
@@ -328,8 +319,7 @@ def main():
                          if e['kind'] == 'diff' and e.get('base') == base_entry['time'])
         cumulative += len(encoded)
         print(f"Cumulative chain: {cumulative/1024/1024:.2f} MB "
-              f"(PNG size {png_size/1024/1024:.2f} MB, "
-              f"threshold {CUMULATIVE_MULTIPLIER:.1f}x)", flush=True)
+              f"(PNG size {png_size/1024/1024:.2f} MB, threshold {CUMULATIVE_MULTIPLIER:.1f}x)", flush=True)
 
         single_exceeded     = len(encoded) > SINGLE_DIFF_MULTIPLIER * png_size
         cumulative_exceeded = cumulative    > CUMULATIVE_MULTIPLIER * png_size
@@ -340,7 +330,6 @@ def main():
         elif cumulative_exceeded:
             promote_reason = 'cumulative'
 
-        # Recheck before any R2 write
         recheck_or_abort(env, tmp, timeline)
 
         if promote_reason:
@@ -353,7 +342,7 @@ def main():
             print(f"Uploading diff: {diff_name}", flush=True)
             upload_brotli(env, encoded, diff_name)
             timeline.append({
-                "time": new_time, "kind": "diff", "format": fmt,
+                "time": new_time, "kind": "diff", "format": fmt, "codec": "br",
                 "base": base_entry['time'], "src": diff_name,
                 "name": new_time, "bytes": len(encoded),
             })
