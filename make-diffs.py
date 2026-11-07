@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import argparse, json, re, shutil, sys
+import argparse, brotli, json, re, shutil, sys
 from pathlib import Path
 
 try:
@@ -11,6 +11,7 @@ except ImportError:
 
 SINGLE_DIFF_MULTIPLIER   = 1.0
 CUMULATIVE_MULTIPLIER    = 1.0
+BROTLI_QUALITY           = 11
 
 
 def parse_ts(name):
@@ -117,6 +118,15 @@ def pack_change_set(xs, ys, idxs):
     return set(packed.tolist())
 
 
+def read_diff(path):
+    """Read brotli-compressed or plain-JSON diff."""
+    raw = path.read_bytes()
+    try:
+        return json.loads(brotli.decompress(raw))
+    except Exception:
+        return json.loads(raw)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--input', required=True)
@@ -157,7 +167,7 @@ def main():
         base_arr, _ = load_image(base_png_path)
         print(f"Loaded prior base: {base_png_path.name} ({base_arr.shape[1]}x{base_arr.shape[0]})", flush=True)
         if prior.get('last_diff_local') and Path(prior['last_diff_local']).exists():
-            prev_diff = json.load(open(prior['last_diff_local']))
+            prev_diff = read_diff(Path(prior['last_diff_local']))
             prev_changes_set = diff_content_set(prev_diff)
             if prev_changes_set is not None:
                 print(f"Loaded prior last diff for activity comparison", flush=True)
@@ -236,7 +246,8 @@ def main():
                 print(f"{t}: unchanged -> reuse {prev_entry['src']}", flush=True)
                 continue
 
-        payload, encoded, fmt = build_diff_payload(base_time, t, xs, ys, idxs)
+        payload, encoded_raw, fmt = build_diff_payload(base_time, t, xs, ys, idxs)
+        encoded = brotli.compress(encoded_raw, quality=BROTLI_QUALITY)
         if fmt == 'v3-rle': rle_wins += 1
         else:               flat_wins += 1
 
@@ -273,7 +284,7 @@ def main():
             prev_changes_set = curr_set
             total_new += len(encoded)
             bytes_since_base += len(encoded)
-            print(f"{t}: {fmt} {len(curr_set):,} changes -> {len(encoded)/1024:.1f} KB", flush=True)
+            print(f"{t}: {fmt} {len(curr_set):,} changes -> {len(encoded)/1024:.1f} KB (br)", flush=True)
 
     (out_dir / 'timeline.json').write_text(json.dumps(timeline, indent=2))
 
@@ -283,7 +294,7 @@ def main():
     ndiff = sum(1 for e in timeline if e['kind'] == 'diff')
     print(f"  New:      {total_new/1024/1024:.2f} MB "
           f"({npng} PNGs + {ndiff} diffs, {reused_count} reused, {promoted_count} promoted, {culled_count} culled)", flush=True)
-    print(f"  Format:   {flat_wins} v2-flat, {rle_wins} v3-rle", flush=True)
+    print(f"  Format:   {flat_wins} v2-flat, {rle_wins} v3-rle, all brotli-compressed", flush=True)
     if total_original:
         print(f"  Savings:  {(1 - total_new/total_original)*100:.1f}%", flush=True)
 
