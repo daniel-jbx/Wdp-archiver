@@ -32,7 +32,11 @@ def rclone(env, *args):
 
 
 def download(env, remote, local):
-    rclone(env, 'copyto', f':s3:{env["R2_BUCKET"]}/{remote}', local)
+    # --ignore-size is required for brotli-compressed diffs: R2 stores the
+    # compressed byte count but serves decompressed bytes via Content-Encoding.
+    # Adding --ignore-size only for .json avoids weakening PNG integrity checks.
+    extra = ['--ignore-size'] if remote.endswith('.json') else []
+    rclone(env, 'copyto', f':s3:{env["R2_BUCKET"]}/{remote}', local, *extra)
 
 
 def upload(env, local, remote):
