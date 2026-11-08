@@ -43,16 +43,22 @@ jobs:
           DAY: ${{ inputs.day }}
         run: |
           set -euo pipefail
+          # NOTE: --paginate + --jq emits one line PER PAGE. If the jq filter
+          # returns an array, you get one JSON array per line, and json.load
+          # chokes with "Extra data: line 2 column 1". So emit one timestamp
+          # per line and dedupe with sort -u.
           TSS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq "[.artifacts[] | select(.name | startswith(\"snap-${DAY}_\")) | select(.expired == false) | .name | sub(\"^snap-\"; \"\")] | unique | sort")
-          N=$(echo "$TSS" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')
+            --jq ".artifacts[] | select(.name | startswith(\"snap-${DAY}_\")) | select(.expired == false) | .name | sub(\"^snap-\"; \"\")" \
+            | sort -u)
+          N=$(printf '%s\n' "$TSS" | grep -c . || true)
           echo "Found $N artifacts for day $DAY"
           if [ "$N" -eq 0 ]; then
             echo "::warning::No artifacts found for day $DAY"
             echo 'timestamps=[]' >> "$GITHUB_OUTPUT"
             echo "empty=true" >> "$GITHUB_OUTPUT"
           else
-            echo "timestamps=$TSS" >> "$GITHUB_OUTPUT"
+            JSON=$(printf '%s\n' "$TSS" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+            echo "timestamps=$JSON" >> "$GITHUB_OUTPUT"
             echo "empty=false" >> "$GITHUB_OUTPUT"
           fi
 
