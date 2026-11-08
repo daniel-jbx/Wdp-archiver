@@ -267,3 +267,4 @@ jobs:
           path: out/wdpsnapshot_${{ matrix.snapshot.time }}.png
           retention-days: 90
           if-no-files-found: error
+          overwrite: true
