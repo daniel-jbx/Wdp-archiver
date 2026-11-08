@@ -28,7 +28,7 @@
   const urlY      = parseFloat(urlParams.get('y'));
   const urlZoom   = parseFloat(urlParams.get('zoom'));
   const urlBase   = urlParams.get('base');
-  const urlTimeline = urlParams.get('timeline') || 'timeline-rediff.json';
+  const urlTimeline = urlParams.get('timeline') || 'timeline.json';
 
   const dataset  = location.pathname.includes('/antarktika/') ? 'antarktika' : 'wdp';
   const DEFAULT_BASE = `https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/${dataset === 'wdp' ? '' : 'antarktika/'}`;
