@@ -1,24 +1,28 @@
-name: Patch Specific Artifact From Reference
+name: Patch Specific Artifact (cross-checked)
 
-# Replaces snap-<target_ts> with a corrected version built from snap-<reference_ts>
-# (which must be verified clean). Patches each pixel where the target artifact
-# differs from the reference at positions the buggy diff wrote black, then
-# enforces alpha (transparent where #47704c).
+# Like the earlier version, but uses a fixed later timestamp (182555 for
+# 180124) as an additional reference. The bug mask becomes:
+#   A.rgb == C.rgb  AND  B.rgb == black  AND  A.rgb != black
+# which excludes legitimate terrain edits (blue→black) that also appear
+# black in the buggy reconstruction.
 #
-# One-shot per timestamp. Run with reference_ts = a snapshot verified clean and
-# base_ts = the chain base that the target's diff references.
+# Rebuilds the artifact from B (reconstruction) + A (reference) rather than
+# patching the existing artifact in place, so any earlier mis-patch is undone.
 
 on:
   workflow_dispatch:
     inputs:
       target_ts:
-        description: 'Buggy timestamp to patch (YYYYMMDD_HHMMSS)'
+        description: 'Buggy timestamp'
         required: true
       reference_ts:
-        description: 'Clean reference timestamp (YYYYMMDD_HHMMSS)'
+        description: 'Clean reference timestamp (earlier)'
         required: true
       base_ts:
-        description: 'Chain base for the target diff (YYYYMMDD_HHMMSS)'
+        description: 'Chain base for target diff'
+        required: true
+      fixed_later_ts:
+        description: 'Fixed timestamp on R2 to cross-check (the fixed promotion point)'
         required: true
 
 permissions:
@@ -41,7 +45,7 @@ jobs:
           sudo dpkg -i rclone.deb
           rm -f rclone.deb
 
-      - name: Download from R2 + current artifact
+      - name: Download inputs
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -52,64 +56,33 @@ jobs:
           TARGET: ${{ inputs.target_ts }}
           REF: ${{ inputs.reference_ts }}
           BASE: ${{ inputs.base_ts }}
+          FIXED_LATER: ${{ inputs.fixed_later_ts }}
         run: |
           set -euo pipefail
           mkdir -p work out
 
-          echo "Inputs: BASE=$BASE  TARGET=$TARGET  REF=$REF"
-          echo "R2 bucket: ${R2_BUCKET:0:8}…"
-
           rclone_get() {
-            local remote="$1"
-            local dest="$2"
-            echo "── pulling $remote → $dest"
-            command rclone copyto ":s3:${R2_BUCKET}/$remote" "$dest" \
+            command rclone copyto ":s3:${R2_BUCKET}/$1" "$2" \
               --ignore-size \
               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
               --s3-access-key-id="$R2_ACCESS_KEY_ID" \
               --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
               --s3-no-check-bucket --log-level ERROR
-            local rc=$?
-            if [ "$rc" -ne 0 ]; then
-              echo "::error::rclone failed for $remote (exit=$rc)"
-              return "$rc"
-            fi
-            if [ ! -s "$dest" ]; then
-              echo "::error::$dest is missing or zero-length after rclone"
-              return 1
-            fi
-            echo "   ✓ $(wc -c < "$dest") bytes"
+            [ -s "$2" ] || { echo "::error::rclone failed for $1"; exit 1; }
           }
 
-          rclone_get "wdpsnapshot_${BASE}.png" work/base.png
-          rclone_get "wdpdiff_${TARGET}.json"  work/target.json
-          rclone_get "wdpdiff_${REF}.json"     work/ref.json
-          rclone_get "palette.json"            work/palette.json
-
-          echo "── work/ contents after download:"
-          ls -la work/
+          rclone_get "wdpsnapshot_${BASE}.png"           work/base.png
+          rclone_get "wdpdiff_${TARGET}.json"            work/target.json
+          rclone_get "wdpdiff_${REF}.json"               work/ref.json
+          rclone_get "wdpsnapshot_${FIXED_LATER}.png"    work/fixed_later.png
+          rclone_get "palette.json"                      work/palette.json
 
           ART_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.name==\"snap-${TARGET}\") | select(.expired==false) | \"\(.created_at) \(.id)\"" \
             | sort -r | head -1 | awk '{print $2}')
-          if [ -z "$ART_ID" ]; then
-            echo "::error::No artifact found for snap-${TARGET}"
-            exit 1
-          fi
-          echo "── downloading artifact $ART_ID"
-          curl -sL -f -H "Authorization: Bearer $GH_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
-            -o work/target_artifact.zip
-          python3 -c "import zipfile; zipfile.ZipFile('work/target_artifact.zip').extractall('work/extracted')"
+          echo "Current artifact: $ART_ID (will be replaced)"
 
-          echo "── extracted PNGs:"
-          find work/extracted -name "*.png"
-
-          echo "── final work/ state:"
-          ls -la work/
-
-      - name: Patch artifact
+      - name: Rebuild and patch
         env:
           TARGET: ${{ inputs.target_ts }}
         run: |
@@ -149,51 +122,62 @@ jobs:
           palette = json.load(open('work/palette.json'))
           target_ts = os.environ['TARGET']
 
-          print('Reconstructing reference (clean)…')
+          print('Reconstructing A (reference, clean)…')
           A = np.array(Image.open('work/base.png').convert('RGBA'))
           apply_diff(A, read_diff('work/ref.json'), palette)
           A = enforce_alpha(A)
 
-          print('Reconstructing buggy target (to infer bad positions)…')
+          print('Reconstructing B (target, has bug)…')
           B = np.array(Image.open('work/base.png').convert('RGBA'))
           apply_diff(B, read_diff('work/target.json'), palette)
           B = enforce_alpha(B)
 
-          print('Loading current artifact…')
-          pngs = list(Path('work/extracted').rglob('*.png'))
-          if not pngs: raise SystemExit('No PNG in target artifact')
-          art = np.array(Image.open(pngs[0]).convert('RGBA'))
-          print(f'  {art.shape[1]}x{art.shape[0]}')
+          print('Loading C (fixed later timestamp)…')
+          C = np.array(Image.open('work/fixed_later.png').convert('RGBA'))
+          C = enforce_alpha(C)
 
-          is_black    = np.all(B[:,:,:3] == np.array([0,0,0],dtype=np.uint8), axis=2)
-          is_diff     = np.any(A[:,:,:3] != B[:,:,:3], axis=2)
-          ref_not_blk = np.any(A[:,:,:3] != np.array([0,0,0],dtype=np.uint8), axis=2)
-          bad         = is_black & is_diff & ref_not_blk
-          ys, xs = np.where(bad)
-          print(f'Bad positions (diff wrote black, reference differs): {len(xs):,}')
+          # True bug mask: A and C agree on a non-black color, but B is black
+          rgb_eq_ac = np.all(A[:,:,:3] == C[:,:,:3], axis=2)
+          b_is_blk  = np.all(B[:,:,:3] == np.array([0,0,0],dtype=np.uint8), axis=2)
+          a_not_blk = np.any(A[:,:,:3] != np.array([0,0,0],dtype=np.uint8), axis=2)
+          true_bad  = rgb_eq_ac & b_is_blk & a_not_blk
+          ys, xs = np.where(true_bad)
+          print(f'TRUE bug positions: {len(xs):,}')
 
-          patched = 0
+          # Also report the excluded set for sanity
+          a_ne_c = ~rgb_eq_ac
+          excluded = b_is_blk & a_not_blk & a_ne_c
+          print(f'Excluded (A!=C but B=black, A!=black): {int(excluded.sum()):,}')
+          if excluded.any():
+              from collections import Counter
+              excl_c = Counter()
+              for y, x in zip(*np.where(excluded)):
+                  excl_c[(tuple(int(v) for v in A[y,x,:3]), tuple(int(v) for v in C[y,x,:3]))] += 1
+              for (ac, cc), n in excl_c.most_common(5):
+                  print(f'  A=#{ac[0]:02x}{ac[1]:02x}{ac[2]:02x} C=#{cc[0]:02x}{cc[1]:02x}{cc[2]:02x}: {n}')
+
+          # Build new artifact from B, patch the true-bad positions with A
+          new_art = B.copy()
           for y, x in zip(ys.tolist(), xs.tolist()):
-              if tuple(art[y,x,:3]) == (0,0,0) and tuple(A[y,x,:3]) != (0,0,0):
-                  art[y,x,:3] = A[y,x,:3]
-                  patched += 1
-          print(f'Patched {patched:,} pixels from reference')
+              new_art[y, x, :3] = A[y, x, :3]
+          new_art = enforce_alpha(new_art)
 
-          art = enforce_alpha(art)
-
-          rem = int(np.all(art[:,:,:3] == np.array([0,0,0],dtype=np.uint8), axis=2).sum())
-          print(f'After:')
-          print(f'  black px:     {rem}')
-          print(f'  has alpha:    {bool((art[:,:,3]<255).any())}')
-          print(f'  unique colors:{len(np.unique(art[:,:,:3].reshape(-1,3), axis=0))}')
+          # Sanity
+          rem = int(np.all(new_art[:,:,:3] == np.array([0,0,0],dtype=np.uint8), axis=2).sum())
+          a_blk = int(np.all(A[:,:,:3] == np.array([0,0,0],dtype=np.uint8), axis=2).sum())
+          print(f'\nVerification:')
+          print(f'  new_art black px: {rem:,}')
+          print(f'  A (174605) black px: {a_blk:,}')
+          print(f'  difference: {abs(rem - a_blk):,}')
+          print(f'  has alpha: {bool((new_art[:,:,3]<255).any())}')
+          print(f'  unique colors: {len(np.unique(new_art[:,:,:3].reshape(-1,3), axis=0))}')
 
           out = Path('out') / f'wdpsnapshot_{target_ts}.png'
-          Image.fromarray(art, 'RGBA').save(out, optimize=True)
+          Image.fromarray(new_art, 'RGBA').save(out, optimize=True)
           print(f'Saved {out} ({out.stat().st_size} bytes)')
           PY
 
-      - name: Upload as new artifact
-        id: upload
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: snap-${{ inputs.target_ts }}
@@ -202,7 +186,7 @@ jobs:
           if-no-files-found: error
           overwrite: true
 
-      - name: Delete old duplicate artifacts
+      - name: Delete old duplicates
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -213,7 +197,7 @@ jobs:
             --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired==false) | \"\(.created_at) \(.id)\"" \
             | sort -r | tail -n +2 | awk '{print $2}' > to-delete.txt
           count=$(wc -l < to-delete.txt)
-          echo "Deleting $count old artifact(s) of $ART_NAME"
+          echo "Deleting $count old artifact(s)"
           while read -r id; do
             [ -z "$id" ] && continue
             echo "  Deleting $id"
