@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       focus_days:
-        description: 'Comma-separated days (YYYYMMDD)'
+        description: 'Focus days (YYYYMMDD, comma-separated)'
+        required: true
+        default: '20261103,20261104,20261105,20261106,20261107,20261108'
+      context_days:
+        description: 'Extra days to include for context (comma-separated)'
         required: false
-        default: '20261104,20261105,20261106,20261107'
+        default: '20261101,20261102,20261109,20261110'
 
 permissions:
   contents: read
@@ -14,7 +18,7 @@ permissions:
 jobs:
   dump:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -39,7 +43,7 @@ jobs:
             --s3-access-key-id="$R2_ACCESS_KEY_ID" \
             --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR > dump/r2-listing.json
-          echo "R2 files: $(python3 -c "import json;print(len(json.load(open('dump/r2-listing.json'))))")"
+          python3 -c "import json;print('R2 files:',len(json.load(open('dump/r2-listing.json'))))"
 
       - name: Download timelines
         env:
@@ -49,7 +53,7 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
           set -euo pipefail
-          for name in timeline.json timeline-rediff.json; do
+          for name in timeline.json timeline-rediff.json palette.json; do
             if rclone copyto ":s3:${R2_BUCKET}/${name}" "dump/${name}" \
                 --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
                 --s3-access-key-id="$R2_ACCESS_KEY_ID" \
@@ -57,259 +61,241 @@ jobs:
                 --s3-no-check-bucket --log-level ERROR 2>/dev/null; then
               echo "Downloaded $name ($(stat -c%s "dump/${name}") bytes)"
             else
-              echo "WARNING: $name not found — writing []"
-              echo '[]' > "dump/${name}"
+              echo "WARNING: $name not found"
+              [ "$name" = "timeline.json" ] || [ "$name" = "timeline-rediff.json" ] && echo '[]' > "dump/${name}"
             fi
           done
 
-      - name: CSV listing
-        run: |
-          python3 - <<'PY'
-          import json
-          files = json.load(open('dump/r2-listing.json'))
-          files.sort(key=lambda f: f['Name'])
-          with open('dump/r2-listing.csv','w') as f:
-              f.write('name,size,modtime\n')
-              for e in files:
-                  f.write(f"{e['Name']},{e['Size']},{e.get('ModTime','')}\n")
-          print(f"r2-listing.csv: {len(files)} entries")
-          PY
-
-      - name: Analyze
+      - name: Slice and analyze
         env:
           FOCUS_DAYS: ${{ inputs.focus_days }}
+          CONTEXT_DAYS: ${{ inputs.context_days }}
         run: |
           python3 -u <<'PY'
           import json, os
           from pathlib import Path
-          from collections import Counter
+          from collections import defaultdict, Counter
 
-          focus_days = [d.strip() for d in os.environ['FOCUS_DAYS'].split(',') if d.strip()]
-          r2     = json.load(open('dump/r2-listing.json'))
-          prod   = json.load(open('dump/timeline.json'))
-          rediff = json.load(open('dump/timeline-rediff.json'))
+          focus   = [d.strip() for d in os.environ['FOCUS_DAYS'].split(',')   if d.strip()]
+          context = [d.strip() for d in os.environ['CONTEXT_DAYS'].split(',') if d.strip()]
+          all_days = sorted(set(focus + context))
+
+          r2   = json.load(open('dump/r2-listing.json'))
+          prod = json.load(open('dump/timeline.json'))   if Path('dump/timeline.json').exists()   else []
+          redf = json.load(open('dump/timeline-rediff.json')) if Path('dump/timeline-rediff.json').exists() else []
 
           r2_names = {e['Name'] for e in r2}
           r2_sizes = {e['Name']: e['Size'] for e in r2}
-          total_bytes = sum(r2_sizes.values())
 
-          png_files  = sorted(n for n in r2_names if n.startswith('wdpsnapshot_') and n.endswith('.png'))
-          diff_files = sorted(n for n in r2_names if n.startswith('wdpdiff_') and n.endswith('.json'))
-          ant_files  = sorted(n for n in r2_names if n.startswith('antarktika/'))
-          meta_files = sorted(n for n in r2_names if n in ('timeline.json','timeline-rediff.json','palette.json','snapshots.json'))
-          other      = sorted(r2_names - set(png_files) - set(diff_files) - set(ant_files) - set(meta_files))
-
-          def broken(tl):
-              png_times = {e['time'] for e in tl if e['kind']=='png'}
-              bb, bs = [], []
-              for e in tl:
-                  if e['kind']=='diff' and e.get('base') and e['base'] not in png_times:
-                      bb.append((e['time'], e['base']))
-                  if e.get('src') and e.get('bytes',0)!=0 and e['src'] not in r2_names:
-                      bs.append((e['time'], e['src'], e.get('bytes',0)))
-              return bb, bs
+          out_root = Path('dump/focus')
+          out_root.mkdir(parents=True, exist_ok=True)
 
           def day_entries(tl, day):
               lo, hi = day+'_000000', day+'_999999'
               return [e for e in tl if lo <= e['time'] <= hi]
 
           def r2_files_for(day):
-              return (
-                  sorted(n for n in r2_names if n.startswith(f'wdpsnapshot_{day}_')),
-                  sorted(n for n in r2_names if n.startswith(f'wdpdiff_{day}_')),
-              )
+              pngs  = sorted(n for n in r2_names if n.startswith(f'wdpsnapshot_{day}_'))
+              diffs = sorted(n for n in r2_names if n.startswith(f'wdpdiff_{day}_'))
+              return pngs, diffs
 
-          def can_reconstruct(tl, day):
+          def reconstruct_recipe(tl, day, tl_name):
+              """Return a dict describing exactly how to reconstruct `day` from this timeline."""
               ents = day_entries(tl, day)
-              if not ents: return (False, 'no entries')
+              if not ents:
+                  return {'ok': False, 'reason': 'no timeline entries', 'files': []}
               first = ents[0]
-              if first['kind']=='png':
-                  if first['src'] not in r2_names:
-                      return (False, f"first png src missing: {first['src']}")
-                  base_time = first['time']
+              if first['kind'] == 'png':
+                  base_time, base_src = first['time'], first['src']
               else:
-                  base = first.get('base')
-                  be = next((e for e in tl if e['time']==base and e['kind']=='png'), None)
-                  if not be: return (False, f"base not in timeline: {base}")
-                  if be['src'] not in r2_names:
-                      return (False, f"base png src missing: {be['src']}")
-                  base_time = be['time']
+                  base_time = first.get('base')
+                  be = next((e for e in tl if e['time']==base_time and e['kind']=='png'), None)
+                  if not be:
+                      return {'ok': False, 'reason': f'base not in {tl_name}: {base_time}', 'files': []}
+                  base_src = be['src']
+              if base_src not in r2_names:
+                  return {'ok': False, 'reason': f'base src missing on R2: {base_src}', 'files': []}
+
+              needed = [base_src]
+              cur_base = base_time
               for e in ents:
-                  if e['kind']!='diff': continue
-                  if e.get('base') and e['base'] != base_time:
-                      nb = next((x for x in tl if x['time']==e['base'] and x['kind']=='png'), None)
-                      if not nb: return (False, f"mid-day base not in timeline: {e['base']}")
-                      if nb['src'] not in r2_names:
-                          return (False, f"mid-day base png src missing: {nb['src']}")
-                      base_time = nb['time']
-                  if e.get('bytes',0)!=0 and e['src'] not in r2_names:
-                      return (False, f"diff src missing: {e['src']}")
-              return (True, f"chain intact, starts at {base_time}")
+                  if e['kind'] == 'png':
+                      if e['src'] not in r2_names:
+                          return {'ok': False, 'reason': f'png src missing: {e["src"]}', 'files': needed}
+                      needed.append(e['src'])
+                      cur_base = e['time']
+                  elif e['kind'] == 'diff':
+                      b = e.get('base')
+                      if b and b != cur_base:
+                          be = next((x for x in tl if x['time']==b and x['kind']=='png'), None)
+                          if not be:
+                              return {'ok': False, 'reason': f'mid-day base not in {tl_name}: {b}', 'files': needed}
+                          if be['src'] not in r2_names:
+                              return {'ok': False, 'reason': f'mid-day base src missing: {be["src"]}', 'files': needed}
+                          needed.append(be['src']); cur_base = b
+                      if e.get('bytes', 0) != 0 and e['src'] not in r2_names:
+                          return {'ok': False, 'reason': f'diff src missing: {e["src"]}', 'files': needed}
+                      if e.get('bytes', 0) == 0 and e['src'] not in r2_names:
+                          return {'ok': False, 'reason': f'reused-diff src missing: {e["src"]}', 'files': needed}
+                      if e.get('bytes', 0) != 0:
+                          needed.append(e['src'])
+              return {'ok': True, 'reason': f'chain intact from base {base_time}', 'files': needed}
 
-          out = []
-          def w(s=''): out.append(s)
+          summary = []
+          def w(s=''): summary.append(s)
 
-          # ---- R2 ----
-          w("## R2 storage")
+          # --- Global R2 summary ---
+          total_bytes = sum(r2_sizes.values())
+          pngs_all  = sorted(n for n in r2_names if n.startswith('wdpsnapshot_') and n.endswith('.png'))
+          diffs_all = sorted(n for n in r2_names if n.startswith('wdpdiff_') and n.endswith('.json'))
+          meta      = sorted(n for n in r2_names if n in ('timeline.json','timeline-rediff.json','palette.json','snapshots.json'))
+          w('## R2 global')
           w('')
-          w(f"**Total:** {len(r2_names)} files, {total_bytes/1024/1024:.1f} MB "
-            f"({total_bytes/1024/1024/1024:.2f} GB)")
-          w('')
-          w("| Type | Count | Bytes |")
-          w("|---|---:|---:|")
-          w(f"| Base PNGs | {len(png_files)} | {sum(r2_sizes[n] for n in png_files)/1024/1024:.1f} MB |")
-          w(f"| Diffs | {len(diff_files)} | {sum(r2_sizes[n] for n in diff_files)/1024/1024:.1f} MB |")
-          w(f"| Antarktika | {len(ant_files)} | {sum(r2_sizes.get(n,0) for n in ant_files)/1024/1024:.1f} MB |")
-          w(f"| Metadata | {len(meta_files)} | {sum(r2_sizes.get(n,0) for n in meta_files)/1024/1024:.1f} MB |")
-          if other:
-              w(f"| Other | {len(other)} | {sum(r2_sizes.get(n,0) for n in other)/1024/1024:.1f} MB |")
-          w('')
-          w(f"**Metadata present:** {', '.join(f'`{m}`' for m in meta_files) or '(none)'}")
-          if other:
-              w('')
-              w(f"**Other files ({len(other)}):**")
-              for n in other[:20]:
-                  w(f"- `{n}` ({r2_sizes.get(n,0)} B)")
-              if len(other) > 20: w(f"- … and {len(other)-20} more (see r2-listing.csv)")
+          w(f"- Files: **{len(r2_names)}** | Total: **{total_bytes/1024/1024:.1f} MB**")
+          w(f"- Base PNGs: **{len(pngs_all)}** ({sum(r2_sizes[n] for n in pngs_all)/1024/1024:.1f} MB)")
+          w(f"- Diffs: **{len(diffs_all)}** ({sum(r2_sizes[n] for n in diffs_all)/1024/1024:.1f} MB)")
+          w(f"- Metadata: {', '.join(meta) or '(none)'}")
           w('')
 
-          # ---- Timelines ----
-          w("## Timelines")
+          # --- Timelines overview ---
+          w('## Timelines')
           w('')
-          for name, tl in [('timeline.json', prod), ('timeline-rediff.json', rediff)]:
+          for name, tl in [('timeline.json (prod)', prod), ('timeline-rediff.json', redf)]:
               if not tl:
-                  w(f"- **{name}:** EMPTY")
-                  continue
-              kinds = Counter(e['kind'] for e in tl)
-              dbytes = sum(e.get('bytes',0) for e in tl if e['kind']=='diff' and e.get('bytes',0)>0)
-              w(f"- **{name}:** {len(tl)} entries | "
-                f"{kinds.get('png',0)} png / {kinds.get('diff',0)} diff | "
-                f"`{tl[0]['time']}` → `{tl[-1]['time']}` | "
-                f"diff bytes: {dbytes/1024/1024:.1f} MB")
+                  w(f"- **{name}:** EMPTY"); continue
+              k = Counter(e['kind'] for e in tl)
+              w(f"- **{name}:** {len(tl)} entries ({k.get('png',0)} png / {k.get('diff',0)} diff), "
+                f"`{tl[0]['time']}` → `{tl[-1]['time']}`")
           w('')
 
-          # ---- Broken ----
-          w("## Broken references")
-          w('')
-          for name, tl in [('timeline.json', prod), ('timeline-rediff.json', rediff)]:
-              bb, bs = broken(tl)
-              w(f"**{name}:**")
-              if not bb and not bs:
-                  w("- ✓ Clean")
-              else:
-                  if bb:
-                      w(f"- **{len(bb)} broken `base` refs** (base not a png entry):")
-                      for t, b in bb[:10]:
-                          w(f"  - `{t}` → base `{b}`")
-                      if len(bb)>10: w(f"  - … and {len(bb)-10} more")
-                  if bs:
-                      w(f"- **{len(bs)} missing `src` files** (not on R2, bytes>0):")
-                      for t, s, sz in bs[:10]:
-                          w(f"  - `{t}` → src `{s}` ({sz} B)")
-                      if len(bs)>10: w(f"  - … and {len(bs)-10} more")
-              w('')
+          # --- Per focus/context day ---
+          for day in all_days:
+              is_focus = day in focus
+              tag = 'FOCUS' if is_focus else 'context'
+              day_dir = out_root / day
+              day_dir.mkdir(exist_ok=True)
 
-          # ---- Focus days ----
-          w("## Focus days")
-          w('')
-          for day in focus_days:
-              w(f"### `{day}`")
-              w('')
               pngs, diffs = r2_files_for(day)
-              w(f"- **R2:** {len(pngs)} PNGs, {len(diffs)} diffs")
+              p_prod = day_entries(prod, day)
+              p_redf = day_entries(redf, day)
 
-              for name, tl in [('prod', prod), ('rediff', rediff)]:
-                  ents = day_entries(tl, day)
-                  if ents:
-                      npng = sum(1 for e in ents if e['kind']=='png')
-                      ndiff = sum(1 for e in ents if e['kind']=='diff')
-                      w(f"- **`{name}` timeline:** {len(ents)} entries ({npng} png / {ndiff} diff)")
-                  else:
-                      w(f"- **`{name}` timeline:** *(no entries)*")
+              # Write the per-day JSON slices (what user pastes)
+              (day_dir / 'timeline-prod.json').write_text(json.dumps(p_prod, indent=2))
+              (day_dir / 'timeline-rediff.json').write_text(json.dumps(p_redf, indent=2))
 
-              bases = set()
-              for tl in (prod, rediff):
-                  for e in day_entries(tl, day):
-                      if e['kind']=='diff' and e.get('base'):
-                          bases.add(e['base'])
-              if bases:
-                  w(f"- **Bases referenced:**")
-                  for b in sorted(bases):
-                      png_ex = f'wdpsnapshot_{b}.png' in r2_names
-                      in_p = any(x['time']==b and x['kind']=='png' for x in prod)
-                      in_r = any(x['time']==b and x['kind']=='png' for x in rediff)
-                      w(f"  - `{b}` — PNG: {'✓' if png_ex else '✗'} | "
-                        f"prod: {'✓' if in_p else '✗'} | rediff: {'✓' if in_r else '✗'}")
+              # R2 files for day
+              with open(day_dir / 'r2-files.csv', 'w') as f:
+                  f.write('kind,name,size_bytes\n')
+                  for n in pngs:  f.write(f'png,{n},{r2_sizes[n]}\n')
+                  for n in diffs: f.write(f'diff,{n},{r2_sizes[n]}\n')
 
-              for name, tl in [('prod', prod), ('rediff', rediff)]:
-                  ok, reason = can_reconstruct(tl, day)
-                  w(f"- **Reconstruct from `{name}`:** {'✓' if ok else '✗'} — {reason}")
+              # Recipes
+              rec_prod = reconstruct_recipe(prod, day, 'prod')
+              rec_redf = reconstruct_recipe(redf, day, 'rediff')
+              with open(day_dir / 'recipe.json', 'w') as f:
+                  json.dump({'day': day,
+                             'r2_pngs': pngs, 'r2_diffs': diffs,
+                             'prod': rec_prod, 'rediff': rec_redf}, f, indent=2)
+
+              # Summary section per day
+              w(f"### `{day}`  ({tag})")
+              w('')
+              w(f"- R2: {len(pngs)} PNGs, {len(diffs)} diffs")
+              w(f"- prod: {len(p_prod)} entries | rediff: {len(p_redf)} entries")
+              w(f"- Reconstruct from prod:   {'✓' if rec_prod['ok'] else '✗'} — {rec_prod['reason']}")
+              w(f"- Reconstruct from rediff: {'✓' if rec_redf['ok'] else '✗'} — {rec_redf['reason']}")
               w('')
 
-              if pngs or diffs:
-                  w("<details><summary>R2 files for this day</summary>")
-                  w('')
-                  for n in pngs:  w(f"- `{n}` ({r2_sizes[n]/1024:.1f} KB)")
-                  for n in diffs: w(f"- `{n}` ({r2_sizes[n]/1024:.1f} KB)")
-                  w('')
-                  w("</details>")
-                  w('')
-
-          # ---- Transitions ----
-          w("## Timeline context (kind changes across focus range)")
-          w('')
-          lo = focus_days[0]+'_000000'
-          hi = focus_days[-1]+'_999999'
-          for name, tl in [('prod', prod), ('rediff', rediff)]:
-              if not tl: continue
-              w(f"**{name}:**")
-              around = [e for e in tl if lo <= e['time'] <= hi]
-              if not around:
-                  w("  (no entries)")
-              else:
-                  prev = None
-                  for e in around:
-                      if e['kind'] != prev:
-                          extra = f" (base `{e['base']}`)" if e['kind']=='diff' else ''
-                          w(f"- `{e['time']}` → {e['kind']} `{e.get('src','')}`{extra}")
-                          prev = e['kind']
-                  after = [e for e in tl if e['time'] > hi]
-                  if after:
-                      a = after[0]
-                      extra = f" (base `{a['base']}`)" if a['kind']=='diff' else ''
-                      w(f"- … `{a['time']}` → {a['kind']} `{a.get('src','')}`{extra}  ← first after range")
-              w('')
-
-          Path('dump/summary.md').write_text('\n'.join(out))
-          print(f"Wrote summary.md ({len(out)} lines)")
+          Path('dump/summary.md').write_text('\n'.join(summary))
+          print(f"summary.md written: {len(summary)} lines")
           PY
 
-      - name: Step summary
-        if: always()
+      - name: Analyze sentinel (per focus day)
+        env:
+          FOCUS_DAYS: ${{ inputs.focus_days }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          [ -f dump/summary.md ] && cat dump/summary.md >> $GITHUB_STEP_SUMMARY
+          set -euo pipefail
+          IFS=',' read -ra DAYS <<< "$FOCUS_DAYS"
+          mkdir -p dump/sentinel
 
-      - name: Per-day slices of timelines
-        if: always()
+          # Download one PNG per focus day (for alpha analysis)
+          for day in "${DAYS[@]}"; do
+            day=$(echo "$day" | tr -d ' ')
+            [ -z "$day" ] && continue
+            # Look for a base PNG for this day
+            candidate=$(rclone lsf ":s3:${R2_BUCKET}" \
+              --include "wdpsnapshot_${day}_*.png" \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket --log-level ERROR | sort | head -1 || true)
+            if [ -z "$candidate" ]; then
+              echo "  $day: no base PNG" > "dump/sentinel/${day}.txt"
+              continue
+            fi
+            rclone copyto ":s3:${R2_BUCKET}/${candidate}" "dump/sentinel/${candidate}" \
+              --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+              --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+              --s3-no-check-bucket --log-level ERROR
+            echo "  $day: downloaded $candidate"
+          done
+
+      - name: Sentinel check
         run: |
-          python3 - <<'PY'
+          python3 -u <<'PY'
           import json
           from pathlib import Path
-          from collections import defaultdict
-          for name in ('timeline.json','timeline-rediff.json'):
-              p = Path('dump')/name
-              if not p.exists() or p.stat().st_size < 100: continue
-              tl = json.load(open(p))
-              by_day = defaultdict(list)
-              for e in tl: by_day[e['time'][:8]].append(e)
-              out_dir = Path('dump/split')/name.replace('.json','')
-              out_dir.mkdir(parents=True, exist_ok=True)
-              for d, ents in sorted(by_day.items()):
-                  (out_dir/f'{d}.json').write_text(json.dumps(ents, indent=2))
-              print(f"{name}: split into {len(by_day)} day files")
+          import numpy as np
+          from PIL import Image
+
+          palette = json.load(open('dump/palette.json'))
+          canon = {int(h[1:], 16): h for h in palette}
+          sentinel_hex = '#47704c'
+          sentinel_packed = int(sentinel_hex[1:], 16)
+
+          lines = []
+          lines.append("## Sentinel check per focus day")
+          lines.append("")
+          lines.append("For each downloaded base PNG: is `#47704c` used at α=255?")
+          lines.append("")
+          lines.append("| Day | File | α=0 px | α=255 px | #47704c@α=0 | #47704c@α=255 | Other colors |")
+          lines.append("|---|---|---:|---:|---:|---:|---:|")
+
+          for png in sorted(Path('dump/sentinel').glob('wdpsnapshot_*.png')):
+              day = png.name[len('wdpsnapshot_'):][:8]
+              arr = np.array(Image.open(png).convert('RGBA'))
+              a, rgb = arr[:,:,3], arr[:,:,:3]
+              packed = ((rgb[:,:,0].astype(np.uint32)<<16) | (rgb[:,:,1].astype(np.uint32)<<8) | rgb[:,:,2].astype(np.uint32))
+
+              t_mask  = (a == 0)
+              o_mask  = (a == 255)
+              sent_t  = int((t_mask & (packed == sentinel_packed)).sum())
+              sent_o  = int((o_mask & (packed == sentinel_packed)).sum())
+
+              # Count distinct colors present at α=255
+              unique_opaque = set(np.unique(packed[o_mask]).tolist()) if o_mask.any() else set()
+              other = len(unique_opaque - {sentinel_packed})
+
+              lines.append(f"| {day} | {png.name} | {int(t_mask.sum()):,} | {int(o_mask.sum()):,} | "
+                           f"{sent_t:,} | **{sent_o:,}** | {other} |")
+
+          Path('dump/sentinel/report.md').write_text('\n'.join(lines))
+          print('\n'.join(lines))
           PY
 
-      - name: Upload artifact
+      - name: Final summary
+        if: always()
+        run: |
+          {
+            [ -f dump/summary.md ]          && cat dump/summary.md
+            echo ""
+            [ -f dump/sentinel/report.md ]  && cat dump/sentinel/report.md
+          } >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
