@@ -232,8 +232,10 @@ jobs:
           ts = item['time']
           out_file = Path(f'out/wdpsnapshot_{ts}.png')
 
-          TR_RGB = np.array([0x47, 0x70, 0x4c], dtype=np.uint8)
+          TR_RGB  = np.array([0x47, 0x70, 0x4c], dtype=np.uint8)
           BAD_RGB = np.array([0x76, 0x63, 0x4b], dtype=np.uint8)
+
+          palette_list = json.load(open('work/palette.json'))
 
           def dl(remote, local):
               local = Path(local)
@@ -284,13 +286,46 @@ jobs:
               alpha = np.where(mask, 0, 255).astype(np.uint8)
               return np.dstack([rgb, alpha])
 
+          def save_palette_png(arr, out_path, palette_list, transparent_hex='#47704c'):
+              """Save RGBA array as P-mode PNG with tRNS at #47704c's index.
+              Produces ~2.5 MB files matching original capture format."""
+              rgb = arr[:, :, :3].copy()
+
+              flat = []
+              for h in palette_list:
+                  flat.extend([int(h[i:i+2], 16) for i in (1, 3, 5)])
+              flat.extend([0] * (256 * 3 - len(flat)))
+              pal_img = Image.new('P', (1, 1))
+              pal_img.putpalette(flat)
+
+              try:
+                  dither_none = Image.Dither.NONE
+              except AttributeError:
+                  dither_none = 0
+
+              indexed = Image.fromarray(rgb, 'RGB').quantize(palette=pal_img, dither=dither_none)
+
+              tr_idx = next((i for i, h in enumerate(palette_list)
+                             if h.lower() == transparent_hex.lower()), None)
+              if tr_idx is None:
+                  raise SystemExit(f"FATAL: {transparent_hex} not in palette")
+
+              tr_rgb = tuple(int(transparent_hex[i:i+2], 16) for i in (1, 3, 5))
+              tr_mask = np.all(rgb == np.array(tr_rgb, dtype=np.uint8), axis=2)
+              if tr_mask.any() and not (arr[:, :, 3][tr_mask] == 0).all():
+                  n_bad = int((arr[:, :, 3][tr_mask] != 0).sum())
+                  raise SystemExit(f"FATAL: {n_bad} #47704c pixels have alpha != 0 — "
+                                   f"palette mode would lose them")
+
+              indexed.save(out_path, format='PNG', optimize=True, transparency=tr_idx)
+
           if item['mode'] == 'copy':
               src = item['src']
               local = Path('work') / src
               dl(src, local)
               arr = np.array(Image.open(local).convert('RGBA'))
               arr = enforce_alpha(arr)
-              Image.fromarray(arr, 'RGBA').save(out_file, optimize=True)
+              save_palette_png(arr, out_file, palette_list)
               transparent = int((arr[:, :, 3] == 0).sum())
               print(f"Copied {src}: {transparent} transparent px")
               if transparent == 0:
@@ -312,11 +347,10 @@ jobs:
               diff_local = Path('work') / diff_name
               dl(diff_name, diff_local)
               diff = read_diff(diff_local)
-              palette = json.load(open('work/palette.json'))
 
-              apply_diff(arr, diff, palette)
+              apply_diff(arr, diff, palette_list)
               arr = enforce_alpha(arr)
-              Image.fromarray(arr, 'RGBA').save(out_file, optimize=True)
+              save_palette_png(arr, out_file, palette_list)
 
               transparent = int((arr[:, :, 3] == 0).sum())
               print(f"Reconstructed {ts} (base {base_time}): "
@@ -335,7 +369,7 @@ jobs:
           if bad:
               raise SystemExit(f"::error::{out_file.name} contains #76634b "
                                f"({bad} px) — run Fix Artifact Colors first")
-          print(f"✓ {out_file.name} ({out_file.stat().st_size} bytes) "
+          print(f"✓ {out_file.name} ({out_file.stat().st_size:,} bytes) "
                 f"has alpha, no #76634b")
           PY
 
