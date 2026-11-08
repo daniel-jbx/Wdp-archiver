@@ -28,15 +28,44 @@ jobs:
       REPO: ${{ github.repository }}
       FILTER: ${{ inputs.filter }}
     steps:
-      - name: Sanity-check token
+      - name: Verify token identity and permissions
         run: |
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::GH_TOKEN is empty — set PAT_TOKEN or ensure github.token is available"
+          set -euo pipefail
+          echo "── Token prefix ──"
+          prefix="${GH_TOKEN:0:10}"
+          echo "Prefix: $prefix..."
+          case "$prefix" in
+            github_pat_*) echo "✅ Fine-grained PAT detected" ;;
+            ghp_*)       echo "⚠️  Classic PAT detected (ghp_)" ;;
+            *)           echo "❓ Not a PAT — likely the built-in github.token" ;;
+          esac
+
+          echo "── Can this token read the artifacts API? ──"
+          if gh api "repos/$REPO/actions/artifacts?per_page=1" >/dev/null 2>&1; then
+            echo "✅ Token can read artifacts API"
+          else
+            echo "❌ Token cannot read artifacts API — permissions likely wrong"
             exit 1
           fi
-          # Also proves the token has actions:write
-          gh api "repos/$REPO/actions/artifacts?per_page=1" >/dev/null
-          echo "Token OK"
+
+          echo "── Token permissions (fine-grained only) ──"
+          gh api /user/permissions 2>/dev/null | python3 -c "
+          import json,sys
+          try:
+              d=json.load(sys.stdin)
+              perms=d.get('permissions',{})
+              actions=perms.get('actions')
+              if actions is None:
+                  print('ℹ️  No fine-grained permissions block (classic PAT or github.token)')
+              else:
+                  print(f'actions: {actions}')
+                  if actions == 'write':
+                      print('✅ actions:write — deletion should work')
+                  else:
+                      print('❌ actions:write NOT granted')
+          except Exception:
+              print('ℹ️  Could not read fine-grained permissions')
+          " || true
 
       - name: Enumerate and classify
         run: |
@@ -61,7 +90,7 @@ jobs:
           to_delete = []
           for name in sorted(groups):
               arts = groups[name]
-              # Prefer: non-expired, then newest
+              # Prefer non-expired, then newest
               arts.sort(key=lambda x: (not x['expired'], x['created_at']), reverse=True)
               keep = arts[0]
               if len(arts) > 1:
