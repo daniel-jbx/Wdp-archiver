@@ -1,0 +1,325 @@
+name: Peruse Day Artifacts
+# Builds a read-only "peruse-<day>-<runid>" artifact from every
+# snap-<day>_* artifact:
+#   - thumbs/<ts>.png            (400px thumbnails, alpha shown on checkerboard)
+#   - contact_sheet.png          (grid of every snapshot, green border = has alpha,
+#                                 orange border = flattened)
+#   - index.html                 (browsable gallery — open locally in a browser)
+#   - manifest.json              (per-artifact metadata + alpha stats)
+#   - raw/                       (optional, full-size PNGs)
+#
+# Does NOT modify or delete any snap-* artifact. Only derived
+# peruse-<day>-* bundles are created; older peruse bundles for the
+# same day are pruned so re-runs don't accumulate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      day:
+        description: 'Day to bundle (YYYYMMDD)'
+        required: true
+      include_raw:
+        description: 'Include full-size original PNGs (large, ~250MB)'
+        type: boolean
+        default: false
+      thumb_width:
+        description: 'Thumbnail width in pixels'
+        default: '400'
+      dry_run:
+        description: 'Process and log but do not upload'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: peruse-${{ inputs.day }}
+  cancel-in-progress: false
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --quiet pillow numpy
+
+      - name: Download all snap-* artifacts for the day
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DAY: ${{ inputs.day }}
+        run: |
+          set -euo pipefail
+          mkdir -p raw
+
+          # id<space>name pairs, newest per name wins
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"snap-${DAY}_\")) | select(.expired==false) | \"\(.name) \(.created_at) \(.id)\"" \
+            | sort -k1,1 -k2,2r \
+            | awk '!seen[$1]++ {print $3, $1}' \
+            > /tmp/artifacts.txt
+
+          N=$(wc -l < /tmp/artifacts.txt)
+          echo "Found $N artifacts for day $DAY"
+          if [ "$N" -eq 0 ]; then
+            echo "::error::No artifacts for $DAY"
+            exit 1
+          fi
+
+          # Parallel download (8 at a time)
+          export GH_TOKEN REPO
+          awk '{print $1, $2}' /tmp/artifacts.txt \
+            | xargs -P 8 -n 2 bash -c '
+                id="$1"; name="$2"
+                curl -sL -f \
+                  -H "Authorization: Bearer $GH_TOKEN" \
+                  -H "Accept: application/vnd.github+json" \
+                  "https://api.github.com/repos/$REPO/actions/artifacts/${id}/zip" \
+                  -o "/tmp/${id}.zip" || { echo "FAILED $name ($id)"; exit 0; }
+                unzip -q -o "/tmp/${id}.zip" -d "raw/${name}/" || { echo "UNZIP FAILED $name"; exit 0; }
+                rm -f "/tmp/${id}.zip"
+              ' _
+          echo "Downloaded $(ls raw/ | wc -l) artifact directories"
+
+      - name: Build bundle (thumbs, contact sheet, gallery, manifest)
+        env:
+          DAY: ${{ inputs.day }}
+          THUMB_WIDTH: ${{ inputs.thumb_width }}
+          INCLUDE_RAW: ${{ inputs.include_raw }}
+        run: |
+          python3 -u <<'PY'
+          import json, os, shutil
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import numpy as np
+          from PIL import Image, ImageDraw, ImageFont
+
+          DAY          = os.environ['DAY']
+          THUMB_W      = int(os.environ['THUMB_WIDTH'])
+          INCLUDE_RAW  = os.environ['INCLUDE_RAW'].lower() == 'true'
+          SHEET_COLS   = 10
+          SHEET_PAD    = 8
+          LABEL_H      = 24
+          BORDER       = 4
+          BG           = (32, 32, 32)
+          BORDER_ALPHA = (0x13, 0xe6, 0x7b)
+          BORDER_FLAT  = (0xe4, 0x5c, 0x1a)
+          CHECKER_TILE = 16
+          CHECKER_L    = (180, 180, 180)
+          CHECKER_D    = (110, 110, 110)
+
+          bundle = Path('bundle'); bundle.mkdir(exist_ok=True)
+          thumbs = bundle / 'thumbs'; thumbs.mkdir(exist_ok=True)
+
+          def checkerboard(h, w, tile=CHECKER_TILE):
+              yy, xx = np.mgrid[0:h, 0:w]
+              pattern = ((yy // tile) + (xx // tile)) % 2
+              out = np.zeros((h, w, 3), dtype=np.uint8)
+              out[pattern == 0] = CHECKER_L
+              out[pattern == 1] = CHECKER_D
+              return out
+
+          def composite_on_checker(rgba):
+              h, w = rgba.shape[:2]
+              chk = checkerboard(h, w)
+              a = rgba[:, :, 3:4].astype(np.float32) / 255.0
+              rgb = rgba[:, :, :3].astype(np.float32)
+              return (rgb * a + chk * (1 - a)).astype(np.uint8)
+
+          def make_thumb(path, target_w):
+              rgba = np.array(Image.open(path).convert('RGBA'))
+              h, w = rgba.shape[:2]
+              target_h = max(1, int(target_w * h / w))
+              comp = composite_on_checker(rgba)
+              return Image.fromarray(comp).resize((target_w, target_h), Image.LANCZOS)
+
+          def analyze(path):
+              im = Image.open(path)
+              rgba = np.array(im.convert('RGBA'))
+              alpha = rgba[:, :, 3]
+              return {
+                  'mode': im.mode,
+                  'width': im.size[0],
+                  'height': im.size[1],
+                  'has_alpha': bool((alpha < 255).any()),
+                  'transparent_pct': float((alpha == 0).mean() * 100),
+              }
+
+          # 1. Enumerate + analyze
+          raw_dir = Path('raw')
+          entries = []
+          for art_dir in sorted(raw_dir.iterdir()):
+              if not art_dir.is_dir(): continue
+              name = art_dir.name           # snap-YYYYMMDD_HHMMSS
+              ts   = name[len('snap-'):]
+              pngs = sorted(art_dir.rglob('wdpsnapshot_*.png'))
+              if not pngs:
+                  print(f"WARN: no PNG in {name}, skipping")
+                  continue
+              png = pngs[0]
+              info = analyze(png)
+              info.update({
+                  'timestamp': ts,
+                  'name': name,
+                  'size_bytes': png.stat().st_size,
+                  'png_relpath': str(png),
+              })
+              entries.append(info)
+
+          print(f"Analyzed {len(entries)} artifacts")
+          if not entries:
+              raise SystemExit("Nothing to bundle")
+
+          # 2. Thumbnails
+          for e in entries:
+              thumb = make_thumb(e['png_relpath'], THUMB_W)
+              thumb_path = thumbs / f"{e['timestamp']}.png"
+              thumb.save(thumb_path, optimize=True)
+              e['thumb_relpath'] = str(thumb_path.relative_to(bundle))
+
+          # 3. Manifest
+          summary = {
+              'alpha': sum(1 for e in entries if e['has_alpha']),
+              'flat':  sum(1 for e in entries if not e['has_alpha']),
+          }
+          manifest = {
+              'day': DAY,
+              'generated_at': datetime.now(timezone.utc).isoformat(),
+              'artifact_count': len(entries),
+              'summary': summary,
+              'artifacts': entries,
+          }
+          (bundle / 'manifest.json').write_text(json.dumps(manifest, indent=2))
+          print(f"Manifest: {summary}")
+
+          # 4. Contact sheet
+          cols = SHEET_COLS
+          rows = (len(entries) + cols - 1) // cols
+          first = Image.open(thumbs / f"{entries[0]['timestamp']}.png")
+          tile_w, tile_h = first.size
+          cell_w = tile_w + SHEET_PAD*2 + BORDER*2
+          cell_h = tile_h + SHEET_PAD*2 + BORDER*2 + LABEL_H
+
+          sheet = Image.new('RGB', (cols * cell_w, rows * cell_h), BG)
+          draw = ImageDraw.Draw(sheet)
+          try:
+              font = ImageFont.truetype(
+                  '/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf', 16)
+          except Exception:
+              font = ImageFont.load_default()
+
+          for i, e in enumerate(entries):
+              col, row = i % cols, i // cols
+              x0 = col * cell_w + SHEET_PAD
+              y0 = row * cell_h + SHEET_PAD
+              border = BORDER_ALPHA if e['has_alpha'] else BORDER_FLAT
+              draw.rectangle(
+                  [x0, y0, x0 + tile_w + BORDER*2, y0 + tile_h + BORDER*2],
+                  fill=border,
+              )
+              thumb = Image.open(thumbs / f"{e['timestamp']}.png")
+              sheet.paste(thumb, (x0 + BORDER, y0 + BORDER))
+              mark = '✓' if e['has_alpha'] else '✗'
+              label = f"{e['timestamp'][-6:]}  {mark}  {e['transparent_pct']:.1f}%"
+              draw.text(
+                  (x0 + BORDER, y0 + tile_h + BORDER + 4),
+                  label, fill=(220, 220, 220), font=font,
+              )
+          sheet.save(bundle / 'contact_sheet.png', optimize=True)
+          print(f"Contact sheet: {sheet.size[0]}x{sheet.size[1]}")
+
+          # 5. HTML gallery
+          def esc(s): return str(s).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+          cards = []
+          for e in entries:
+              cls = 'alpha' if e['has_alpha'] else 'flat'
+              if e['has_alpha']:
+                  status = f"<span style='color:#13e67b'>✓ alpha — {e['transparent_pct']:.1f}% transparent</span>"
+              else:
+                  status = "<span style='color:#e45c1a'>✗ flattened (no alpha)</span>"
+              raw_link = ''
+              if INCLUDE_RAW:
+                  raw_link = (f"<br><a href='raw/{esc(e['name'])}/"
+                              f"{esc(Path(e['png_relpath']).name)}' "
+                              f"style='color:#7dc7ff'>open full-size</a>")
+              cards.append(f"""
+              <div class="card {cls}">
+                <a href="{esc(e['thumb_relpath'])}"><img src="{esc(e['thumb_relpath'])}" loading="lazy"></a>
+                <div class="meta">
+                  <strong>{esc(e['timestamp'])}</strong><br>
+                  {status}<br>
+                  {e['width']}×{e['height']} · {e['size_bytes']/1e6:.2f} MB{raw_link}
+                </div>
+              </div>""")
+
+          html = f"""<!DOCTYPE html>
+          <html><head><meta charset="utf-8">
+          <title>Peruse: day {DAY}</title>
+          <style>
+          body {{ background: #1e1e1e; color: #ddd;
+                  font-family: ui-monospace, "SF Mono", Menlo, monospace; margin: 0; }}
+          h1 {{ padding: 16px; margin: 0; }}
+          p  {{ padding: 0 16px 8px 16px; margin: 0; }}
+          .grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+                   gap: 12px; padding: 16px; }}
+          .card {{ background: #2a2a2a; border-radius: 6px; padding: 10px; }}
+          .card.alpha {{ border-left: 5px solid #13e67b; }}
+          .card.flat  {{ border-left: 5px solid #e45c1a; }}
+          .card img {{ width: 100%; border-radius: 3px; image-rendering: pixelated; }}
+          .meta {{ font-size: 12px; color: #aaa; margin-top: 6px; line-height: 1.6; }}
+          </style></head>
+          <body>
+          <h1>Day {DAY} — {len(entries)} artifacts</h1>
+          <p><span style="color:#13e67b">{summary['alpha']} with alpha</span> ·
+             <span style="color:#e45c1a">{summary['flat']} flattened</span></p>
+          <div class="grid">{''.join(cards)}</div>
+          </body></html>"""
+          (bundle / 'index.html').write_text(html)
+          print("Gallery: index.html")
+
+          # 6. Optionally move raw into the bundle
+          if INCLUDE_RAW:
+              target = bundle / 'raw'
+              if target.exists(): shutil.rmtree(target)
+              shutil.move('raw', target)
+              print(f"Raw PNGs moved into bundle ({sum(1 for _ in target.rglob('*.png'))} files)")
+
+          # 7. Console summary so the run log is self-documenting
+          print("\n──── Alpha status summary ────")
+          for e in entries:
+              mark = '✓' if e['has_alpha'] else '✗'
+              print(f"  {mark} {e['timestamp']}"
+                    + (f"  ({e['transparent_pct']:.2f}% transparent)" if e['has_alpha']
+                       else "  (flattened)"))
+          PY
+
+      - name: Upload peruse bundle
+        if: inputs.dry_run != true
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: peruse-${{ inputs.day }}-${{ github.run_id }}
+          path: bundle/
+          retention-days: 30
+
+      - name: Clean up older peruse bundles for this day
+        if: inputs.dry_run != true && success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DAY: ${{ inputs.day }}
+          KEEP_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -uo pipefail
+          ids=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"peruse-$DAY-\")) | select(.id != $KEEP_ID) | .id" || true)
+          for id in $ids; do
+            [ -z "$id" ] && continue
+            echo "Deleting old peruse bundle $id"
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" || true
+          done
