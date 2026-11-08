@@ -54,19 +54,16 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          # Check for backfill artifact — if present, entire day is covered
           gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.name | startswith(\"backfill-${DATE}-\")) | select(.expired == false) | .name" \
             > work/backfill_artifacts.txt
           echo "Existing backfill-${DATE}-* artifacts: $(wc -l < work/backfill_artifacts.txt)"
 
-          # Snap artifacts with size info (so we can detect bloated reconstructions)
           gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | {name: .name, size: .size_in_bytes}" \
             > work/artifacts.json
           echo "Existing snap-${DATE}_* artifacts: $(wc -l < work/artifacts.json)"
 
-          # R2 PNGs
           rclone lsf ":s3:${R2_BUCKET}" \
             --include "wdpsnapshot_${DATE}_*.png" \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
@@ -81,7 +78,6 @@ jobs:
         run: |
           if [ -s work/backfill_artifacts.txt ]; then
             echo "Day $DATE covered by backfill artifact — no reconstruction needed"
-            cat work/backfill_artifacts.txt
             echo "missing=[]" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -96,18 +92,18 @@ jobs:
           invalid = set()
           for line in open('work/artifacts.json'):
               line = line.strip()
-              if not line:
-                  continue
+              if not line: continue
               a = json.loads(line)
-              if not a['name'].startswith(f'snap-{day}_'):
-                  continue
+              if not a['name'].startswith(f'snap-{day}_'): continue
               ts = a['name'][5:]
+              # Force rebuild if size is > 0 (so we re-run the fixed palette logic)
               if a['size'] > 0:
                   invalid.add(ts)
               else:
                   covered.add(ts)
+          
           if invalid:
-              print(f"Note: {len(invalid)} bloated artifacts (>4MB) will be re-reconstructed")
+              print(f"Note: {len(invalid)} artifacts will be re-reconstructed to ensure exact palette")
 
           r2_pngs = set()
           for line in open('work/r2_pngs.txt'):
@@ -115,10 +111,7 @@ jobs:
               if name.startswith('wdpsnapshot_') and name.endswith('.png'):
                   r2_pngs.add(name[len('wdpsnapshot_'):-len('.png')])
 
-          day_entries = sorted(
-              [e for e in timeline if e['time'].startswith(day)],
-              key=lambda e: e['time']
-          )
+          day_entries = sorted([e for e in timeline if e['time'].startswith(day)], key=lambda e: e['time'])
           if not day_entries:
               print(f"ERROR: no entries for {day}")
               raise SystemExit(1)
@@ -150,18 +143,6 @@ jobs:
               f.write(f"missing={json.dumps(missing)}\n")
           PY
 
-      - name: Upload determine report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: determine-report-${{ github.run_id }}
-          path: |
-            work/backfill_artifacts.txt
-            work/artifacts.json
-            work/r2_pngs.txt
-          retention-days: 7
-          if-no-files-found: warn
-
   reconstruct:
     needs: determine
     if: needs.determine.outputs.missing != '[]' && inputs.dry_run == false
@@ -179,12 +160,10 @@ jobs:
 
       - run: python3 -m pip install --quiet pillow numpy brotli
 
-      - name: Install rclone and pngquant
+      - name: Install rclone
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends pngquant
 
       - name: Download palette
         env:
@@ -206,6 +185,7 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           SNAPSHOT: ${{ toJson(matrix.snapshot) }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 -u << 'PY'
           import json, os, shutil, subprocess
@@ -214,37 +194,44 @@ jobs:
           from PIL import Image
           import brotli
 
-          env = {k: os.environ[k] for k in (
-              'R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET')}
+          env = {k: os.environ[k] for k in ('R2_ENDPOINT', 'R2_ACCESS_KEY_ID', 'R2_SECRET_ACCESS_KEY', 'R2_BUCKET')}
           item = json.loads(os.environ['SNAPSHOT'])
           ts = item['time']
           out_file = Path(f'out/wdpsnapshot_{ts}.png')
 
           def dl(remote, local):
               local = Path(local)
-              if local.exists():
-                  return
+              if local.exists(): return
               local.parent.mkdir(parents=True, exist_ok=True)
-              subprocess.run(
-                  ['rclone', 'copyto',
-                   f':s3:{env["R2_BUCKET"]}/{remote}', str(local),
-                   '--ignore-size',
-                   '--s3-provider=Cloudflare',
-                   f'--s3-endpoint={env["R2_ENDPOINT"]}',
-                   f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}',
-                   f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
+              
+              # Try R2 first
+              result = subprocess.run(
+                  ['rclone', 'copyto', f':s3:{env["R2_BUCKET"]}/{remote}', str(local),
+                   '--ignore-size', '--s3-provider=Cloudflare', f'--s3-endpoint={env["R2_ENDPOINT"]}',
+                   f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}', f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
                    '--s3-no-check-bucket', '--log-level', 'ERROR'],
-                  check=True)
+                  capture_output=True)
+              
+              if result.returncode != 0:
+                  # Fall back to artifact if R2 base was deleted by a previous day's rediff
+                  print(f"R2 download failed for {remote}, trying artifact...")
+                  artifact_name = remote.replace('wdpsnapshot_', 'snap-').replace('.png', '')
+                  subprocess.run(
+                      ['gh', 'run', 'download', '-R', 'daniel-jbx/Wdp-archiver', '-n', artifact_name, '-D', 'work/base_artifact'],
+                      check=True)
+                  found = list(Path('work/base_artifact').rglob(remote))
+                  if found:
+                      shutil.copy(found[0], local)
+                      print(f"Recovered {remote} from artifact {artifact_name}")
+                  else:
+                      raise FileNotFoundError(f"Could not find {remote} in artifact {artifact_name}")
 
           def read_diff(path):
               raw = Path(path).read_bytes()
-              try:
-                  return json.loads(brotli.decompress(raw))
-              except Exception:
-                  return json.loads(raw)
+              try: return json.loads(brotli.decompress(raw))
+              except Exception: return json.loads(raw)
 
-          def hex_to_rgb(h):
-              return int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
+          def hex_to_rgb(h): return int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16)
 
           def apply_diff(arr, diff, palette):
               if 'rows' in diff:
@@ -259,15 +246,13 @@ jobs:
               elif 'changes' in diff:
                   for x, y, idx in diff['changes']:
                       if isinstance(idx, str):
-                          # v1 format: idx is a hex string like "#ff00aa"
                           r, g, b = hex_to_rgb(idx)
                       else:
-                          # v2/v3 format: idx is a palette index
                           r, g, b = hex_to_rgb(palette[idx])
                       arr[y, x, 0] = r
                       arr[y, x, 1] = g
                       arr[y, x, 2] = b
-                      
+
           if item['mode'] == 'copy':
               src = item['src']
               local = Path('work') / src
@@ -277,8 +262,7 @@ jobs:
           else:
               palette = json.load(open('work/palette.json'))
               base_time = item['base']
-              if base_time is None:
-                  raise SystemExit(f"ERROR: no base for {ts}")
+              if base_time is None: raise SystemExit(f"ERROR: no base for {ts}")
 
               base_src = f'wdpsnapshot_{base_time}.png'
               base_local = Path('work') / base_src
@@ -291,7 +275,7 @@ jobs:
               diff = read_diff(diff_local)
               apply_diff(arr, diff, palette)
 
-              # Build the exact canonical palette from palette.json
+              # Use PIL's exact palette quantizer to ensure zero color shifting
               rgb_palette = [tuple(int(h[i:i+2], 16) for i in (1, 3, 5)) for h in palette]
               flat_palette = []
               for r, g, b in rgb_palette:
@@ -301,7 +285,6 @@ jobs:
               pal_img = Image.new('P', (1, 1))
               pal_img.putpalette(flat_palette)
               
-              # Quantize to the exact canonical palette (no dithering, no color shifting)
               rgb_img = Image.fromarray(arr, 'RGBA').convert('RGB')
               indexed_img = rgb_img.quantize(palette=pal_img, dither=Image.Dither.NONE)
               indexed_img.save(out_file)
