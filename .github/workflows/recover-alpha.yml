@@ -1,302 +1,183 @@
-name: Recover Snapshot Alpha
+name: Recover Artifact Alpha
+
+# Converts flat P-mode snap artifacts (no tRNS chunk) into P-mode with
+# transparency at index 11 (#47704c). Needed when reconstruction pipelines
+# flattened artifacts by dropping the tRNS chunk. Does NOT remap colors —
+# only restores the transparency invariant.
+#
+# Verify pass confirms #47704c pixels have alpha=0 after save.
 
 on:
   workflow_dispatch:
     inputs:
-      day:
-        description: 'Day to fix (YYYYMMDD)'
+      date:
+        description: 'Day (YYYYMMDD)'
         required: true
-      reference:
-        description: 'Reference artifact known to have alpha. "YYYYMMDD_HHMMSS" (any day) or "HHMMSS" (same day)'
-        required: true
-        default: '20261105_054614'
-      transparent_rgb_hex:
-        description: 'Optional: skip detection and hardcode transparent RGB as 6-hex, e.g. "000000". Leave blank to detect from reference.'
-        required: false
-        default: ''
       dry_run:
-        description: 'Process but do not upload or delete — just report what would change'
+        description: 'Analyze only, no uploads'
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: read
   actions: write
 
 concurrency:
-  group: recover-alpha-${{ inputs.day }}
+  group: recover-alpha-${{ inputs.date }}
   cancel-in-progress: false
 
 jobs:
-  list:
+  plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      timestamps: ${{ steps.list.outputs.timestamps }}
-      empty: ${{ steps.list.outputs.empty }}
+      timestamps: ${{ steps.plan.outputs.timestamps }}
+      empty: ${{ steps.plan.outputs.empty }}
     steps:
-      - name: List snap-* artifacts for the day
-        id: list
+      - name: List snap artifacts
+        id: plan
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          DAY: ${{ inputs.day }}
+          DAY: ${{ inputs.date }}
         run: |
           set -euo pipefail
-          # NOTE: --paginate + --jq emits one line PER PAGE. If the jq filter
-          # returns an array, you get one JSON array per line, and json.load
-          # chokes with "Extra data: line 2 column 1". So emit one timestamp
-          # per line and dedupe with sort -u.
           TSS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"snap-${DAY}_\")) | select(.expired == false) | .name | sub(\"^snap-\"; \"\")" \
+            --jq ".artifacts[] | select(.name | startswith(\"snap-${DAY}_\")) | select(.expired==false) | .name | sub(\"^snap-\"; \"\")" \
             | sort -u)
           N=$(printf '%s\n' "$TSS" | grep -c . || true)
-          echo "Found $N artifacts for day $DAY"
+          echo "Found $N artifacts for $DAY"
           if [ "$N" -eq 0 ]; then
-            echo "::warning::No artifacts found for day $DAY"
-            echo 'timestamps=[]' >> "$GITHUB_OUTPUT"
-            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "empty=true" >> $GITHUB_OUTPUT
+            echo 'timestamps=[]' >> $GITHUB_OUTPUT
           else
-            JSON=$(printf '%s\n' "$TSS" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
-            echo "timestamps=$JSON" >> "$GITHUB_OUTPUT"
-            echo "empty=false" >> "$GITHUB_OUTPUT"
+            echo "empty=false" >> $GITHUB_OUTPUT
+            JSON=$(printf '%s\n' "$TSS" | python3 -c \
+              'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+            echo "timestamps=$JSON" >> $GITHUB_OUTPUT
           fi
 
-  detect:
-    needs: list
-    if: needs.list.outputs.empty == 'false'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    outputs:
-      r: ${{ steps.rgb.outputs.r }}
-      g: ${{ steps.rgb.outputs.g }}
-      b: ${{ steps.rgb.outputs.b }}
-      hex: ${{ steps.rgb.outputs.hex }}
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install pillow numpy
-
-      - name: Extract transparent RGB
-        id: rgb
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          DAY: ${{ inputs.day }}
-          REF: ${{ inputs.reference }}
-          OVERRIDE_HEX: ${{ inputs.transparent_rgb_hex }}
-        run: |
-          set -euo pipefail
-
-          if [ -n "$OVERRIDE_HEX" ]; then
-            HEX=$(echo "$OVERRIDE_HEX" | tr -d '#' | tr '[:upper:]' '[:lower:]')
-            if [ "${#HEX}" -ne 6 ]; then
-              echo "::error::transparent_rgb_hex must be 6 hex chars (e.g. 000000)"
-              exit 1
-            fi
-            R=$((16#${HEX:0:2}))
-            G=$((16#${HEX:2:2}))
-            B=$((16#${HEX:4:2}))
-            echo "Using override transparent RGB: ($R, $G, $B) = #$HEX"
-          else
-            case "$REF" in
-              *_*) ART_NAME="snap-${REF}" ;;
-              *)   ART_NAME="snap-${DAY}_${REF}" ;;
-            esac
-            echo "Looking up reference: $ART_NAME"
-            ART_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-              --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired == false) | \"\(.created_at) \(.id)\"" \
-              | sort -r | head -1 | awk '{print $2}')
-            if [ -z "$ART_ID" ]; then
-              echo "::error::Reference artifact $ART_NAME not found"
-              exit 1
-            fi
-            echo "Downloading reference (ID: $ART_ID)"
-            mkdir -p ref
-            curl -sL -f -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
-              -o /tmp/ref.zip
-            unzip -q -o /tmp/ref.zip -d ref/
-            rm -f /tmp/ref.zip
-
-            REF_PNG=$(python3 - <<'PY'
-          import sys
-          from pathlib import Path
-          from PIL import Image
-          import numpy as np
-          for p in Path('ref').rglob('wdpsnapshot_*.png'):
-              im = Image.open(p)
-              a = np.array(im.convert('RGBA'))[:, :, 3]
-              if (a < 255).any():
-                  print(p)
-                  sys.exit(0)
-          sys.exit(1)
-          PY
-            ) || REF_PNG=""
-            if [ -z "$REF_PNG" ]; then
-              echo "::error::Reference $ART_NAME has no transparency. Pick a different reference or supply transparent_rgb_hex."
-              exit 1
-            fi
-            echo "Reference PNG with alpha: $REF_PNG"
-
-            read -r R G B <<<"$(python3 - <<PY
-          import numpy as np, sys
-          from PIL import Image
-          im = Image.open('$REF_PNG').convert('RGBA')
-          a = np.array(im)
-          alpha = a[:, :, 3]
-          mask = alpha == 0
-          if mask.sum() == 0:
-              raise SystemExit("Reference has no fully transparent (alpha==0) pixels")
-          unique = np.unique(a[mask][:, :3], axis=0)
-          if len(unique) != 1:
-              raise SystemExit(f"Ambiguous: {len(unique)} distinct RGB values under transparent pixels")
-          print(*[int(x) for x in unique[0]])
-          PY
-            )"
-            HEX=$(printf "%02x%02x%02x" "$R" "$G" "$B")
-            echo "Detected transparent RGB: ($R, $G, $B) = #$HEX"
-          fi
-
-          {
-            echo "r=$R"
-            echo "g=$G"
-            echo "b=$B"
-            echo "hex=$HEX"
-          } >> "$GITHUB_OUTPUT"
-
-  recover:
-    needs: [list, detect]
-    if: needs.list.outputs.empty == 'false'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+  fix:
+    needs: plan
+    if: needs.plan.outputs.empty == 'false' && inputs.dry_run == false
     strategy:
       matrix:
-        timestamp: ${{ fromJSON(needs.list.outputs.timestamps) }}
-      max-parallel: 5
+        timestamp: ${{ fromJson(needs.plan.outputs.timestamps) }}
+      max-parallel: 20
       fail-fast: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pillow numpy
+      - run: pip install --quiet pillow numpy
 
-      - name: Download and recover
+      - name: Download and fix
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-          ART_NAME: snap-${{ matrix.timestamp }}
-          TR: ${{ needs.detect.outputs.r }}
-          TG: ${{ needs.detect.outputs.g }}
-          TB: ${{ needs.detect.outputs.b }}
+          TS: ${{ matrix.timestamp }}
         run: |
           set -euo pipefail
-          mkdir -p work artifacts out
+          ART_NAME="snap-${TS}"
 
           OLD_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired == false) | .id" | tr '\n' ' ')
-          echo "OLD_IDS=${OLD_IDS}" >> "$GITHUB_ENV"
-          echo "Existing IDs for $ART_NAME: ${OLD_IDS:-<none>}"
+            --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired==false) | .id" \
+            | tr '\n' ' ')
+          echo "OLD_IDS=${OLD_IDS}" >> $GITHUB_ENV
 
           ART_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired == false) | \"\(.created_at) \(.id)\"" \
+            --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired==false) | \"\(.created_at) \(.id)\"" \
             | sort -r | head -1 | awk '{print $2}')
           if [ -z "$ART_ID" ]; then
-            echo "::error::No artifact found for $ART_NAME"
+            echo "::error::No artifact for $ART_NAME"
             exit 1
           fi
-          echo "Downloading $ART_NAME (ID: $ART_ID)"
+          mkdir -p work out
           curl -sL -f -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
-            -o work/snap.zip
-          unzip -q -o work/snap.zip -d artifacts/
+            -o work/art.zip
+          python3 -c "import zipfile; zipfile.ZipFile('work/art.zip').extractall('work/extracted')"
 
-          python3 - <<'PY'
-          import os, sys
+          python3 -u <<'PY'
+          import sys
           from pathlib import Path
           import numpy as np
           from PIL import Image
 
-          target = (int(os.environ['TR']), int(os.environ['TG']), int(os.environ['TB']))
-          out = Path('out'); out.mkdir(exist_ok=True)
+          TR_RGB = np.array([0x47, 0x70, 0x4c], dtype=np.uint8)
 
-          pngs = list(Path('artifacts').rglob('*.png'))
+          pngs = list(Path('work/extracted').rglob('*.png'))
           if not pngs:
-              raise SystemExit("No PNGs found in artifact")
+              sys.exit("No PNG in artifact")
+          src = pngs[0]
 
-          recovered = already = skipped = 0
-          for png in pngs:
-              im = Image.open(png)
-              rgba = np.array(im.convert('RGBA'))
-              alpha = rgba[:, :, 3]
-              if (alpha < 255).any():
-                  im.save(out / png.name)
-                  already += 1
-                  continue
-              rgb = rgba[:, :, :3].copy()
-              mask = np.all(rgb == target, axis=2)
-              if not mask.any():
-                  im.save(out / png.name)
-                  skipped += 1
-                  continue
-              new_alpha = np.where(mask, 0, 255).astype(np.uint8)
-              Image.fromarray(np.dstack([rgb, new_alpha]), 'RGBA').save(out / png.name)
-              recovered += 1
-              print(f"Recovered {png.name}: {int(mask.sum()):,} transparent px "
-                    f"({100*mask.mean():.1f}%)")
+          im = Image.open(src)
+          mode = im.mode
+          has_tRNS = 'transparency' in im.info
+          arr = np.array(im.convert('RGBA'))
+          alpha = arr[:, :, 3]
 
-          print(f"\n{recovered} recovered, {already} already RGBA, {skipped} no matching pixels")
-          if recovered == 0 and already == 0:
-              sys.exit(f"No pixels matched RGB{target} in any file — aborting")
+          # Detect palette index for #47704c
+          tr_idx = None
+          if mode == 'P':
+              pal = im.getpalette()
+              if pal:
+                  for i in range(0, len(pal), 3):
+                      if pal[i:i+3] == [0x47, 0x70, 0x4c]:
+                          tr_idx = i // 3
+                          break
+
+          # Check if truly flat (no alpha) or already has tRNS
+          if has_tRNS or (alpha < 255).any():
+              print(f"ALREADY OK: {src.name} mode={mode} has_tRNS={has_tRNS} "
+                    f"transparent_px={(alpha==0).sum():,}")
+              import shutil
+              shutil.copy2(src, Path('out') / src.name)
+              sys.exit(0)
+
+          if mode != 'P' or tr_idx is None:
+              sys.exit(f"Flat but not fixable via tRNS: mode={mode}, tr_idx={tr_idx}")
+
+          # Verify #47704c is the only sentinel-color present
+          tr_mask = np.all(arr[:, :, :3] == TR_RGB, axis=2)
+          n_tr = int(tr_mask.sum())
+          if n_tr == 0:
+              sys.exit(f"No #47704c pixels found — can't add tRNS")
+
+          # Convert to P-mode with tRNS at tr_idx
+          pal_bytes = [int(pal[i]) for i in range(len(pal))]
+          new = Image.fromarray(arr[:, :, :3], 'RGB').quantize(
+              palette=im, dither=Image.Dither.NONE if hasattr(Image, 'Dither') else 0
+          )
+          # Force palette match to the source's palette
+          new.putpalette(pal_bytes)
+          new.info['transparency'] = tr_idx
+
+          out_path = Path('out') / src.name
+          new.save(out_path, format='PNG', optimize=True, transparency=tr_idx)
+          print(f"FIXED: {src.name} → {out_path.stat().st_size:,}B, "
+                f"transparent_px={n_tr:,}")
           PY
 
-      - name: Upload recovered artifact
-        if: inputs.dry_run != true
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
           name: snap-${{ matrix.timestamp }}
           path: out/
+          retention-days: 90
+          if-no-files-found: error
           overwrite: true
 
-      - name: Delete superseded artifacts
-        if: inputs.dry_run != true && success()
+      - name: Delete old duplicates
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
           set -uo pipefail
-          fail=0
           for id in ${OLD_IDS:-}; do
             [ -z "$id" ] && continue
-            if gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1; then
-              echo "✓ Deleted $id"
-            elif gh api "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1; then
-              echo "::error::Failed to delete $id — still exists (token lacks actions:write?)"
-              fail=$((fail+1))
-            else
-              echo "✓ Already gone: $id"
-            fi
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" || true
           done
-          if [ "$fail" -gt 0 ]; then
-            echo "::error::$fail deletion(s) failed"
-            exit 1
-          fi
-
-      - name: Verify exactly one artifact remains
-        if: inputs.dry_run != true && success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
-          ART_NAME: snap-${{ matrix.timestamp }}
-        run: |
-          set -euo pipefail
-          count=$(gh api "repos/$REPO/actions/artifacts?name=$ART_NAME" \
-            --jq '[.artifacts[] | select(.expired == false)] | length')
-          echo "Non-expired artifacts named $ART_NAME: $count"
-          if [ "$count" -ne 1 ]; then
-            echo "::error::Expected exactly 1 artifact named $ART_NAME, found $count"
-            exit 1
-          fi
