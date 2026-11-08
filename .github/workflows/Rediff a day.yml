@@ -237,27 +237,70 @@ jobs:
           DATE: ${{ steps.target.outputs.day }}
         run: |
           set -euo pipefail
-          ARTIFACT_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}-\")) | select(.expired == false) | .id")
-          N=$(echo "$ARTIFACT_IDS" | grep -c . || true)
-          echo "Found $N snap artifacts for $DATE"
-          if [ "$N" -lt 50 ]; then echo "Only $N — incomplete"; exit 1; fi
-          rm -rf "$GITHUB_WORKSPACE/day" && mkdir -p "$GITHUB_WORKSPACE/day"
-          COUNT=0
-          for id in $ARTIFACT_IDS; do
-            ZIP="/tmp/snap-${id}.zip"
-            curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/artifacts/${id}/zip" \
-              -o "$ZIP"
-            unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/day/"
-            rm -f "$ZIP"
-            COUNT=$((COUNT + 1))
-            if [ $((COUNT % 20)) -eq 0 ]; then echo "  Downloaded $COUNT of $N..."; fi
-          done
-          PNG_COUNT=$(ls "$GITHUB_WORKSPACE/day"/wdpsnapshot_${DATE}_*.png 2>/dev/null | wc -l)
-          echo "Extracted $PNG_COUNT snapshots"
-          if [ "$PNG_COUNT" -lt 50 ]; then echo "ERROR: only $PNG_COUNT"; exit 1; fi
+
+          # Try individual snap-YYYYMMDD_HHMMSS artifacts first (NOTE THE UNDERSCORE)
+          INDIV_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | .id" 2>/dev/null || true)
+          N=$(echo "$INDIV_IDS" | grep -c . || true)
+          echo "Individual snap artifacts for $DATE: $N"
+
+          if [ "$N" -ge 50 ]; then
+            rm -rf "$GITHUB_WORKSPACE/day" && mkdir -p "$GITHUB_WORKSPACE/day"
+            COUNT=0
+            for id in $INDIV_IDS; do
+              ZIP="/tmp/snap-${id}.zip"
+              curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/actions/artifacts/${id}/zip" \
+                -o "$ZIP"
+              unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/day/"
+              rm -f "$ZIP"
+              COUNT=$((COUNT + 1))
+              if [ $((COUNT % 20)) -eq 0 ]; then
+                echo "  Downloaded $COUNT of $N..."
+              fi
+            done
+            # Flatten any nested subdirectories
+            find "$GITHUB_WORKSPACE/day" -mindepth 2 -name "wdpsnapshot_*.png" -exec mv {} "$GITHUB_WORKSPACE/day/" \; 2>/dev/null || true
+            PNG_COUNT=$(ls "$GITHUB_WORKSPACE/day"/wdpsnapshot_${DATE}_*.png 2>/dev/null | wc -l)
+            echo "Extracted $PNG_COUNT snapshots from individual artifacts"
+            if [ "$PNG_COUNT" -ge 50 ]; then
+              echo "OK: using individual snap artifacts"
+              exit 0
+            fi
+            echo "Individual artifacts yielded only $PNG_COUNT, falling through to batch"
+          fi
+
+          # Fall back to snap-batch-DATE-* artifacts
+          BATCH_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"snap-batch-${DATE}-\")) | select(.expired == false) | .id" 2>/dev/null || true)
+          B=$(echo "$BATCH_IDS" | grep -c . || true)
+          echo "Batch snap artifacts for $DATE: $B"
+
+          if [ "$B" -ge 1 ]; then
+            rm -rf "$GITHUB_WORKSPACE/day" && mkdir -p "$GITHUB_WORKSPACE/day"
+            for id in $BATCH_IDS; do
+              ZIP="/tmp/snap-batch-${id}.zip"
+              curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/$REPO/actions/artifacts/${id}/zip" \
+                -o "$ZIP"
+              unzip -q -o "$ZIP" -d "$GITHUB_WORKSPACE/day/"
+              rm -f "$ZIP"
+            done
+            find "$GITHUB_WORKSPACE/day" -mindepth 2 -name "wdpsnapshot_*.png" -exec mv {} "$GITHUB_WORKSPACE/day/" \; 2>/dev/null || true
+            PNG_COUNT=$(ls "$GITHUB_WORKSPACE/day"/wdpsnapshot_${DATE}_*.png 2>/dev/null | wc -l)
+            echo "Extracted $PNG_COUNT snapshots from batch artifacts"
+            if [ "$PNG_COUNT" -ge 50 ]; then
+              echo "OK: using batch snap artifacts"
+              exit 0
+            fi
+            echo "ERROR: batch artifacts yielded only $PNG_COUNT"
+            exit 1
+          fi
+
+          echo "No snap artifacts found for $DATE (neither individual nor batch)"
+          exit 1
 
       - name: Try release archive
         id: release
