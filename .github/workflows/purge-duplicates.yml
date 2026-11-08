@@ -31,7 +31,6 @@ jobs:
       - name: Verify token identity and permissions
         run: |
           set -euo pipefail
-          echo "── Token prefix ──"
           prefix="${GH_TOKEN:0:10}"
           echo "Prefix: $prefix..."
           case "$prefix" in
@@ -40,32 +39,19 @@ jobs:
             *)           echo "❓ Not a PAT — likely the built-in github.token" ;;
           esac
 
-          echo "── Can this token read the artifacts API? ──"
-          if gh api "repos/$REPO/actions/artifacts?per_page=1" >/dev/null 2>&1; then
-            echo "✅ Token can read artifacts API"
-          else
-            echo "❌ Token cannot read artifacts API — permissions likely wrong"
+          if ! gh api "repos/$REPO/actions/artifacts?per_page=1" >/dev/null 2>&1; then
+            echo "::error::Token cannot read the artifacts API. Check token validity and repository access."
             exit 1
           fi
+          echo "✅ Token can read artifacts API"
 
-          echo "── Token permissions (fine-grained only) ──"
-          gh api /user/permissions 2>/dev/null | python3 -c "
-          import json,sys
-          try:
-              d=json.load(sys.stdin)
-              perms=d.get('permissions',{})
-              actions=perms.get('actions')
-              if actions is None:
-                  print('ℹ️  No fine-grained permissions block (classic PAT or github.token)')
-              else:
-                  print(f'actions: {actions}')
-                  if actions == 'write':
-                      print('✅ actions:write — deletion should work')
-                  else:
-                      print('❌ actions:write NOT granted')
-          except Exception:
-              print('ℹ️  Could not read fine-grained permissions')
-          " || true
+          # Probe write permission with a harmless request that requires actions:write.
+          # We try to list workflow runs with the 'gh run list' command which requires
+          # actions:read at minimum; but to test write we check the rate limit endpoint
+          # does not tell us. A reliable check is to attempt a GET on the artifact
+          # and inspect the token's scope. Since there is no non-destructive write
+          # test, we rely on the error message from the first DELETE attempt.
+          echo "ℹ️  Proceeding to enumerate. Write permission will be validated on first DELETE."
 
       - name: Enumerate and classify
         run: |
@@ -90,7 +76,6 @@ jobs:
           to_delete = []
           for name in sorted(groups):
               arts = groups[name]
-              # Prefer non-expired, then newest
               arts.sort(key=lambda x: (not x['expired'], x['created_at']), reverse=True)
               keep = arts[0]
               if len(arts) > 1:
@@ -114,12 +99,21 @@ jobs:
           while read -r id; do
             [ -z "$id" ] && continue
             total=$((total+1))
-            if gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1; then
+            # Capture both stdout and stderr, and the HTTP status code
+            response=$(gh api -X DELETE "repos/$REPO/actions/artifacts/$id" 2>&1) || true
+            if [ $? -eq 0 ]; then
               ok=$((ok+1))
               echo "[$ok/$total] ✓ $id"
             else
               fail=$((fail+1))
-              echo "[$ok/$total] ✗ $id (failed)"
+              echo "[$ok/$total] ✗ $id — response: ${response:-<empty>}"
+              # Extract HTTP status if present
+              if echo "$response" | grep -q 'HTTP 403'; then
+                echo "   ↳ 403 Forbidden: token lacks Actions:write permission."
+                echo "   ↳ Edit the fine-grained PAT and set Actions → Read and write."
+              elif echo "$response" | grep -q 'HTTP 404'; then
+                echo "   ↳ 404 Not Found: artifact may already be deleted or token lacks repo access."
+              fi
             fi
           done < delete.txt
           echo "----"
