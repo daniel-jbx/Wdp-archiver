@@ -7,6 +7,10 @@ permissions:
   contents: read
   actions: write
 
+concurrency:
+  group: fix-colors-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   fix:
     runs-on: ubuntu-latest
@@ -32,6 +36,7 @@ jobs:
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
+
       - name: Download palette
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -47,18 +52,22 @@ jobs:
 
       - name: Download and fix artifact
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          # github.token has actions:write from the permissions block above.
+          # Switch to secrets.PAT_TOKEN only if your org restricts built-in tokens.
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           TS: ${{ matrix.timestamp }}
         run: |
+          set -euo pipefail
           ART_NAME="snap-${TS}"
 
-          # Record every non-expired artifact ID with this name, so we can
-          # delete them all after the fixed replacement is uploaded.
+          # Snapshot every non-expired artifact ID with this name.
+          # These are the ones we may want to delete after the new upload.
           OLD_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired == false) | .id" \
             | tr '\n' ' ')
           echo "OLD_IDS=${OLD_IDS}" >> "$GITHUB_ENV"
+          echo "Existing IDs for $ART_NAME: ${OLD_IDS:-<none>}"
 
           # Newest one to download (sort by created_at, fall back to id).
           ART_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
@@ -66,12 +75,12 @@ jobs:
             | sort -r | head -1 | awk '{print $2}')
 
           if [ -z "$ART_ID" ]; then
-            echo "No artifact found for $ART_NAME"
+            echo "::error::No artifact found for $ART_NAME"
             exit 1
           fi
 
           echo "Fixing $ART_NAME (ID: $ART_ID)"
-          curl -sL -H "Authorization: Bearer $GH_TOKEN" \
+          curl -sL -f -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
             -o "artifacts/${ART_NAME}.zip"
@@ -90,22 +99,32 @@ jobs:
           dists = [np.linalg.norm(np.array(c) - np.array(target)) for c in canonical_rgb]
           best_color = canonical_rgb[int(np.argmin(dists))]
 
+          flat_palette = []
+          for r, g, b in canonical_rgb:
+              flat_palette.extend([r, g, b])
+          flat_palette.extend([0] * (256 * 3 - len(flat_palette)))
+          pal_img = Image.new('P', (1, 1))
+          pal_img.putPalette(flat_palette)
+
           pngs = list(Path('artifacts').glob('*.png'))
+          if not pngs:
+              raise SystemExit("No PNGs found in artifact — aborting so we don't upload an empty replacement")
+
+          # Always write every PNG to out/, not just the modified ones.
+          # Otherwise an artifact that needed no fixing produces an empty
+          # out/ — upload-artifact@v4 still creates an artifact, and the
+          # subsequent delete step then destroys the good copy.
           for png in pngs:
               arr = np.array(Image.open(png).convert('RGB'))
               mask = (arr[:, :, 0] == target[0]) & (arr[:, :, 1] == target[1]) & (arr[:, :, 2] == target[2])
               if mask.any():
                   arr[mask] = best_color
-                  rgb_palette = [tuple(int(h[i:i+2], 16) for i in (1, 3, 5)) for h in palette]
-                  flat_palette = []
-                  for r, g, b in rgb_palette:
-                      flat_palette.extend([r, g, b])
-                  flat_palette.extend([0] * (256 * 3 - len(flat_palette)))
-                  pal_img = Image.new('P', (1, 1))
-                  pal_img.putPalette(flat_palette)
-                  indexed_img = Image.fromarray(arr, 'RGB').quantize(palette=pal_img, dither=Image.Dither.NONE)
-                  indexed_img.save(Path('out') / png.name)
-                  print(f"Fixed {png.name}")
+                  status = "Fixed"
+              else:
+                  status = "Kept "
+              indexed = Image.fromarray(arr, 'RGB').quantize(palette=pal_img, dither=Image.Dither.NONE)
+              indexed.save(Path('out') / png.name)
+              print(f"{status} {png.name}")
           PY
 
       - name: Upload fixed artifact
@@ -118,10 +137,43 @@ jobs:
       - name: Delete superseded artifacts
         if: success()
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
+          set -uo pipefail
+          fail=0
           for id in ${OLD_IDS:-}; do
-            echo "Deleting old artifact $id"
-            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" || true
+            [ -z "$id" ] && continue
+            if gh api -X DELETE "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1; then
+              echo "✓ Deleted old artifact $id"
+            else
+              # If it's already gone (e.g. upload-artifact's overwrite:true
+              # removed it within the same run), that's fine — goal achieved.
+              if gh api "repos/$REPO/actions/artifacts/$id" >/dev/null 2>&1; then
+                echo "::error::Failed to delete artifact $id — it still exists"
+                fail=$((fail+1))
+              else
+                echo "✓ Old artifact $id already gone (overwritten)"
+              fi
+            fi
           done
+          if [ "$fail" -gt 0 ]; then
+            echo "::error::$fail deletion(s) failed — token likely lacks actions:write"
+            exit 1
+          fi
+
+      - name: Verify exactly one artifact remains
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ART_NAME: snap-${{ matrix.timestamp }}
+        run: |
+          set -euo pipefail
+          count=$(gh api "repos/$REPO/actions/artifacts?name=$ART_NAME" \
+            --jq '[.artifacts[] | select(.expired == false)] | length')
+          echo "Non-expired artifacts named $ART_NAME: $count"
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Expected exactly 1 artifact named $ART_NAME, found $count"
+            exit 1
+          fi
