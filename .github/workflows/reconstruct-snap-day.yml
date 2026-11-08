@@ -102,7 +102,7 @@ jobs:
               if not a['name'].startswith(f'snap-{day}_'):
                   continue
               ts = a['name'][5:]
-              if a['size'] > 4_000_000:
+              if a['size'] > 0:
                   invalid.add(ts)
               else:
                   covered.add(ts)
@@ -291,11 +291,20 @@ jobs:
               diff = read_diff(diff_local)
               apply_diff(arr, diff, palette)
 
-              Image.fromarray(arr, 'RGBA').save(out_file)
-              subprocess.run(
-                  ['pngquant', '--quality=100', '--speed=1', '--force', '64',
-                   str(out_file), '--output', str(out_file)],
-                  check=True)
+              # Build the exact canonical palette from palette.json
+              rgb_palette = [tuple(int(h[i:i+2], 16) for i in (1, 3, 5)) for h in palette]
+              flat_palette = []
+              for r, g, b in rgb_palette:
+                  flat_palette.extend([r, g, b])
+              flat_palette.extend([0] * (256 * 3 - len(flat_palette)))
+              
+              pal_img = Image.new('P', (1, 1))
+              pal_img.putpalette(flat_palette)
+              
+              # Quantize to the exact canonical palette (no dithering, no color shifting)
+              rgb_img = Image.fromarray(arr, 'RGBA').convert('RGB')
+              indexed_img = rgb_img.quantize(palette=pal_img, dither=Image.Dither.NONE)
+              indexed_img.save(out_file)
               print(f"Reconstructed {ts} (base {base_time}) → {out_file.stat().st_size} bytes")
           PY
 
