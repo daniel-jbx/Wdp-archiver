@@ -571,10 +571,13 @@ jobs:
                     if p.name.startswith('wdpsnapshot_') or p.name.startswith('wdpdiff_'))
 
           merged = json.load(open('merged-timeline.json'))
-          referenced_elsewhere = {
-              e['src'] for e in merged
-              if not e['time'].startswith(day)
-          }
+          referenced_elsewhere = set()
+          for e in merged:
+              if e['time'].startswith(day):
+                  continue
+              referenced_elsewhere.add(e['src'])
+              if e['kind'] == 'diff' and e.get('base'):
+                  referenced_elsewhere.add(f'wdpsnapshot_{e["base"]}.png')
 
           stale = []
           protected = []
