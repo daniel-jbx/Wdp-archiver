@@ -11,10 +11,6 @@ on:
         type: boolean
         default: true
 
-concurrency:
-  group: reconstruct-snap-${{ inputs.date }}
-  cancel-in-progress: false
-
 permissions:
   contents: read
   actions: write
@@ -216,10 +212,17 @@ jobs:
               if not local.exists():
                   print(f"R2 download failed for {remote}, trying artifact...")
                   artifact_name = remote.replace('wdpsnapshot_', 'snap-').replace('.png', '')
+                  artifact_dir = Path('work/base_artifact')
+
+                  # Clean up previous failed download attempts
+                  if artifact_dir.exists():
+                      shutil.rmtree(artifact_dir)
+
                   subprocess.run(
-                      ['gh', 'run', 'download', '-R', 'daniel-jbx/Wdp-archiver', '-n', artifact_name, '-D', 'work/base_artifact', '--clobber'],
+                      ['gh', 'run', 'download', '-R', 'daniel-jbx/Wdp-archiver', '-n', artifact_name, '-D', str(artifact_dir)],
                       check=True)
-                  found = list(Path('work/base_artifact').rglob(remote))
+
+                  found = list(artifact_dir.rglob(remote))
                   if found:
                       shutil.copy(found[0], local)
                       print(f"Recovered {remote} from artifact {artifact_name}")
