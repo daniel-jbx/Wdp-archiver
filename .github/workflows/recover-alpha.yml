@@ -1,11 +1,12 @@
 name: Recover Artifact Alpha
 
-# Converts flat P-mode snap artifacts (no tRNS chunk) into P-mode with
-# transparency at index 11 (#47704c). Needed when reconstruction pipelines
-# flattened artifacts by dropping the tRNS chunk. Does NOT remap colors —
-# only restores the transparency invariant.
+# Adds tRNS chunk at index 11 (#47704c) to flat P-mode snap artifacts.
+# Does NOT re-quantize — artifacts are assumed to already have canonical
+# palette (verified via pixel-level check before save). Re-quantizing an
+# already-palette-correct image is a no-op that costs ~30s/file instead
+# of ~50ms/file.
 #
-# Verify pass confirms #47704c pixels have alpha=0 after save.
+# Skips artifacts that already have transparency (idempotent).
 
 on:
   workflow_dispatch:
@@ -14,7 +15,7 @@ on:
         description: 'Day (YYYYMMDD)'
         required: true
       dry_run:
-        description: 'Analyze only, no uploads'
+        description: 'Plan only, no uploads'
         type: boolean
         default: true
 
@@ -66,7 +67,7 @@ jobs:
       max-parallel: 20
       fail-fast: false
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -113,53 +114,67 @@ jobs:
           if not pngs:
               sys.exit("No PNG in artifact")
           src = pngs[0]
+          out_path = Path('out') / src.name
 
           im = Image.open(src)
           mode = im.mode
           has_tRNS = 'transparency' in im.info
-          arr = np.array(im.convert('RGBA'))
-          alpha = arr[:, :, 3]
 
-          # Detect palette index for #47704c
-          tr_idx = None
-          if mode == 'P':
-              pal = im.getpalette()
-              if pal:
-                  for i in range(0, len(pal), 3):
-                      if pal[i:i+3] == [0x47, 0x70, 0x4c]:
-                          tr_idx = i // 3
-                          break
+          if mode != 'P':
+              # Not P-mode; use the slower quantize path
+              print(f"{src.name}: mode={mode} — quantize path")
+              arr = np.array(im.convert('RGBA'))
+              if (arr[:, :, 3] < 255).any():
+                  print(f"ALREADY OK: {src.name} (RGBA with alpha)")
+                  im.save(out_path)
+                  sys.exit(0)
+              # RGBA flat — needs full quantize
+              sys.exit(f"::error::{src.name} is flat RGBA, not P-mode — "
+                       f"needs full re-quantize, not simple tRNS fix")
 
-          # Check if truly flat (no alpha) or already has tRNS
-          if has_tRNS or (alpha < 255).any():
-              print(f"ALREADY OK: {src.name} mode={mode} has_tRNS={has_tRNS} "
-                    f"transparent_px={(alpha==0).sum():,}")
-              import shutil
-              shutil.copy2(src, Path('out') / src.name)
+          # P-mode. Check if already has tRNS
+          if has_tRNS:
+              transparency_val = im.info['transparency']
+              print(f"ALREADY OK: {src.name} (P-mode with tRNS at index {transparency_val})")
+              im.save(out_path)
               sys.exit(0)
 
-          if mode != 'P' or tr_idx is None:
-              sys.exit(f"Flat but not fixable via tRNS: mode={mode}, tr_idx={tr_idx}")
+          # P-mode flat — find #47704c in palette
+          pal = im.getpalette()
+          tr_idx = None
+          for i in range(0, len(pal), 3):
+              if pal[i:i+3] == [0x47, 0x70, 0x4c]:
+                  tr_idx = i // 3
+                  break
 
-          # Verify #47704c is the only sentinel-color present
-          tr_mask = np.all(arr[:, :, :3] == TR_RGB, axis=2)
-          n_tr = int(tr_mask.sum())
-          if n_tr == 0:
-              sys.exit(f"No #47704c pixels found — can't add tRNS")
+          if tr_idx is None:
+              sys.exit(f"::error::#47704c not found in palette")
 
-          # Convert to P-mode with tRNS at tr_idx
-          pal_bytes = [int(pal[i]) for i in range(len(pal))]
-          new = Image.fromarray(arr[:, :, :3], 'RGB').quantize(
-              palette=im, dither=Image.Dither.NONE if hasattr(Image, 'Dither') else 0
-          )
-          # Force palette match to the source's palette
-          new.putpalette(pal_bytes)
-          new.info['transparency'] = tr_idx
+          # Verify: every pixel whose RGB is #47704c must be at index tr_idx.
+          # This guards against corrupt palettes (e.g. pngquant-derived) where
+          # #47704c might appear at some other index, or where similar colors
+          # got merged.
+          idx_arr = np.array(im)  # P-mode indices, shape (H, W)
+          rgba_arr = np.array(im.convert('RGBA'))
+          tr_by_rgb = np.all(rgba_arr[:, :, :3] == TR_RGB, axis=2)
+          tr_by_idx = (idx_arr == tr_idx)
 
-          out_path = Path('out') / src.name
-          new.save(out_path, format='PNG', optimize=True, transparency=tr_idx)
-          print(f"FIXED: {src.name} → {out_path.stat().st_size:,}B, "
-                f"transparent_px={n_tr:,}")
+          n_rgb = int(tr_by_rgb.sum())
+          n_idx = int(tr_by_idx.sum())
+
+          if not np.array_equal(tr_by_rgb, tr_by_idx):
+              n_mismatch = int((tr_by_rgb != tr_by_idx).sum())
+              sys.exit(f"::error::palette inconsistency: {n_mismatch} pixels differ "
+                       f"between RGB-match ({n_rgb}) and idx-match ({n_idx})")
+
+          if n_rgb == 0:
+              sys.exit(f"::error::no #47704c pixels — can't add tRNS meaningfully")
+
+          # Direct save with tRNS
+          im.save(out_path, format='PNG', optimize=True, transparency=tr_idx)
+          size = out_path.stat().st_size
+          print(f"FIXED: {src.name} → {size:,}B, "
+                f"tRNS at index {tr_idx}, {n_rgb:,} transparent px")
           PY
 
       - name: Upload
