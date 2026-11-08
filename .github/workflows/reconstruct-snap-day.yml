@@ -26,13 +26,11 @@ jobs:
     outputs:
       missing: ${{ steps.determine.outputs.missing }}
     steps:
-      - name: Install rclone and pngquant
+      - name: Install rclone
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends pngquant
-          
+
       - name: Download timeline
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
@@ -56,11 +54,19 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
+          # Check for backfill artifact — if present, entire day is covered
           gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | .name" \
-            > work/artifacts.txt
-          echo "Existing snap-${DATE}_* artifacts: $(wc -l < work/artifacts.txt)"
+            --jq ".artifacts[] | select(.name | startswith(\"backfill-${DATE}-\")) | select(.expired == false) | .name" \
+            > work/backfill_artifacts.txt
+          echo "Existing backfill-${DATE}-* artifacts: $(wc -l < work/backfill_artifacts.txt)"
 
+          # Snap artifacts with size info (so we can detect bloated reconstructions)
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | {name: .name, size: .size_in_bytes}" \
+            > work/artifacts.json
+          echo "Existing snap-${DATE}_* artifacts: $(wc -l < work/artifacts.json)"
+
+          # R2 PNGs
           rclone lsf ":s3:${R2_BUCKET}" \
             --include "wdpsnapshot_${DATE}_*.png" \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
@@ -73,6 +79,13 @@ jobs:
         env:
           DATE: ${{ inputs.date }}
         run: |
+          if [ -s work/backfill_artifacts.txt ]; then
+            echo "Day $DATE covered by backfill artifact — no reconstruction needed"
+            cat work/backfill_artifacts.txt
+            echo "missing=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
           python3 -u << 'PY'
           import json, os
 
@@ -80,10 +93,21 @@ jobs:
           timeline = json.load(open('work/timeline.json'))
 
           covered = set()
-          for line in open('work/artifacts.txt'):
-              name = line.strip()
-              if name.startswith(f'snap-{day}_'):
-                  covered.add(name[5:])
+          invalid = set()
+          for line in open('work/artifacts.json'):
+              line = line.strip()
+              if not line:
+                  continue
+              a = json.loads(line)
+              if not a['name'].startswith(f'snap-{day}_'):
+                  continue
+              ts = a['name'][5:]
+              if a['size'] > 4_000_000:
+                  invalid.add(ts)
+              else:
+                  covered.add(ts)
+          if invalid:
+              print(f"Note: {len(invalid)} bloated artifacts (>4MB) will be re-reconstructed")
 
           r2_pngs = set()
           for line in open('work/r2_pngs.txt'):
@@ -126,6 +150,18 @@ jobs:
               f.write(f"missing={json.dumps(missing)}\n")
           PY
 
+      - name: Upload determine report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: determine-report-${{ github.run_id }}
+          path: |
+            work/backfill_artifacts.txt
+            work/artifacts.json
+            work/r2_pngs.txt
+          retention-days: 7
+          if-no-files-found: warn
+
   reconstruct:
     needs: determine
     if: needs.determine.outputs.missing != '[]' && inputs.dry_run == false
@@ -143,10 +179,12 @@ jobs:
 
       - run: python3 -m pip install --quiet pillow numpy brotli
 
-      - name: Install rclone
+      - name: Install rclone and pngquant
         run: |
           curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
           sudo dpkg -i rclone-current-linux-amd64.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends pngquant
 
       - name: Download palette
         env:
@@ -230,15 +268,13 @@ jobs:
               local = Path('work') / src
               dl(src, local)
               shutil.copy(local, out_file)
-              print(f"Copied {src}")
+              print(f"Copied {src} → {out_file.stat().st_size} bytes")
           else:
               palette = json.load(open('work/palette.json'))
               base_time = item['base']
               if base_time is None:
-                  # png entry, shouldn't reach here in reconstruct mode
                   raise SystemExit(f"ERROR: no base for {ts}")
 
-              # Base PNG may be missing from timeline (orphaned), but file exists on R2
               base_src = f'wdpsnapshot_{base_time}.png'
               base_local = Path('work') / base_src
               dl(base_src, base_local)
@@ -256,8 +292,6 @@ jobs:
                    str(out_file), '--output', str(out_file)],
                   check=True)
               print(f"Reconstructed {ts} (base {base_time}) → {out_file.stat().st_size} bytes")
-
-          print(f"Size: {out_file.stat().st_size} bytes")
           PY
 
       - name: Upload artifact
