@@ -205,19 +205,19 @@ jobs:
               local.parent.mkdir(parents=True, exist_ok=True)
               
               # Try R2 first
-              result = subprocess.run(
+              subprocess.run(
                   ['rclone', 'copyto', f':s3:{env["R2_BUCKET"]}/{remote}', str(local),
                    '--ignore-size', '--s3-provider=Cloudflare', f'--s3-endpoint={env["R2_ENDPOINT"]}',
                    f'--s3-access-key-id={env["R2_ACCESS_KEY_ID"]}', f'--s3-secret-access-key={env["R2_SECRET_ACCESS_KEY"]}',
                    '--s3-no-check-bucket', '--log-level', 'ERROR'],
                   capture_output=True)
               
-              if result.returncode != 0:
-                  # Fall back to artifact if R2 base was deleted by a previous day's rediff
+              # If R2 failed OR rclone bugged out and didn't write the file, try artifacts
+              if not local.exists():
                   print(f"R2 download failed for {remote}, trying artifact...")
                   artifact_name = remote.replace('wdpsnapshot_', 'snap-').replace('.png', '')
                   subprocess.run(
-                      ['gh', 'run', 'download', '-R', 'daniel-jbx/Wdp-archiver', '-n', artifact_name, '-D', 'work/base_artifact'],
+                      ['gh', 'run', 'download', '-R', 'daniel-jbx/Wdp-archiver', '-n', artifact_name, '-D', 'work/base_artifact', '--clobber'],
                       check=True)
                   found = list(Path('work/base_artifact').rglob(remote))
                   if found:
