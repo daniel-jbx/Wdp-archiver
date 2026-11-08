@@ -96,7 +96,7 @@ jobs:
               a = json.loads(line)
               if not a['name'].startswith(f'snap-{day}_'): continue
               ts = a['name'][5:]
-              # Force rebuild if size is > 0 (so we re-run the fixed palette logic)
+              # Force rebuild if size is > 0 to ensure exact palette
               if a['size'] > 0:
                   invalid.add(ts)
               else:
