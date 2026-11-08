@@ -258,11 +258,16 @@ jobs:
                           x += length
               elif 'changes' in diff:
                   for x, y, idx in diff['changes']:
-                      r, g, b = hex_to_rgb(palette[idx])
+                      if isinstance(idx, str):
+                          # v1 format: idx is a hex string like "#ff00aa"
+                          r, g, b = hex_to_rgb(idx)
+                      else:
+                          # v2/v3 format: idx is a palette index
+                          r, g, b = hex_to_rgb(palette[idx])
                       arr[y, x, 0] = r
                       arr[y, x, 1] = g
                       arr[y, x, 2] = b
-
+                      
           if item['mode'] == 'copy':
               src = item['src']
               local = Path('work') / src
