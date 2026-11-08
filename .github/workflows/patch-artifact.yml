@@ -56,19 +56,38 @@ jobs:
           set -euo pipefail
           mkdir -p work out
 
+          echo "Inputs: BASE=$BASE  TARGET=$TARGET  REF=$REF"
+          echo "R2 bucket: ${R2_BUCKET:0:8}…"
+
           rclone_get() {
-            command rclone copyto ":s3:${R2_BUCKET}/$1" "$2" \
+            local remote="$1"
+            local dest="$2"
+            echo "── pulling $remote → $dest"
+            command rclone copyto ":s3:${R2_BUCKET}/$remote" "$dest" \
               --ignore-size \
               --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
               --s3-access-key-id="$R2_ACCESS_KEY_ID" \
               --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
               --s3-no-check-bucket --log-level ERROR
+            local rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "::error::rclone failed for $remote (exit=$rc)"
+              return "$rc"
+            fi
+            if [ ! -s "$dest" ]; then
+              echo "::error::$dest is missing or zero-length after rclone"
+              return 1
+            fi
+            echo "   ✓ $(wc -c < "$dest") bytes"
           }
 
-          rclone_get "wdpsnapshot_${BASE}.png"      work/base.png
-          rclone_get "wdpdiff_${TARGET}.json"       work/target.json
-          rclone_get "wdpdiff_${REF}.json"          work/ref.json
-          rclone_get "palette.json"                 work/palette.json
+          rclone_get "wdpsnapshot_${BASE}.png" work/base.png
+          rclone_get "wdpdiff_${TARGET}.json"  work/target.json
+          rclone_get "wdpdiff_${REF}.json"     work/ref.json
+          rclone_get "palette.json"            work/palette.json
+
+          echo "── work/ contents after download:"
+          ls -la work/
 
           ART_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
             --jq ".artifacts[] | select(.name==\"snap-${TARGET}\") | select(.expired==false) | \"\(.created_at) \(.id)\"" \
@@ -77,12 +96,18 @@ jobs:
             echo "::error::No artifact found for snap-${TARGET}"
             exit 1
           fi
-          echo "Downloading artifact $ART_ID"
+          echo "── downloading artifact $ART_ID"
           curl -sL -f -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
             -o work/target_artifact.zip
           python3 -c "import zipfile; zipfile.ZipFile('work/target_artifact.zip').extractall('work/extracted')"
+
+          echo "── extracted PNGs:"
+          find work/extracted -name "*.png"
+
+          echo "── final work/ state:"
+          ls -la work/
 
       - name: Patch artifact
         env:
