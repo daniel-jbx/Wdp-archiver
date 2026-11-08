@@ -1,0 +1,46 @@
+name: Release Antarktika Archive
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install rclone
+        run: |
+          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone-current-linux-amd64.deb
+
+      - name: Download Antarktika folder from R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p antarktika_backup
+          echo "Downloading antarktika files..."
+          rclone copy ":s3:${R2_BUCKET}/antarktika" antarktika_backup/ \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR --transfers 16 -P
+          
+          echo "Compressing into a tar.gz..."
+          tar -czvf antarktika-archive.tar.gz antarktika_backup/
+          ls -lh antarktika-archive.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: antarktika-archive
+          name: "Antarktika Static Archive"
+          body: |
+            Standalone backup of the Antarktika tile set.
+            Extracted directly from R2.
+          files: antarktika-archive.tar.gz
+          draft: false
+          prerelease: false
