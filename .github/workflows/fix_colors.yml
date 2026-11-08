@@ -1,101 +1,28 @@
-name: Fix Artifact Colors
+name: Fix Specific Artifact Colors
 
 on:
   workflow_dispatch:
-    inputs:
-      date:
-        description: 'Date to fix (YYYYMMDD)'
-        required: true
-        default: '20261105'
 
 permissions:
   contents: read
   actions: write
 
 jobs:
-  find:
-    runs-on: ubuntu-latest
-    outputs:
-      artifacts: ${{ steps.find.outputs.artifacts }}
-    steps:
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - run: pip install pillow numpy
-      - name: Install rclone
-        run: |
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
-          sudo dpkg -i rclone-current-linux-amd64.deb
-      - name: Download palette
-        env:
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          mkdir -p work artifacts
-          rclone copyto ":s3:${R2_BUCKET}/palette.json" work/palette.json \
-            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket --log-level ERROR
-
-      - name: Find corrupted artifacts
-        id: find
-        env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
-          REPO: ${{ github.repository }}
-          DATE: ${{ inputs.date }}
-        run: |
-          # Get both ID and Name for the date
-          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | \"\(.id) \(.name)\"" > work/ids.txt
-          
-          # Download all 95 zips to check them
-          while read -r id name; do
-            curl -sL -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/$REPO/actions/artifacts/${id}/zip" \
-              -o "artifacts/${id}.zip"
-            unzip -q -o "artifacts/${id}.zip" -d "artifacts/"
-            rm "artifacts/${id}.zip"
-          done < work/ids.txt
-
-          python3 -u << 'PY'
-          import json, os
-          from pathlib import Path
-          import numpy as np
-          from PIL import Image
-
-          target = (0x76, 0x63, 0x4b)
-          corrupted = []
-          
-          # Load ID to name map
-          id_map = {}
-          for line in open('work/ids.txt'):
-              if not line.strip(): continue
-              aid, name = line.strip().split(' ', 1)
-              id_map[name] = aid
-
-          for png in Path('artifacts').glob('*.png'):
-              arr = np.array(Image.open(png).convert('RGB'))
-              if np.any((arr[:,:,0]==target[0]) & (arr[:,:,1]==target[1]) & (arr[:,:,2]==target[2])):
-                  art_name = png.name.replace('wdpsnapshot_', 'snap-').replace('.png', '')
-                  if art_name in id_map:
-                      corrupted.append({"id": id_map[art_name], "name": art_name})
-          
-          print(f"Found {len(corrupted)} corrupted artifacts.")
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write(f"artifacts={json.dumps(corrupted)}\n")
-          PY
-
   fix:
-    needs: find
-    if: needs.find.outputs.artifacts != '[]'
+    runs-on: ubuntu-latest
     strategy:
       matrix:
-        artifact: ${{ fromJson(needs.find.outputs.artifacts) }}
+        timestamp: [
+          "20261105_180124", "20261105_182555", "20261105_183107",
+          "20261105_184629", "20261105_190126", "20261105_191615",
+          "20261105_193134", "20261105_194602", "20261105_200110",
+          "20261105_201604", "20261105_203835", "20261105_204611",
+          "20261105_220112", "20261105_221612", "20261105_223115",
+          "20261105_224609", "20261105_230113", "20261105_231609",
+          "20261105_233107", "20261105_234616"
+        ]
       max-parallel: 5
-    runs-on: ubuntu-latest
+      fail-fast: false
     steps:
       - uses: actions/setup-python@v5
         with:
@@ -117,23 +44,41 @@ jobs:
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR
-      
+
       - name: Download and fix artifact
         env:
           GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
           REPO: ${{ github.repository }}
-          ART_ID: ${{ matrix.artifact.id }}
-          ART_NAME: ${{ matrix.artifact.name }}
+          TS: ${{ matrix.timestamp }}
         run: |
-          # Direct download using the known ID
+          ART_NAME="snap-${TS}"
+
+          # Record every non-expired artifact ID with this name, so we can
+          # delete them all after the fixed replacement is uploaded.
+          OLD_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired == false) | .id" \
+            | tr '\n' ' ')
+          echo "OLD_IDS=${OLD_IDS}" >> "$GITHUB_ENV"
+
+          # Newest one to download (sort by created_at, fall back to id).
+          ART_ID=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name==\"$ART_NAME\") | select(.expired == false) | \"\(.created_at) \(.id)\"" \
+            | sort -r | head -1 | awk '{print $2}')
+
+          if [ -z "$ART_ID" ]; then
+            echo "No artifact found for $ART_NAME"
+            exit 1
+          fi
+
+          echo "Fixing $ART_NAME (ID: $ART_ID)"
           curl -sL -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
             -o "artifacts/${ART_NAME}.zip"
           unzip -q -o "artifacts/${ART_NAME}.zip" -d artifacts/
-          
+
           python3 -u << 'PY'
-          import json, os
+          import json
           from pathlib import Path
           import numpy as np
           from PIL import Image
@@ -141,10 +86,10 @@ jobs:
           palette = json.load(open('work/palette.json'))
           canonical_rgb = [tuple(int(h[i:i+2], 16) for i in (1, 3, 5)) for h in palette]
           target = (0x76, 0x63, 0x4b)
-          
+
           dists = [np.linalg.norm(np.array(c) - np.array(target)) for c in canonical_rgb]
           best_color = canonical_rgb[int(np.argmin(dists))]
-          
+
           pngs = list(Path('artifacts').glob('*.png'))
           for png in pngs:
               arr = np.array(Image.open(png).convert('RGB'))
@@ -162,10 +107,21 @@ jobs:
                   indexed_img.save(Path('out') / png.name)
                   print(f"Fixed {png.name}")
           PY
-          
+
       - name: Upload fixed artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact.name }}
+          name: snap-${{ matrix.timestamp }}
           path: out/
           overwrite: true
+
+      - name: Delete superseded artifacts
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          for id in ${OLD_IDS:-}; do
+            echo "Deleting old artifact $id"
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" || true
+          done
