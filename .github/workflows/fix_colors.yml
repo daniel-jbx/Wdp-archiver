@@ -38,27 +38,27 @@ jobs:
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR
+
       - name: Find corrupted artifacts
         id: find
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
           REPO: ${{ github.repository }}
           DATE: ${{ inputs.date }}
         run: |
-          # Download ALL artifacts for the date to check them
-          ARTIFACT_IDS=$(gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
-            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | .id")
+          # Get both ID and Name for the date
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"snap-${DATE}_\")) | select(.expired == false) | \"\(.id) \(.name)\"" > work/ids.txt
           
-          i=0
-          for id in $ARTIFACT_IDS; do
-            i=$((i + 1))
+          # Download all 95 zips to check them
+          while read -r id name; do
             curl -sL -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
               "https://api.github.com/repos/$REPO/actions/artifacts/${id}/zip" \
               -o "artifacts/${id}.zip"
-            unzip -q -o "artifacts/${id}.zip" -d artifacts/
+            unzip -q -o "artifacts/${id}.zip" -d "artifacts/"
             rm "artifacts/${id}.zip"
-          done
+          done < work/ids.txt
 
           python3 -u << 'PY'
           import json, os
@@ -66,15 +66,22 @@ jobs:
           import numpy as np
           from PIL import Image
 
-          palette = json.load(open('work/palette.json'))
-          target = (0x76, 0x63, 0x4b) # The corrupted color
-
+          target = (0x76, 0x63, 0x4b)
           corrupted = []
-          pngs = list(Path('artifacts').glob('*.png'))
-          for png in pngs:
+          
+          # Load ID to name map
+          id_map = {}
+          for line in open('work/ids.txt'):
+              if not line.strip(): continue
+              aid, name = line.strip().split(' ', 1)
+              id_map[name] = aid
+
+          for png in Path('artifacts').glob('*.png'):
               arr = np.array(Image.open(png).convert('RGB'))
               if np.any((arr[:,:,0]==target[0]) & (arr[:,:,1]==target[1]) & (arr[:,:,2]==target[2])):
-                  corrupted.append(png.name.replace('wdpsnapshot_', 'snap-').replace('.png', ''))
+                  art_name = png.name.replace('wdpsnapshot_', 'snap-').replace('.png', '')
+                  if art_name in id_map:
+                      corrupted.append({"id": id_map[art_name], "name": art_name})
           
           print(f"Found {len(corrupted)} corrupted artifacts.")
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
@@ -87,6 +94,7 @@ jobs:
     strategy:
       matrix:
         artifact: ${{ fromJson(needs.find.outputs.artifacts) }}
+      max-parallel: 5
     runs-on: ubuntu-latest
     steps:
       - uses: actions/setup-python@v5
@@ -104,27 +112,28 @@ jobs:
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          mkdir -p work out
+          mkdir -p work out artifacts
           rclone copyto ":s3:${R2_BUCKET}/palette.json" work/palette.json \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR
-      - name: Download artifact
+      
+      - name: Download and fix artifact
         env:
-          GH_TOKEN: ${{ secrets.PAT_TOKEN }}   # Changed from ${{ github.token }}
+          GH_TOKEN: ${{ secrets.PAT_TOKEN || github.token }}
           REPO: ${{ github.repository }}
-          ARTIFACT: ${{ matrix.artifact }}
+          ART_ID: ${{ matrix.artifact.id }}
+          ART_NAME: ${{ matrix.artifact.name }}
         run: |
-          mkdir -p artifacts
+          # Direct download using the known ID
           curl -sL -H "Authorization: Bearer $GH_TOKEN" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/$REPO/actions/artifacts/$(gh api repos/$REPO/actions/artifacts --jq ".artifacts[] | select(.name==\"$ARTIFACT\") | .id")/zip" \
-            -o "artifacts/${ARTIFACT}.zip"
-          unzip -q -o "artifacts/${ARTIFACT}.zip" -d artifacts/
-      - name: Fix color
-        run: |
+            "https://api.github.com/repos/$REPO/actions/artifacts/${ART_ID}/zip" \
+            -o "artifacts/${ART_NAME}.zip"
+          unzip -q -o "artifacts/${ART_NAME}.zip" -d artifacts/
+          
           python3 -u << 'PY'
-          import json
+          import json, os
           from pathlib import Path
           import numpy as np
           from PIL import Image
@@ -133,32 +142,30 @@ jobs:
           canonical_rgb = [tuple(int(h[i:i+2], 16) for i in (1, 3, 5)) for h in palette]
           target = (0x76, 0x63, 0x4b)
           
-          # Find the closest canonical color to the corrupted one
           dists = [np.linalg.norm(np.array(c) - np.array(target)) for c in canonical_rgb]
           best_color = canonical_rgb[int(np.argmin(dists))]
-          print(f"Mapping #76634b to {best_color}")
-
+          
           pngs = list(Path('artifacts').glob('*.png'))
           for png in pngs:
               arr = np.array(Image.open(png).convert('RGB'))
               mask = (arr[:, :, 0] == target[0]) & (arr[:, :, 1] == target[1]) & (arr[:, :, 2] == target[2])
               if mask.any():
                   arr[mask] = best_color
-                  # Save with exact palette
                   rgb_palette = [tuple(int(h[i:i+2], 16) for i in (1, 3, 5)) for h in palette]
                   flat_palette = []
                   for r, g, b in rgb_palette:
                       flat_palette.extend([r, g, b])
                   flat_palette.extend([0] * (256 * 3 - len(flat_palette)))
                   pal_img = Image.new('P', (1, 1))
-                  pal_img.putpalette(flat_palette)
+                  pal_img.putPalette(flat_palette)
                   indexed_img = Image.fromarray(arr, 'RGB').quantize(palette=pal_img, dither=Image.Dither.NONE)
                   indexed_img.save(Path('out') / png.name)
                   print(f"Fixed {png.name}")
           PY
+          
       - name: Upload fixed artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
+          name: ${{ matrix.artifact.name }}
           path: out/
           overwrite: true
