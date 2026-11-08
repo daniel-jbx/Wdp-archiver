@@ -1,10 +1,24 @@
 name: Reconcile timelines
 
+# Fast atomic swap. Assumes Fix Timeline has already produced on R2:
+#   timeline-clean.json         — the verified merged result
+#   timeline-prod-snapshot.json — the timeline.json that Fix Timeline saw
+#
+# Steps:
+#   1. Verify both files exist on R2
+#   2. Race guard: timeline.json must be unchanged since Fix Timeline ran
+#   3. Re-verify timeline-clean.json against current R2 file listing
+#   4. Atomic swap: timeline-clean.json → timeline.json
+#   5. Delete timeline-rediff.json (rediff falls back to timeline.json)
+#   6. Delete intermediate files
+#
+# Runtime: ~20-30 seconds. Safe to re-run without side effects.
+
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Analyze only, no R2 writes'
+        description: 'Verify only, no R2 writes'
         type: boolean
         default: true
 
@@ -18,161 +32,251 @@ permissions:
 jobs:
   reconcile:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - name: Install rclone
         run: |
-          curl -O https://downloads.rclone.org/rclone-current-linux-amd64.deb
-          sudo dpkg -i rclone-current-linux-amd64.deb
+          curl -fsSL -o rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone.deb
+          rm -f rclone.deb
 
-      - name: Download both timelines
+      - name: Verify prerequisites and race guard
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
         run: |
-          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline-prod.json \
+          set -euo pipefail
+          mkdir -p work
+
+          # 1. Both prerequisites must exist
+          echo "Checking prerequisites on R2…"
+          HAVE_CLEAN=$(rclone lsf ":s3:${R2_BUCKET}" --include "timeline-clean.json" \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket --log-level ERROR
-          rclone copyto ":s3:${R2_BUCKET}/timeline-rediff.json" timeline-rediff.json \
+            --s3-no-check-bucket --log-level ERROR | grep -c timeline-clean.json || true)
+          HAVE_SNAPSHOT=$(rclone lsf ":s3:${R2_BUCKET}" --include "timeline-prod-snapshot.json" \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket --log-level ERROR
+            --s3-no-check-bucket --log-level ERROR | grep -c timeline-prod-snapshot.json || true)
 
-      - name: Merge and validate
-        run: |
-          python3 -u << 'PY'
-          import json, sys
-          from pathlib import Path
-
-          rediff = json.load(open('timeline-rediff.json'))
-          prod = json.load(open('timeline-prod.json'))
-
-          print(f"Rediff timeline:  {len(rediff)} entries")
-          print(f"Production:       {len(prod)} entries")
-
-          if not rediff:
-              print("ERROR: rediff timeline empty")
-              sys.exit(1)
-
-          T_rediff_end = rediff[-1]['time']
-          print(f"Rediff ends at:   {T_rediff_end}")
-
-          prod_after = [e for e in prod if e['time'] > T_rediff_end]
-          print(f"Production entries after T_rediff_end: {len(prod_after)}")
-
-          # Sanity check: production and rediff share history up to T_rediff_end
-          prod_at_boundary = [e for e in prod if e['time'] == T_rediff_end]
-          if not prod_at_boundary:
-              print(f"WARNING: no production entry exactly at {T_rediff_end}")
-              # That's OK — the boundary may be off by a few seconds
-
-          merged = rediff + prod_after
-          merged.sort(key=lambda e: e['time'])
-
-          # Validate: check for broken base refs
-          png_times = {e['time'] for e in merged if e['kind'] == 'png'}
-          broken_days = set()
-          for e in merged:
-              if e['kind'] == 'diff':
-                  base = e.get('base')
-                  if base and base not in png_times:
-                      broken_days.add(e['time'][:8])
-
-          # Duplicates
-          times = [e['time'] for e in merged]
-          dupes = set(t for t in times if times.count(t) > 1)
-
-          print()
-          print(f"Merged: {len(merged)} entries")
-          print(f"Days with broken base refs (need re-clean): {len(broken_days)}")
-          if broken_days:
-              for d in sorted(broken_days)[:20]:
-                  print(f"  {d}")
-          print(f"Duplicate timestamps: {len(dupes)}")
-          if dupes:
-              for t in sorted(dupes)[:5]:
-                  print(f"  {t}")
-              print("ERROR: duplicate timestamps in merged timeline")
-              sys.exit(1)
-
-          json.dump(merged, open('timeline-merged.json', 'w'), indent=2)
-          with open('broken-days.txt', 'w') as f:
-              f.write('\n'.join(sorted(broken_days)))
-
-          with open('summary.txt', 'w') as f:
-              f.write(f"rediff_end: {T_rediff_end}\n")
-              f.write(f"merged_entries: {len(merged)}\n")
-              f.write(f"broken_days: {len(broken_days)}\n")
-          PY
-
-      - name: Upload merged timeline
-        if: ${{ !inputs.dry_run }}
-        env:
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET: ${{ secrets.R2_BUCKET }}
-        run: |
-          # Race guard: re-check timeline.json hasn't changed since we downloaded it
-          rclone copyto ":s3:${R2_BUCKET}/timeline.json" timeline-check.json \
-            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
-            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
-            --s3-no-check-bucket --log-level ERROR
-
-          OLD_LAST=$(python3 -c "import json; print(json.load(open('timeline-prod.json'))[-1]['time'])")
-          NEW_LAST=$(python3 -c "import json; print(json.load(open('timeline-check.json'))[-1]['time'])")
-          if [ "$OLD_LAST" != "$NEW_LAST" ]; then
-            echo "Timeline changed since merge started (production wrote during merge)."
-            echo "Old last: $OLD_LAST"
-            echo "New last: $NEW_LAST"
-            echo "Re-run reconcile to pick up the new production entries."
+          if [ "$HAVE_CLEAN" -eq 0 ]; then
+            echo "::error::timeline-clean.json not found on R2 — run Fix Timeline first"
             exit 1
           fi
+          if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+            echo "::error::timeline-prod-snapshot.json not found — run Fix Timeline first"
+            exit 1
+          fi
+          echo "  ✓ timeline-clean.json present"
+          echo "  ✓ timeline-prod-snapshot.json present"
 
-          # Upload merged as timeline.json
-          rclone copyto timeline-merged.json ":s3:${R2_BUCKET}/timeline.json" \
+          # 2. Download everything needed for verification
+          echo ""
+          echo "Downloading timelines for race guard…"
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" work/timeline-current.json \
+            --ignore-size \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR
-          echo "Uploaded merged timeline as timeline.json"
+          rclone copyto ":s3:${R2_BUCKET}/timeline-prod-snapshot.json" work/timeline-snapshot.json \
+            --ignore-size \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          rclone copyto ":s3:${R2_BUCKET}/timeline-clean.json" work/timeline-clean.json \
+            --ignore-size \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
 
-          # Delete timeline-rediff.json so future rediff runs fall back to timeline.json
-          rclone delete ":s3:${R2_BUCKET}/timeline-rediff.json" \
+          # 3. Race guard: current timeline.json must byte-match the snapshot
+          echo ""
+          echo "Race guard…"
+          python3 - <<'PY'
+          import hashlib, json, sys
+
+          cur  = open('work/timeline-current.json', 'rb').read()
+          snap = open('work/timeline-snapshot.json', 'rb').read()
+
+          cur_h  = hashlib.sha256(cur).hexdigest()
+          snap_h = hashlib.sha256(snap).hexdigest()
+
+          cur_data  = json.loads(cur)
+          snap_data = json.loads(snap)
+          cur_last  = cur_data[-1]['time'] if cur_data else None
+          snap_last = snap_data[-1]['time'] if snap_data else None
+
+          print(f"  current  sha256 {cur_h[:16]}…  last={cur_last}  ({len(cur_data)} entries)")
+          print(f"  snapshot sha256 {snap_h[:16]}…  last={snap_last}  ({len(snap_data)} entries)")
+
+          if cur_h != snap_h:
+              print("")
+              print("::error::timeline.json changed since Fix Timeline ran.")
+              print("  update-map wrote during the Fix-Timeline → Reconcile window.")
+              print("  Re-run Fix Timeline to pick up new entries, then Reconcile.")
+              sys.exit(1)
+
+          print("  ✓ Race guard passed: timeline.json unchanged")
+          PY
+
+          # 4. Re-verify timeline-clean.json against current R2 file listing
+          echo ""
+          echo "Re-verifying timeline-clean.json against R2…"
+          rclone lsf ":s3:${R2_BUCKET}" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR > work/r2-files.txt
+
+          python3 - <<'PY'
+          import json, sys
+
+          clean = json.load(open('work/timeline-clean.json'))
+          on_r2 = set(line.strip() for line in open('work/r2-files.txt') if line.strip())
+
+          valid_pngs = {e['time'] for e in clean if e['kind'] == 'png' and e['src'] in on_r2}
+
+          broken = []
+          for e in clean:
+              if e['src'] not in on_r2:
+                  broken.append((e['time'], e['kind'], 'missing src'))
+                  continue
+              if e['kind'] == 'diff':
+                  base = e.get('base')
+                  if base and base not in valid_pngs:
+                      broken.append((e['time'], e['kind'], f'missing base {base}'))
+
+          if broken:
+              print(f"::error::timeline-clean.json has {len(broken)} broken references on R2:")
+              for t, k, why in broken[:15]:
+                  print(f"  {t} ({k}): {why}")
+              print("")
+              print("  Something deleted files since Fix Timeline ran.")
+              print("  Re-run Fix Timeline to regenerate timeline-clean.json, then Reconcile.")
+              sys.exit(1)
+
+          print(f"  ✓ timeline-clean.json verified: {len(clean)} entries, all files present on R2")
+          print(f"  ✓ {len(valid_pngs)} valid PNG bases, all diff bases resolve")
+          print(f"  Last entry: {clean[-1]['time']} ({clean[-1]['kind']})")
+          PY
+
+          echo ""
+          echo "All pre-flight checks passed."
+
+      - name: Swap
+        if: inputs.dry_run == false
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+
+          # 1. timeline-clean.json → timeline.json (single atomic-ish write)
+          rclone copyto ":s3:${R2_BUCKET}/timeline-clean.json" ":s3:${R2_BUCKET}/timeline.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "✓ Swapped timeline-clean.json → timeline.json"
+
+          # 2. Delete timeline-rediff.json (rediff falls back to timeline.json)
+          echo "timeline-rediff.json" > /tmp/delete-rediff.txt
+          rclone delete ":s3:${R2_BUCKET}" \
+            --files-from /tmp/delete-rediff.txt \
             --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
             --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
             --s3-no-check-bucket --log-level ERROR || true
-          echo "Deleted timeline-rediff.json (rediff now targets timeline.json)"
+          echo "✓ Deleted timeline-rediff.json"
 
-      - name: Report
+          # 3. Clean up intermediate files
+          printf "timeline-clean.json\ntimeline-prod-snapshot.json\n" > /tmp/delete-intermediate.txt
+          rclone delete ":s3:${R2_BUCKET}" \
+            --files-from /tmp/delete-intermediate.txt \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR || true
+          echo "✓ Cleaned up intermediate files"
+
+          echo ""
+          echo "Reconcile complete."
+          echo "  timeline.json:                $(rclone size ":s3:${R2_BUCKET}/timeline.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR 2>/dev/null | head -1)"
+
+      - name: Verify post-swap
+        if: inputs.dry_run == false
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          set -euo pipefail
+          mkdir -p post
+
+          # Download post-swap timeline.json and verify it matches timeline-clean
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" post/timeline.json \
+            --ignore-size \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+
+          python3 - <<'PY'
+          import json, sys
+
+          clean = json.load(open('work/timeline-clean.json'))
+          post  = json.load(open('post/timeline.json'))
+
+          if len(clean) != len(post):
+              sys.exit(f"::error::Post-swap mismatch: clean={len(clean)} post={len(post)}")
+
+          # Entry-level check
+          mismatch = 0
+          for i in range(len(clean)):
+              if clean[i] != post[i]:
+                  mismatch += 1
+                  if mismatch <= 3:
+                      print(f"  Mismatch at {clean[i]['time']}: "
+                            f"clean={clean[i]['src']} post={post[i]['src']}")
+
+          if mismatch:
+              sys.exit(f"::error::{mismatch} entries differ between clean and post")
+
+          print(f"✓ Post-swap verification: {len(post)} entries match timeline-clean.json byte-for-byte")
+
+          # Confirm timeline-rediff.json is gone
+          import subprocess
+          r = subprocess.run([
+              'rclone', 'lsf', f':s3:{__import__("os").environ["R2_BUCKET"]}',
+              '--include', 'timeline-rediff.json',
+              '--s3-provider=Cloudflare',
+              f'--s3-endpoint={__import__("os").environ["R2_ENDPOINT"]}',
+              f'--s3-access-key-id={__import__("os").environ["R2_ACCESS_KEY_ID"]}',
+              f'--s3-secret-access-key={__import__("os").environ["R2_SECRET_ACCESS_KEY"]}',
+              '--s3-no-check-bucket', '--log-level', 'ERROR'
+          ], capture_output=True, text=True)
+          if r.stdout.strip():
+              sys.exit("::warning::timeline-rediff.json still exists")
+          print("✓ timeline-rediff.json confirmed deleted")
+          PY
+
+      - name: Summary
         if: always()
         run: |
-          if [ -f summary.txt ]; then
-            echo "### Reconcile summary" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            sed 's/^/- /' summary.txt >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            if [ -s broken-days.txt ]; then
-              echo "### Days needing re-clean" >> $GITHUB_STEP_SUMMARY
-              echo "" >> $GITHUB_STEP_SUMMARY
-              while IFS= read -r d; do echo "- \`$d\`" >> $GITHUB_STEP_SUMMARY; done < broken-days.txt
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "Re-enable rediff cron — it will auto-pick these days." >> $GITHUB_STEP_SUMMARY
-            else
-              echo "### No broken days — merge complete" >> $GITHUB_STEP_SUMMARY
-            fi
+          echo "### Reconcile summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "- **Mode:** dry run (no writes)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- **Mode:** live" >> $GITHUB_STEP_SUMMARY
           fi
-
-      - name: Upload artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: reconcile-${{ github.run_id }}
-          path: |
-            timeline-merged.json
-            broken-days.txt
-            summary.txt
-          retention-days: 30
-          if-no-files-found: warn
+          echo "- **Concurrency:** atomic swap (timeline-clean → timeline)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Post-reconcile state:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`timeline.json\` = merged, verified, R2-consistent" >> $GITHUB_STEP_SUMMARY
+          echo "- \`timeline-rediff.json\` deleted (rediff falls back to timeline.json)" >> $GITHUB_STEP_SUMMARY
+          echo "- Viewer auto-falls back to \`timeline.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`update-map\` cron can be re-enabled" >> $GITHUB_STEP_SUMMARY
