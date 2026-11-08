@@ -1,0 +1,60 @@
+name: Purge Duplicate Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: 'Artifact prefix to clean (e.g. "snap-")'
+        required: true
+        default: 'snap-'
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  purge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: List and filter artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api --paginate "repos/${{ github.repository }}/actions/artifacts?per_page=100" \
+            --jq ".artifacts[] | select(.name | startswith(\"${{ inputs.filter }}\")) | {id: .id, name: .name, created_at: .created_at}" > artifacts.json
+
+          python3 -u << 'PY'
+          import json
+          from collections import defaultdict
+
+          groups = defaultdict(list)
+          for line in open('artifacts.json'):
+              if not line.strip(): continue
+              a = json.loads(line)
+              groups[a['name']].append(a)
+
+          to_delete = []
+          for name, arts in groups.items():
+              if len(arts) > 1:
+                  # Sort by creation time, keep the newest (last), delete the rest
+                  arts.sort(key=lambda x: x['created_at'])
+                  for a in arts[:-1]:
+                      to_delete.append(a['id'])
+                      print(f"Duplicate: {name} (ID: {a['id']})")
+
+          with open('delete.txt', 'w') as f:
+              for i in to_delete: f.write(f"{i}\n")
+          print(f"Total to delete: {len(to_delete)}")
+          PY
+
+      - name: Delete duplicates
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f delete.txt ]; then
+            while read id; do
+              echo "Deleting artifact $id..."
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+              sleep 1
+            done < delete.txt
+          fi
