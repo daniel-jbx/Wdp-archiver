@@ -184,7 +184,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           python3 -u << 'PY'
-          import json, os, shutil, subprocess
+          import json, os, re, shutil, subprocess, sys
           from pathlib import Path
           import numpy as np
           from PIL import Image
@@ -263,6 +263,27 @@ jobs:
               shutil.copy(local, out_file)
               print(f"Copied {src} → {out_file.stat().st_size} bytes")
           else:
+              diff_name = item['src']
+              m = re.search(r'(\d{8})_(\d{6})', diff_name)
+              
+              # Shortcut: If diff is from another day, image is identical to that day's artifact
+              if m and m.group(1) != ts[:8]:
+                  source_ts = f"{m.group(1)}_{m.group(2)}"
+                  print(f"Diff {diff_name} is reused from {source_ts}. Fetching that artifact directly.")
+                  artifact_name = f'snap-{source_ts}'
+                  artifact_dir = Path('work/base_artifact')
+                  if artifact_dir.exists(): shutil.rmtree(artifact_dir)
+                  subprocess.run(
+                      ['gh', 'run', 'download', '-R', 'daniel-jbx/Wdp-archiver', '-n', artifact_name, '-D', str(artifact_dir)],
+                      check=True)
+                  found = list(artifact_dir.rglob(f"wdpsnapshot_{source_ts}.png"))
+                  if found:
+                      shutil.copy(found[0], out_file)
+                      print(f"Recovered {ts} from artifact {artifact_name} → {out_file.stat().st_size} bytes")
+                      sys.exit(0)
+                  else:
+                      raise FileNotFoundError(f"Could not find {artifact_name} artifact")
+
               palette = json.load(open('work/palette.json'))
               base_time = item['base']
               if base_time is None: raise SystemExit(f"ERROR: no base for {ts}")
@@ -273,8 +294,8 @@ jobs:
 
               arr = np.array(Image.open(base_local).convert('RGBA'))
 
-              diff_local = Path('work') / item['src']
-              dl(item['src'], diff_local)
+              diff_local = Path('work') / diff_name
+              dl(diff_name, diff_local)
               diff = read_diff(diff_local)
               apply_diff(arr, diff, palette)
 
