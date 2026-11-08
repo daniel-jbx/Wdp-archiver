@@ -103,8 +103,18 @@ jobs:
           for r, g, b in canonical_rgb:
               flat_palette.extend([r, g, b])
           flat_palette.extend([0] * (256 * 3 - len(flat_palette)))
+
           pal_img = Image.new('P', (1, 1))
-          pal_img.putPalette(flat_palette)
+          # Pillow >= 11 removed the camelCase alias `putPalette`.
+          # `putpalette` is the canonical (lowercase) name and has existed for ages.
+          pal_img.putpalette(flat_palette)
+
+          # Image.Dither.NONE == 0. Some Pillow builds have reshuffled /
+          # deprecated the enum; `dither=0` is always accepted.
+          try:
+              dither_none = Image.Dither.NONE
+          except AttributeError:
+              dither_none = 0
 
           pngs = list(Path('artifacts').glob('*.png'))
           if not pngs:
@@ -122,7 +132,7 @@ jobs:
                   status = "Fixed"
               else:
                   status = "Kept "
-              indexed = Image.fromarray(arr, 'RGB').quantize(palette=pal_img, dither=Image.Dither.NONE)
+              indexed = Image.fromarray(arr, 'RGB').quantize(palette=pal_img, dither=dither_none)
               indexed.save(Path('out') / png.name)
               print(f"{status} {png.name}")
           PY
