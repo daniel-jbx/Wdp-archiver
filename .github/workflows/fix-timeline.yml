@@ -1,0 +1,286 @@
+name: Fix Timeline
+
+# Heavy pre-computation step before reconcile:
+#   1. Merge rediff + production timelines (rediff wins on overlap)
+#   2. Verify every entry's src against actual R2 files
+#   3. Verify every diff's base is a valid PNG on R2
+#   4. Drop broken entries (with safety gates)
+#   5. Upload `timeline-clean.json` to R2 (the verified merged result)
+#   6. Upload `timeline-prod-snapshot.json` to R2 (hash for reconcile race guard)
+#
+# Does NOT touch timeline.json or timeline-rediff.json. Safe to re-run.
+# Reconcile is a fast atomic swap of timeline-clean.json → timeline.json.
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Allow drops even if >5% of entries are unrecoverable'
+        type: boolean
+        default: false
+
+concurrency:
+  group: fix-timeline
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Install rclone
+        run: |
+          curl -fsSL -o rclone.deb https://downloads.rclone.org/rclone-current-linux-amd64.deb
+          sudo dpkg -i rclone.deb
+          rm -f rclone.deb
+
+      - name: Download timelines
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          mkdir -p work
+          rclone copyto ":s3:${R2_BUCKET}/timeline.json" work/timeline-prod.json \
+            --ignore-size \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          rclone copyto ":s3:${R2_BUCKET}/timeline-rediff.json" work/timeline-rediff.json \
+            --ignore-size \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "Prod entries:   $(python3 -c 'import json; print(len(json.load(open("work/timeline-prod.json"))))')"
+          echo "Rediff entries: $(python3 -c 'import json; print(len(json.load(open("work/timeline-rediff.json"))))')"
+
+      - name: List R2 files (ground truth)
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone lsf ":s3:${R2_BUCKET}" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR > work/r2-files.txt
+          echo "Files on R2: $(wc -l < work/r2-files.txt)"
+          echo "  wdpsnapshot_*: $(grep -c '^wdpsnapshot_' work/r2-files.txt || true)"
+          echo "  wdpdiff_*:     $(grep -c '^wdpdiff_' work/r2-files.txt || true)"
+
+      - name: Merge and verify
+        env:
+          FORCE: ${{ inputs.force }}
+        run: |
+          python3 -u <<'PY'
+          import json, os, sys
+          from collections import defaultdict
+          from pathlib import Path
+
+          rediff = json.load(open('work/timeline-rediff.json'))
+          prod   = json.load(open('work/timeline-prod.json'))
+          on_r2  = set(line.strip() for line in open('work/r2-files.txt') if line.strip())
+          force  = os.environ.get('FORCE', 'false').lower() == 'true'
+
+          if not rediff:
+              sys.exit("ERROR: rediff timeline empty")
+
+          T_end = rediff[-1]['time']
+          print(f"Rediff entries: {len(rediff)}, ends at {T_end}")
+          print(f"Prod entries:   {len(prod)}, ends at {prod[-1]['time']}")
+          print(f"Files on R2:    {len(on_r2)}")
+
+          # Merge: rediff wins overlapping timestamps, prod fills gaps + appends
+          merged_by_time = {e['time']: e for e in prod}
+          overridden = 0
+          for e in rediff:
+              if e['time'] in merged_by_time:
+                  overridden += 1
+              merged_by_time[e['time']] = e
+          merged = sorted(merged_by_time.values(), key=lambda e: e['time'])
+
+          prod_after = sum(1 for e in prod if e['time'] > T_end)
+          rediff_times = {e['time'] for e in rediff}
+          prod_gaps = sum(1 for e in prod
+                          if e['time'] <= T_end and e['time'] not in rediff_times)
+
+          print(f"\nMerge:")
+          print(f"  Merged entries:           {len(merged)}")
+          print(f"  Rediff overrode prod:     {overridden}")
+          print(f"  Prod filled gaps <= T_end:{prod_gaps}")
+          print(f"  Prod appended > T_end:    {prod_after}")
+
+          # Verify against R2
+          valid_pngs = {e['time'] for e in merged
+                        if e['kind'] == 'png' and e['src'] in on_r2}
+
+          drops = []
+          for e in merged:
+              if e['src'] not in on_r2:
+                  drops.append((e, 'missing src file'))
+                  continue
+              if e['kind'] == 'diff':
+                  base = e.get('base')
+                  if base and base not in valid_pngs:
+                      drops.append((e, f'base {base} not a valid PNG on R2'))
+
+          dropped_times = {e['time'] for e, _ in drops}
+          clean = [e for e in merged if e['time'] not in dropped_times]
+
+          # Post-drop re-verify: ensure no orphaned diffs remain
+          valid_pngs_clean = {e['time'] for e in clean
+                              if e['kind'] == 'png' and e['src'] in on_r2}
+          still_broken = [e for e in clean
+                          if e['kind'] == 'diff' and e.get('base')
+                          and e['base'] not in valid_pngs_clean]
+          if still_broken:
+              sys.exit(f"ERROR: repair failed — {len(still_broken)} diffs "
+                       f"still broken after drop. Bug in repair logic.")
+
+          # Orphans: files on R2 not referenced by any clean entry
+          referenced_srcs = {e['src'] for e in clean}
+          orphans = sorted(f for f in on_r2
+                           if f.startswith(('wdpsnapshot_', 'wdpdiff_'))
+                           and f not in referenced_srcs)
+
+          drop_pct = 100 * len(drops) / len(merged) if merged else 0
+          print(f"\nVerification:")
+          print(f"  Valid PNGs on R2:   {len(valid_pngs_clean)}")
+          print(f"  Entries to drop:    {len(drops)} ({drop_pct:.2f}%)")
+          print(f"  Orphans on R2:      {len(orphans)} (not deleted, reported only)")
+
+          # Drop detail
+          if drops:
+              print(f"\n{'=' * 70}")
+              print(f"DROPPED ENTRIES ({len(drops)}):")
+              print(f"{'=' * 70}")
+              by_reason = defaultdict(list)
+              by_day    = defaultdict(list)
+              for e, reason in drops:
+                  by_reason[reason].append(e)
+                  by_day[e['time'][:8]].append((e, reason))
+
+              print(f"\nBy reason:")
+              for reason, es in by_reason.items():
+                  print(f"  {reason}: {len(es)}")
+
+              print(f"\nBy day:")
+              for day in sorted(by_day):
+                  print(f"  {day}: {len(by_day[day])}")
+
+              print(f"\nSample (first 15):")
+              for e, reason in drops[:15]:
+                  print(f"  {e['time']} ({e['kind']}): {reason}")
+
+          # Orphans detail
+          if orphans:
+              print(f"\n{'=' * 70}")
+              print(f"ORPHANS ON R2 ({len(orphans)}):")
+              print(f"{'=' * 70}")
+              print("  Files on R2 not referenced by any timeline entry.")
+              print("  Not deleted automatically — review manually if needed.")
+              for f in orphans[:20]:
+                  print(f"  {f}")
+              if len(orphans) > 20:
+                  print(f"  ... and {len(orphans) - 20} more")
+
+          # Safety gates
+          print(f"\n{'=' * 70}")
+          if drop_pct > 50:
+              sys.exit(f"ERROR: {drop_pct:.1f}% drop rate — catastrophic. "
+                       f"Investigate before proceeding. Use force=true to override.")
+          if drop_pct > 5 and not force:
+              sys.exit(f"ERROR: {drop_pct:.1f}% drop rate exceeds 5% safe threshold. "
+                       f"Review drops.txt artifact, then re-run with force=true if "
+                       f"the loss is expected/acceptable.")
+          if drop_pct > 5 and force:
+              print(f"::warning::High drop rate ({drop_pct:.1f}%) allowed by force=true")
+
+          # Write outputs
+          with open('work/timeline-clean.json', 'w') as f:
+              json.dump(clean, f, indent=2)
+          with open('work/drops.txt', 'w') as f:
+              for e, reason in drops:
+                  f.write(f"{e['time']}\t{e['kind']}\t{e['src']}\t{reason}\n")
+          with open('work/orphans.txt', 'w') as f:
+              f.write('\n'.join(orphans))
+          with open('work/summary.txt', 'w') as f:
+              f.write(f"prod_last: {prod[-1]['time']}\n")
+              f.write(f"rediff_last: {T_end}\n")
+              f.write(f"merged: {len(merged)}\n")
+              f.write(f"clean: {len(clean)}\n")
+              f.write(f"dropped: {len(drops)}\n")
+              f.write(f"drop_pct: {drop_pct:.2f}\n")
+              f.write(f"orphans: {len(orphans)}\n")
+
+          print(f"\nResult: {len(merged)} → {len(clean)} "
+                f"({len(drops)} dropped, {drop_pct:.2f}%)")
+          print(f"Prepared: timeline-clean.json + timeline-prod-snapshot.json for upload")
+          PY
+
+      - name: Upload timeline-clean.json and prod snapshot to R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+        run: |
+          rclone copyto work/timeline-clean.json ":s3:${R2_BUCKET}/timeline-clean.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "✓ Uploaded timeline-clean.json"
+
+          rclone copyto work/timeline-prod.json ":s3:${R2_BUCKET}/timeline-prod-snapshot.json" \
+            --s3-provider=Cloudflare --s3-endpoint="$R2_ENDPOINT" \
+            --s3-access-key-id="$R2_ACCESS_KEY_ID" --s3-secret-access-key="$R2_SECRET_ACCESS_KEY" \
+            --s3-no-check-bucket --log-level ERROR
+          echo "✓ Uploaded timeline-prod-snapshot.json (race guard hash)"
+
+      - name: Report
+        if: always()
+        run: |
+          if [ -f work/summary.txt ]; then
+            echo "### Fix Timeline summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            sed 's/^/- /' work/summary.txt >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f work/drops.txt ] && [ -s work/drops.txt ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Dropped entries" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -30 work/drops.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            total=$(wc -l < work/drops.txt)
+            if [ "$total" -gt 30 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "_($((total-30)) more in drops.txt artifact)_" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+          if [ -f work/orphans.txt ] && [ -s work/orphans.txt ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Orphans on R2 (not deleted)" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            head -20 work/orphans.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Upload artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fix-timeline-${{ github.run_id }}
+          path: |
+            work/timeline-clean.json
+            work/drops.txt
+            work/orphans.txt
+            work/summary.txt
+          retention-days: 30
+          if-no-files-found: warn
