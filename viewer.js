@@ -1,17 +1,17 @@
 (function() {
-  const canvas    = document.getElementById('canvas');
-  const selCanvas = document.getElementById('sel-canvas');
-  const slider    = document.getElementById('slider');
-  const tsLabel   = document.getElementById('timestamp-label-top');
-  const interval  = document.getElementById('interval-select');
-  const datePick  = document.getElementById('date-picker');
-  const timeSel   = document.getElementById('time-select');
-  const dlSnap    = document.getElementById('dl-snapshot');
-  const dlToggle  = document.getElementById('dl-select-toggle');
-  const dlPng     = document.getElementById('dl-select-png');
-  const dlOverlay = document.getElementById('dl-select-overlay');
-  const coordsDiv = document.getElementById('coords-display');
-  const selCtx    = selCanvas.getContext('2d');
+  const canvas     = document.getElementById('canvas');
+  const selCanvas  = document.getElementById('sel-canvas');
+  const daySlider  = document.getElementById('slider-day');
+  const snapSlider = document.getElementById('slider-snap');
+  const tsLabel    = document.getElementById('timestamp-label-top');
+  const datePick   = document.getElementById('date-picker');
+  const timeSel    = document.getElementById('time-select');
+  const dlSnap     = document.getElementById('dl-snapshot');
+  const dlToggle   = document.getElementById('dl-select-toggle');
+  const dlPng      = document.getElementById('dl-select-png');
+  const dlOverlay  = document.getElementById('dl-select-overlay');
+  const coordsDiv  = document.getElementById('coords-display');
+  const selCtx     = selCanvas.getContext('2d');
 
   const _diffBtnEl = document.getElementById('diff-btn');
   if (_diffBtnEl) _diffBtnEl.style.display = 'none';
@@ -105,30 +105,47 @@
     }
   }
 
+  // ─── Compositor with bounded LRU caches ────────────────────────────────
   class Compositor {
-    constructor() {
-      this.baseCache = new Map();
+    constructor(opts) {
+      opts = opts || {};
+      this.maxBases = opts.maxBases || 4;
+      this.maxDiffs = opts.maxDiffs || 96;
+      this.baseCache = new Map();   // insertion order = LRU order
       this.diffCache = new Map();
       this.palette = null;
     }
-    setPalette(p) {
-      this.palette = p;
-    }
+    setPalette(p) { this.palette = p; }
+
     registerBase(baseTime, imgPromise) {
+      // refresh position on repeat use
+      this.baseCache.delete(baseTime);
       this.baseCache.set(baseTime, imgPromise);
+      while (this.baseCache.size > this.maxBases) {
+        const k = this.baseCache.keys().next().value;
+        this.baseCache.delete(k);
+      }
     }
-    hasBase(baseTime) {
-      return this.baseCache.has(baseTime);
-    }
+    hasBase(baseTime) { return this.baseCache.has(baseTime); }
+
     getDiff(src) {
-      if (this.diffCache.has(src)) return this.diffCache.get(src);
+      if (this.diffCache.has(src)) {
+        const v = this.diffCache.get(src);
+        this.diffCache.delete(src);
+        this.diffCache.set(src, v);
+        return v;
+      }
       const p = fetch(BASE_URL + src).then(r => {
         if (!r.ok) throw new Error('diff failed: ' + src);
         return r.json();
       });
       this.diffCache.set(src, p);
+      while (this.diffCache.size > this.maxDiffs) {
+        this.diffCache.delete(this.diffCache.keys().next().value);
+      }
       return p;
     }
+
     async compose(entry) {
       const basePromise = this.baseCache.get(entry.base);
       if (!basePromise) throw new Error('base not loaded: ' + entry.base);
@@ -504,115 +521,197 @@
     }
   }
 
-  class FilterController {
-    constructor(allEntries) {
-      this.all = allEntries;
-      this.filtered = [];
-      this.currentIndex = -1;
-      this.intervalSec = 3600;
-    }
-    setInterval(minutes) { this.intervalSec = minutes * 60; }
-    rebuild(anchorName = null) {
-      const interval = this.intervalSec;
-      if (!interval || this.all.length === 0) {
-        this.filtered = this.all.slice().sort((a, b) => epochFromName(a.name) - epochFromName(b.name));
-        slider.max = Math.max(0, this.filtered.length - 1);
-        let idx = anchorName ? this.filtered.findIndex(e => e.name === anchorName) : -1;
-        if (idx === -1) idx = this.filtered.length - 1;
-        this.load(idx);
-        return;
+  // ─── Navigator: in-memory day index + within-day index ─────────────────
+  class Navigator {
+    constructor(entries) {
+      this.all = entries.slice().sort((a, b) => epochFromName(a.name) - epochFromName(b.name));
+      this.dayGroups = [];
+      this.dayIdx = 0;
+      this.withinIdx = 0;
+      this.onLoadSnapshot = null;
+      this.buildDayGroups();
+      if (this.dayGroups.length) {
+        this.dayIdx = this.dayGroups.length - 1;
+        const g = this.dayGroups[this.dayIdx];
+        this.withinIdx = g.entries.length - 1;
       }
-      const cands = this.all
-        .map(entry => ({ entry, ep: epochFromName(entry.name) }))
-        .sort((a, b) => a.ep - b.ep);
-      const anchorIdx = anchorName ? cands.findIndex(c => c.entry.name === anchorName) : cands.length - 1;
-      if (anchorIdx === -1) { this.load(0); return; }
-      const anchorEp = cands[anchorIdx].ep;
-      const selected = new Map();
-      selected.set(anchorEp, cands[anchorIdx].entry);
-      const minEp = cands[0].ep, maxEp = cands[cands.length - 1].ep;
-      for (let k = Math.ceil((minEp - anchorEp) / interval); k <= Math.floor((maxEp - anchorEp) / interval); k++) {
-        if (k === 0) continue;
-        const target = anchorEp + k * interval;
-        let l = 0, r = cands.length - 1;
-        while (l <= r) { const m = (l + r) >> 1; if (cands[m].ep < target) l = m + 1; else r = m - 1; }
-        let best = null, bestDiff = Infinity;
-        if (l < cands.length) { const d = Math.abs(cands[l].ep - target); if (d < bestDiff) { bestDiff = d; best = cands[l]; } }
-        if (l - 1 >= 0) { const d = Math.abs(cands[l - 1].ep - target); if (d < bestDiff) { bestDiff = d; best = cands[l - 1]; } }
-        if (best && !selected.has(best.ep)) selected.set(best.ep, best.entry);
+    }
+    buildDayGroups() {
+      const map = new Map();
+      for (const entry of this.all) {
+        const ts = parseTimestamp(entry.name);
+        const date = ts ? ts.date : 'unknown';
+        if (!map.has(date)) map.set(date, []);
+        map.get(date).push(entry);
       }
-      this.filtered = Array.from(selected.keys()).sort((a, b) => a - b).map(ep => selected.get(ep));
-      slider.max = Math.max(0, this.filtered.length - 1);
-      let targetIdx = this.filtered.findIndex(e => e.name === cands[anchorIdx].entry.name);
-      if (targetIdx === -1) targetIdx = this.filtered.length - 1;
-      this.load(targetIdx);
+      this.dayGroups = Array.from(map.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([date, entries]) => ({ date, entries }));
     }
-    load(idx) {
-      if (idx < 0 || idx >= this.filtered.length) return;
-      this.currentIndex = idx;
-      slider.value = idx;
-      const entry = this.filtered[idx];
-      if (!entry) return;
-      const ts = parseTimestamp(entry.name);
-      tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : entry.name;
-      if (this.onLoadSnapshot) this.onLoadSnapshot(entry);
+    entryAt(d, w) {
+      const group = this.dayGroups[d];
+      if (!group) return null;
+      return group.entries[w] || null;
     }
-    currentEntry() { return this.filtered[this.currentIndex] || null; }
-    currentName() { return this.currentEntry()?.name ?? null; }
+    currentEntry() { return this.entryAt(this.dayIdx, this.withinIdx); }
+    currentName()  { return this.currentEntry()?.name ?? null; }
+    fireLoad() {
+      const entry = this.currentEntry();
+      if (entry && this.onLoadSnapshot) this.onLoadSnapshot(entry);
+    }
+    setPosition(d, w) {
+      if (d < 0 || d >= this.dayGroups.length) return;
+      const group = this.dayGroups[d];
+      if (!group) return;
+      if (w < 0) w = 0;
+      if (w >= group.entries.length) w = group.entries.length - 1;
+      this.dayIdx = d;
+      this.withinIdx = w;
+      this.syncUI();
+      this.fireLoad();
+    }
+    goToName(name) {
+      for (let d = 0; d < this.dayGroups.length; d++) {
+        const g = this.dayGroups[d];
+        const w = g.entries.findIndex(e => e.name === name);
+        if (w !== -1) {
+          this.dayIdx = d;
+          this.withinIdx = w;
+          this.syncUI();
+          this.fireLoad();
+          return true;
+        }
+      }
+      return false;
+    }
+    syncUI() {
+      if (!this.dayGroups.length) return;
+      const group = this.dayGroups[this.dayIdx];
+      daySlider.max = Math.max(0, this.dayGroups.length - 1);
+      daySlider.value = this.dayIdx;
+      snapSlider.max = Math.max(0, group.entries.length - 1);
+      snapSlider.value = this.withinIdx;
+
+      const entry = this.currentEntry();
+      if (entry) {
+        const ts = parseTimestamp(entry.name);
+        tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : entry.name;
+      }
+
+      datePick.min = this.dayGroups[0].date;
+      datePick.max = this.dayGroups[this.dayGroups.length - 1].date;
+      datePick.value = group.date;
+
+      if (timeSel.dataset.date !== group.date) {
+        timeSel.dataset.date = group.date;
+        timeSel.innerHTML = '<option value="">Select time...</option>';
+        for (const e of group.entries) {
+          const ts = parseTimestamp(e.name);
+          const o = document.createElement('option');
+          o.value = e.name;
+          o.text = ts ? ts.time : e.name;
+          timeSel.appendChild(o);
+        }
+      }
+      timeSel.style.display = 'inline-block';
+      if (entry) timeSel.value = entry.name;
+    }
   }
 
+  // ─── Instances ─────────────────────────────────────────────────────────
   const renderer = new Renderer(canvas);
   const viewport = new Viewport(window.innerWidth, window.innerHeight);
   const selection = new SelectionManager(selCtx, viewport);
-  const filterCtrl = new FilterController([]);
-  const compositor = new Compositor();
+  const compositor = new Compositor({ maxBases: 4, maxDiffs: 128 });
+  let nav = null;
   let currentSource = null;
   let initialLoadDone = false;
 
   viewport.onTapLeft = () => {
-    if (filterCtrl.currentIndex > 0) filterCtrl.load(filterCtrl.currentIndex - 1);
+    if (!nav) return;
+    if (nav.withinIdx > 0) nav.setPosition(nav.dayIdx, nav.withinIdx - 1);
+    else if (nav.dayIdx > 0) {
+      const prev = nav.dayGroups[nav.dayIdx - 1];
+      nav.setPosition(nav.dayIdx - 1, prev.entries.length - 1);
+    }
   };
   viewport.onTapRight = () => {
-    if (filterCtrl.currentIndex < filterCtrl.filtered.length - 1) filterCtrl.load(filterCtrl.currentIndex + 1);
+    if (!nav) return;
+    const g = nav.dayGroups[nav.dayIdx];
+    if (g && nav.withinIdx < g.entries.length - 1) nav.setPosition(nav.dayIdx, nav.withinIdx + 1);
+    else if (nav.dayIdx < nav.dayGroups.length - 1) nav.setPosition(nav.dayIdx + 1, 0);
   };
 
-  let loadGeneration = 0;
+  // ─── Single-flight load gate ───────────────────────────────────────────
+  let inFlight = false;
+  let pendingEntry = null;
 
-  async function onLoadSnapshot(entry) {
-    const myGen = ++loadGeneration;
-    try {
-      let source;
-      if (entry.kind === 'png') {
-        const p = loadImage(BASE_URL + entry.src);
-        compositor.registerBase(entry.time, p);
-        source = await p;
-      } else if (entry.kind === 'diff') {
-        if (!compositor.hasBase(entry.base)) {
-          const baseEntry = filterCtrl.all.find(
-            e => e.kind === 'png' && e.time === entry.base
-          );
-          if (!baseEntry) {
-            throw new Error('base entry missing from manifest: ' + entry.base);
-          }
-          const p = loadImage(BASE_URL + baseEntry.src);
-          compositor.registerBase(baseEntry.time, p);
-        }
-        source = await compositor.compose(entry);
-      } else {
-        source = await loadImage(BASE_URL + entry.name);
+  async function loadSourceFor(entry) {
+    let source;
+    if (entry.kind === 'png') {
+      const p = loadImage(BASE_URL + entry.src);
+      compositor.registerBase(entry.time, p);
+      source = await p;
+    } else if (entry.kind === 'diff') {
+      if (!compositor.hasBase(entry.base)) {
+        const baseEntry = nav.all.find(e => e.kind === 'png' && e.time === entry.base);
+        if (!baseEntry) throw new Error('base entry missing from manifest: ' + entry.base);
+        const p = loadImage(BASE_URL + baseEntry.src);
+        compositor.registerBase(baseEntry.time, p);
       }
-      if (myGen !== loadGeneration) {
-        return; // superseded by a newer load
-      }
-      applySource(source);
-    } catch (e) {
-      if (myGen === loadGeneration) {
-        console.error('load failed:', entry, e);
-        tsLabel.textContent = 'load failed';
+      source = await compositor.compose(entry);
+    } else {
+      source = await loadImage(BASE_URL + entry.name);
+    }
+    return source;
+  }
+
+  function prefetchNeighbors(entry) {
+    const g = nav.dayGroups[nav.dayIdx];
+    if (!g) return;
+    const idx = g.entries.indexOf(entry);
+    if (idx === -1) return;
+    const targets = [];
+    if (idx > 0) targets.push(g.entries[idx - 1]);
+    if (idx < g.entries.length - 1) targets.push(g.entries[idx + 1]);
+    if (idx === 0 && nav.dayIdx > 0) {
+      const prev = nav.dayGroups[nav.dayIdx - 1].entries;
+      if (prev.length) targets.push(prev[prev.length - 1]);
+    }
+    if (idx === g.entries.length - 1 && nav.dayIdx < nav.dayGroups.length - 1) {
+      const next = nav.dayGroups[nav.dayIdx + 1].entries;
+      if (next.length) targets.push(next[0]);
+    }
+    for (const t of targets) {
+      if (t.kind === 'diff') {
+        compositor.getDiff(t.src).catch(() => {});
       }
     }
   }
-  filterCtrl.onLoadSnapshot = onLoadSnapshot;
+
+  async function onLoadSnapshot(entry) {
+    pendingEntry = entry;
+    if (inFlight) return;
+    inFlight = true;
+    try {
+      while (pendingEntry) {
+        const target = pendingEntry;
+        pendingEntry = null;
+        try {
+          const source = await loadSourceFor(target);
+          if (!pendingEntry) {
+            applySource(source);
+            prefetchNeighbors(target);
+          }
+        } catch (e) {
+          console.error('load failed:', target, e);
+          if (!pendingEntry) tsLabel.textContent = 'load failed';
+        }
+      }
+    } finally {
+      inFlight = false;
+    }
+  }
 
   function applySource(source) {
     const prevRanges = current.ranges;
@@ -709,7 +808,7 @@
   addEvents();
 
   dlSnap.addEventListener('click', async () => {
-    const entry = filterCtrl.currentEntry();
+    const entry = nav.currentEntry();
     if (!entry) return;
     if (entry.kind === 'png' && entry.src) {
       const a = document.createElement('a');
@@ -734,7 +833,7 @@
   });
 
   copyLinkBtn.addEventListener('click', () => {
-    const name = filterCtrl.currentName();
+    const name = nav.currentName();
     if (!name) return;
     const url = new URL(window.location);
     url.searchParams.set('snap', name);
@@ -766,7 +865,7 @@
     const data = selection.getCroppedData(currentSource);
     if (!data) return;
     const bounds = cropToBounds(data.x, data.y, data.w, data.h);
-    const ts = parseTimestamp(filterCtrl.currentName() || '')?.epoch ?? Date.now();
+    const ts = parseTimestamp(nav.currentName() || '')?.epoch ?? Date.now();
     const overlay = {
       id: `${dataset}_custom_${ts}`, schemaVersion:"1", name:`custom_${ts}.png`,
       opacity:1, image:{dataUrl:data.dataUrl, width:data.w, height:data.h},
@@ -781,71 +880,63 @@
     URL.revokeObjectURL(url);
   });
 
+  // Keyboard: arrows step within-day, then cross day boundary.
   window.addEventListener('keydown', e => {
-    if (e.key === 'ArrowLeft') { e.preventDefault(); if (filterCtrl.currentIndex>0) filterCtrl.load(filterCtrl.currentIndex-1); }
-    else if (e.key === 'ArrowRight') { e.preventDefault(); if (filterCtrl.currentIndex<filterCtrl.filtered.length-1) filterCtrl.load(filterCtrl.currentIndex+1); }
-    else if (e.key === 'r' || e.key === 'R') { e.preventDefault(); if (currentSource) { viewport.reset(currentSource); draw(); } }
+    if (!nav) return;
+    if (e.key === 'ArrowLeft') {
+      e.preventDefault();
+      if (nav.withinIdx > 0) nav.setPosition(nav.dayIdx, nav.withinIdx - 1);
+      else if (nav.dayIdx > 0) {
+        const prev = nav.dayGroups[nav.dayIdx - 1];
+        nav.setPosition(nav.dayIdx - 1, prev.entries.length - 1);
+      }
+    } else if (e.key === 'ArrowRight') {
+      e.preventDefault();
+      const g = nav.dayGroups[nav.dayIdx];
+      if (g && nav.withinIdx < g.entries.length - 1) nav.setPosition(nav.dayIdx, nav.withinIdx + 1);
+      else if (nav.dayIdx < nav.dayGroups.length - 1) nav.setPosition(nav.dayIdx + 1, 0);
+    } else if (e.key === 'r' || e.key === 'R') {
+      e.preventDefault();
+      if (currentSource) { viewport.reset(currentSource); draw(); }
+    }
   });
 
-  interval.addEventListener('change', () => {
-    filterCtrl.setInterval(parseInt(interval.value));
-    filterCtrl.rebuild();
-  });
-
-  function setupDateTimePickers(entries) {
-    const byDate = new Map();
-    for (const entry of entries) {
-      const ts = parseTimestamp(entry.name);
-      if (!ts) continue;
-      if (!byDate.has(ts.date)) byDate.set(ts.date, []);
-      byDate.get(ts.date).push({ name: entry.name, time: ts.time });
-    }
-    for (const arr of byDate.values()) arr.sort((a, b) => a.time.localeCompare(b.time));
-    const dates = Array.from(byDate.keys()).sort();
-    if (dates.length) {
-      datePick.min = dates[0];
-      datePick.max = dates[dates.length - 1];
-      datePick.value = dates[dates.length - 1];
-    }
-    function populateTime(dateVal) {
-      const arr = byDate.get(dateVal);
-      if (!arr || arr.length === 0) { timeSel.style.display = 'none'; return; }
-      timeSel.style.display = 'inline-block';
-      timeSel.innerHTML = '<option value="">Select time...</option>';
-      arr.forEach(s => {
-        const o = document.createElement('option');
-        o.value = s.name; o.text = s.time;
-        timeSel.appendChild(o);
-      });
-    }
-    if (datePick.value) {
-      populateTime(datePick.value);
-      const arr = byDate.get(datePick.value);
-      if (arr && arr.length) timeSel.value = arr[arr.length - 1].name;
-    }
-    datePick.addEventListener('change', () => { populateTime(datePick.value); timeSel.value = ''; });
-    timeSel.addEventListener('change', () => {
-      const name = timeSel.value;
-      if (name) filterCtrl.rebuild(name);
-    });
-    return timeSel.value || null;
+  // ─── Slider handlers (debounced → gate) ────────────────────────────────
+  let debounceTimer = null;
+  function debouncedFire() {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(() => { if (nav) nav.fireLoad(); }, 150);
   }
 
-  let sliderDebounceTimer = null;
-  slider.addEventListener('input', () => {
-    const idx = parseInt(slider.value);
-    if (isNaN(idx) || idx < 0 || idx >= filterCtrl.filtered.length) return;
+  daySlider.addEventListener('input', () => {
+    if (!nav) return;
+    const idx = parseInt(daySlider.value, 10);
+    if (isNaN(idx) || idx === nav.dayIdx) return;
+    nav.dayIdx = idx;
+    nav.withinIdx = 0;
+    nav.syncUI();
+    debouncedFire();
+  });
+  snapSlider.addEventListener('input', () => {
+    if (!nav) return;
+    const idx = parseInt(snapSlider.value, 10);
+    const g = nav.dayGroups[nav.dayIdx];
+    if (!g || isNaN(idx) || idx < 0 || idx >= g.entries.length) return;
+    if (idx === nav.withinIdx) return;
+    nav.withinIdx = idx;
+    nav.syncUI();
+    debouncedFire();
+  });
 
-    // Instant feedback: update the timestamp label immediately
-    const entry = filterCtrl.filtered[idx];
-    if (entry) {
-      const ts = parseTimestamp(entry.name);
-      tsLabel.textContent = ts ? `${ts.date} ${ts.time}` : entry.name;
-    }
-
-    // Debounced load: only fire after the user stops dragging for 150ms
-    clearTimeout(sliderDebounceTimer);
-    sliderDebounceTimer = setTimeout(() => filterCtrl.load(idx), 150);
+  datePick.addEventListener('change', () => {
+    if (!nav) return;
+    const d = nav.dayGroups.findIndex(g => g.date === datePick.value);
+    if (d !== -1) nav.setPosition(d, 0);
+  });
+  timeSel.addEventListener('change', () => {
+    if (!nav) return;
+    const name = timeSel.value;
+    if (name) nav.goToName(name);
   });
 
   function onResize() {
@@ -868,15 +959,7 @@
         if (!Array.isArray(entries)) throw new Error('bad timeline');
         console.log(`[manifest] timeline.json: ${entries.length} entries`);
         return entries;
-      })
-      .catch(() =>
-        fetch(BASE_URL + 'snapshots.json')
-          .then(r => r.json())
-          .then(files => {
-            console.log(`[manifest] snapshots.json (legacy): ${files.length} entries`);
-            return files.map(f => ({ name: f, kind: 'png', src: f }));
-          })
-      );
+      });
   }
 
   loadManifest()
@@ -892,14 +975,17 @@
         console.log('[palette] not found; v2/v3 diffs will fail to render');
       }
       if (!entries.length) { tsLabel.textContent = 'No snapshots.'; return; }
-      filterCtrl.all = entries;
-      const urlEntry = urlSnap ? entries.find(e => e.name === urlSnap) : null;
-      if (urlEntry) {
-        filterCtrl.rebuild(urlEntry.name);
+
+      nav = new Navigator(entries);
+      nav.onLoadSnapshot = onLoadSnapshot;
+      console.log(`[nav] ${nav.dayGroups.length} days, latest ${nav.dayGroups[nav.dayGroups.length-1].date}`);
+
+      const urlEntry = urlSnap ? nav.all.find(e => e.name === urlSnap) : null;
+      if (urlEntry && nav.goToName(urlEntry.name)) {
+        // navigated (syncUI + fireLoad already ran)
       } else {
-        const anchor = setupDateTimePickers(entries);
-        filterCtrl.setInterval(parseInt(interval.value));
-        filterCtrl.rebuild(anchor);
+        nav.syncUI();
+        nav.fireLoad();
       }
     })
     .catch(e => { tsLabel.textContent = 'Failed to load data'; console.error(e); });
