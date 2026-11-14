@@ -12,13 +12,6 @@
 
   <div id="top-bar">
     <div id="selector-group">
-      <select id="interval-select">
-        <option value="1440">1 day</option>
-        <option value="360">6 hrs</option>
-        <option value="60" selected>1 hr</option>
-        <option value="15">15 min</option>
-        <option value="0">all</option>
-      </select>
       <div id="date-group">
         <input type="date" id="date-picker">
         <select id="time-select" style="display:none;">
@@ -47,8 +40,14 @@
   </div>
 
   <div id="controls">
-    <span id="slider-label">drag to move thru time</span>
-    <input type="range" id="slider" min="0" max="0" value="0" step="1">
+    <div class="slider-row">
+      <span class="slider-label">day</span>
+      <input type="range" id="slider-day" min="0" max="0" value="0" step="1">
+    </div>
+    <div class="slider-row">
+      <span class="slider-label">snapshot</span>
+      <input type="range" id="slider-snap" min="0" max="0" value="0" step="1">
+    </div>
   </div>
 
   <script src="viewer.js"></script>
