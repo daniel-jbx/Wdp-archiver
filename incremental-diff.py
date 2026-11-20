@@ -50,7 +50,6 @@ def upload_brotli(env, compressed_bytes, remote):
     try:
         rclone(env, 'copyto', tmp_path, f':s3:{env["R2_BUCKET"]}/{remote}',
                '--header-upload', 'Content-Encoding: br')
-               '--header-upload', 'Content-Type: application/json')
     finally:
         try:
             os.unlink(tmp_path)
