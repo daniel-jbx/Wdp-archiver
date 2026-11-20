@@ -200,6 +200,7 @@
       }
       return c;
     }
+  }
     
   class Renderer {
     constructor(canvas) {
