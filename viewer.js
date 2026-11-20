@@ -156,30 +156,51 @@
       const ctx = c.getContext('2d');
       ctx.drawImage(baseImg, 0, 0);
       const fmt = diff.format || entry.format || 'v1';
+
+      // #47704c is WPlace's transparency sentinel: in base PNGs it appears as
+      // RGB(71,112,76) with alpha=0 via the tRNS chunk, and diffs encode the
+      // same thing as a palette index. A plain fillRect would paint it opaque,
+      // so route writes of this color through clearRect (destination-out).
+      const TRANSPARENT_HEX = '#47704c';
+      const trIdx = this.palette
+        ? this.palette.findIndex(h => typeof h === 'string' && h.toLowerCase() === TRANSPARENT_HEX)
+        : -1;
+
       if (fmt === 'v3-rle') {
         for (const [y, x0, runs] of diff.rows) {
           let x = x0;
           for (const [idx, len] of runs) {
-            ctx.fillStyle = this.palette[idx];
-            ctx.fillRect(x, y, len, 1);
+            if (idx === trIdx) {
+              ctx.clearRect(x, y, len, 1);
+            } else {
+              ctx.fillStyle = this.palette[idx];
+              ctx.fillRect(x, y, len, 1);
+            }
             x += len;
           }
         }
       } else if (fmt === 'v2-flat') {
         for (const [x, y, idx] of diff.changes) {
-          ctx.fillStyle = this.palette[idx];
-          ctx.fillRect(x, y, 1, 1);
+          if (idx === trIdx) {
+            ctx.clearRect(x, y, 1, 1);
+          } else {
+            ctx.fillStyle = this.palette[idx];
+            ctx.fillRect(x, y, 1, 1);
+          }
         }
       } else {
         for (const [x, y, color] of diff.changes) {
-          ctx.fillStyle = color;
-          ctx.fillRect(x, y, 1, 1);
+          if (typeof color === 'string' && color.toLowerCase() === TRANSPARENT_HEX) {
+            ctx.clearRect(x, y, 1, 1);
+          } else {
+            ctx.fillStyle = color;
+            ctx.fillRect(x, y, 1, 1);
+          }
         }
       }
       return c;
     }
-  }
-
+    
   class Renderer {
     constructor(canvas) {
       this.gl = canvas.getContext('webgl', { antialias: false }) ||
