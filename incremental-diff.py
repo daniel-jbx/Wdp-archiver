@@ -50,6 +50,7 @@ def upload_brotli(env, compressed_bytes, remote):
     try:
         rclone(env, 'copyto', tmp_path, f':s3:{env["R2_BUCKET"]}/{remote}',
                '--header-upload', 'Content-Encoding: br')
+               '--header-upload', 'Content-Type: application/json')
     finally:
         try:
             os.unlink(tmp_path)
@@ -190,10 +191,10 @@ def parse_ts(name):
 
 
 def save_timeline(env, tmp, timeline):
-    p = tmp / 'timeline.json'
-    with open(p, 'w') as f:
-        json.dump(timeline, f, indent=2)
-    upload(env, str(p), 'timeline.json')
+    raw = json.dumps(timeline, indent=2).encode('utf-8')
+    compressed = brotli.compress(raw, quality=BROTLI_QUALITY)
+    print(f"timeline.json: {len(raw)/1024:.0f} KB -> {len(compressed)/1024:.0f} KB (br)", flush=True)
+    upload_brotli(env, compressed, 'timeline.json')
 
 
 def main():
