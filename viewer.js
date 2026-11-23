@@ -30,9 +30,6 @@
   const urlBase   = urlParams.get('base');
   const urlTimeline = urlParams.get('timeline') || 'timeline.json';
 
-  // iOS has a much lower per-tab memory ceiling than Android/desktop.
-  // Detected once at startup; drives only the compositor cache sizing
-  // (and prefetch skipping). Everything else is universal.
   const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
                  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 
@@ -86,17 +83,7 @@
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.onload = () => {
-        // Force eager decode. Safari otherwise defers the full RGBA
-        // allocation to first drawImage(), which can trigger a 224 MB spike
-        // during a memory-constrained moment. Decoding here lets the tab's
-        // memory accounting stabilise before we continue.
-        if (typeof img.decode === 'function') {
-          img.decode().then(() => resolve(img), () => resolve(img));
-        } else {
-          resolve(img);
-        }
-      };
+      img.onload = () => resolve(img);
       img.onerror = () => reject(new Error('image failed: ' + url));
       img.src = url;
     });
@@ -121,46 +108,35 @@
     }
   }
 
-  // Some R2 objects were uploaded without Content-Encoding: br, so the
-  // browser hands us raw Brotli bytes and r.json() fails ("Unexpected token
-  // 'O'"). Sniff the first byte; if it's not JSON whitespace / '[' / '{',
-  // decompress with DecompressionStream. Only matters for those broken
-  // uploads — correctly-served files take the fast JSON.parse path.
   async function fetchJson(url) {
     const r = await fetch(url);
     if (!r.ok) throw new Error('fetch failed: ' + url + ' (' + r.status + ')');
-    const buf = await r.arrayBuffer();
-    const b = new Uint8Array(buf);
-    const f = b.length > 0 ? b[0] : -1;
-    const looksJson = f === 0x7B /* { */ || f === 0x5B /* [ */ ||
-                      f === 0x20 || f === 0x09 || f === 0x0A || f === 0x0D;
-    if (looksJson) return JSON.parse(new TextDecoder().decode(buf));
-
-    if (typeof DecompressionStream !== 'undefined') {
-      for (const fmt of ['brotli', 'gzip', 'deflate']) {
-        try {
-          const ds = new DecompressionStream(fmt);
-          const stream = new Blob([buf]).stream().pipeThrough(ds);
-          return JSON.parse(await new Response(stream).text());
-        } catch (_) { /* try next format */ }
+    const clone = r.clone();
+    try {
+      return await r.json();
+    } catch (_) {
+      const buf = await clone.arrayBuffer();
+      if (typeof DecompressionStream !== 'undefined') {
+        for (const fmt of ['brotli', 'gzip', 'deflate']) {
+          try {
+            const ds = new DecompressionStream(fmt);
+            const stream = new Blob([buf]).stream().pipeThrough(ds);
+            return JSON.parse(await new Response(stream).text());
+          } catch (_) { /* try next */ }
+        }
       }
+      throw new Error('unrecognized response encoding: ' + url);
     }
-    throw new Error('unrecognized response encoding: ' + url);
   }
 
-  // ─── Compositor: bounded LRU caches + reusable compose canvas ──────────
   class Compositor {
     constructor(opts) {
       opts = opts || {};
       this.maxBases = opts.maxBases || 4;
       this.maxDiffs = opts.maxDiffs || 96;
-      this.baseCache = new Map();   // insertion order = LRU order
+      this.baseCache = new Map();
       this.diffCache = new Map();
       this.palette = null;
-      // Shared scratch canvas for navigation-driven composes. Reused across
-      // snapshots so we don't allocate ~224 MB per slider movement.
-      // Downloads use { fresh: true } to allocate their own canvas and avoid
-      // clobbering the shared one.
       this.composeCanvas = null;
       this.composeCtx = null;
     }
@@ -188,7 +164,6 @@
       while (this.diffCache.size > this.maxDiffs) {
         this.diffCache.delete(this.diffCache.keys().next().value);
       }
-      // Evict on failure so a transient network error isn't sticky.
       p.catch(() => { this.diffCache.delete(src); });
       return p;
     }
@@ -203,31 +178,29 @@
 
       let target, ctx;
       if (opts.fresh) {
-        // Download path: allocate a private canvas so a concurrent
-        // navigation-driven compose can't overwrite our pixels mid-encode.
         target = document.createElement('canvas');
         target.width = w;
         target.height = h;
         ctx = target.getContext('2d');
+        ctx.drawImage(baseImg, 0, 0);
       } else {
         if (!this.composeCanvas || this.composeCanvas.width !== w || this.composeCanvas.height !== h) {
           this.composeCanvas = document.createElement('canvas');
           this.composeCanvas.width = w;
           this.composeCanvas.height = h;
           this.composeCtx = this.composeCanvas.getContext('2d');
+          this.composeCtx.drawImage(baseImg, 0, 0);
+        } else {
+          ctx = this.composeCtx;
+          ctx.globalCompositeOperation = 'copy';
+          ctx.drawImage(baseImg, 0, 0);
+          ctx.globalCompositeOperation = 'source-over';
         }
         target = this.composeCanvas;
-        ctx = this.composeCtx;
-        ctx.clearRect(0, 0, w, h);
       }
 
-      ctx.drawImage(baseImg, 0, 0);
       const fmt = diff.format || entry.format || 'v1';
 
-      // #47704c is WPlace's transparency sentinel: in base PNGs it appears as
-      // RGB(71,112,76) with alpha=0 via the tRNS chunk, and diffs encode the
-      // same thing as a palette index. A plain fillRect would paint it opaque,
-      // so route writes of this color through clearRect (destination-out).
       const TRANSPARENT_HEX = '#47704c';
       const trIdx = this.palette
         ? this.palette.findIndex(h => typeof h === 'string' && h.toLowerCase() === TRANSPARENT_HEX)
@@ -307,8 +280,6 @@
       this.single = null;
       this._contextLost = false;
 
-      // On context loss, release the big caches immediately so the tab has a
-      // chance to survive. On restore, reload to rebuild textures cleanly.
       canvas.addEventListener('webglcontextlost', e => {
         e.preventDefault();
         this._contextLost = true;
@@ -630,7 +601,6 @@
     }
   }
 
-  // ─── Navigator: in-memory day index + within-day index ─────────────────
   class Navigator {
     constructor(entries) {
       this.all = entries.slice().sort((a, b) => epochFromName(a.name) - epochFromName(b.name));
@@ -727,13 +697,9 @@
     }
   }
 
-  // ─── Instances ─────────────────────────────────────────────────────────
   const renderer = new Renderer(canvas);
   const viewport = new Viewport(window.innerWidth, window.innerHeight);
   const selection = new SelectionManager(selCtx, viewport);
-  // iOS: 1 base + 24 diffs keeps peak memory under Safari's per-tab ceiling.
-  // Elsewhere: keep the larger caches — Android/desktop have the RAM, and
-  // the bigger cache avoids re-downloading bases on back-and-forth scanning.
   const compositor = new Compositor(IS_IOS
     ? { maxBases: 1, maxDiffs: 24 }
     : { maxBases: 4, maxDiffs: 128 });
@@ -756,7 +722,6 @@
     else if (nav.dayIdx < nav.dayGroups.length - 1) nav.setPosition(nav.dayIdx + 1, 0);
   };
 
-  // ─── Single-flight load gate ───────────────────────────────────────────
   let inFlight = false;
   let pendingEntry = null;
 
@@ -781,8 +746,6 @@
   }
 
   function prefetchNeighbors(entry) {
-    // iOS has too little diff cache to make prefetch pay off — skip it to
-    // avoid burning bandwidth on diffs that will be evicted before reuse.
     if (IS_IOS) return;
     const g = nav.dayGroups[nav.dayIdx];
     if (!g) return;
@@ -934,8 +897,6 @@
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
     } else if (entry.kind === 'diff') {
       try {
-        // fresh: true — allocate a private canvas so a slider drag during
-        // the download can't overwrite our pixels before toBlob fires.
         const c = await compositor.compose(entry, { fresh: true });
         c.toBlob(blob => {
           const url = URL.createObjectURL(blob);
@@ -1000,7 +961,6 @@
     URL.revokeObjectURL(url);
   });
 
-  // Keyboard: arrows step within-day, then cross day boundary.
   window.addEventListener('keydown', e => {
     if (!nav) return;
     if (e.key === 'ArrowLeft') {
@@ -1021,7 +981,6 @@
     }
   });
 
-  // ─── Slider handlers (debounced → gate) ────────────────────────────────
   let debounceTimer = null;
   function debouncedFire() {
     clearTimeout(debounceTimer);
@@ -1101,7 +1060,7 @@
 
       const urlEntry = urlSnap ? nav.all.find(e => e.name === urlSnap) : null;
       if (urlEntry && nav.goToName(urlEntry.name)) {
-        // navigated (syncUI + fireLoad already ran)
+        // navigated
       } else {
         nav.syncUI();
         nav.fireLoad();
