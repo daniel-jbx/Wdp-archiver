@@ -111,22 +111,27 @@
   async function fetchJson(url) {
     const r = await fetch(url);
     if (!r.ok) throw new Error('fetch failed: ' + url + ' (' + r.status + ')');
-    const clone = r.clone();
-    try {
-      return await r.json();
-    } catch (_) {
-      const buf = await clone.arrayBuffer();
-      if (typeof DecompressionStream !== 'undefined') {
-        for (const fmt of ['brotli', 'gzip', 'deflate']) {
-          try {
-            const ds = new DecompressionStream(fmt);
-            const stream = new Blob([buf]).stream().pipeThrough(ds);
-            return JSON.parse(await new Response(stream).text());
-          } catch (_) { /* try next */ }
-        }
+    const buf = await r.arrayBuffer();
+    const b = new Uint8Array(buf);
+    const f = b.length > 0 ? b[0] : -1;
+    // JSON starts with `{`, `[`, or whitespace. If the browser already
+    // decompressed (Content-Encoding handled), we see that here.
+    const looksJson = f === 0x7B || f === 0x5B ||
+                      f === 0x20 || f === 0x09 || f === 0x0A || f === 0x0D;
+    if (looksJson) return JSON.parse(new TextDecoder().decode(buf));
+
+    // Otherwise the body is still compressed (upload was missing the CE
+    // header). Try each DecompressionStream format.
+    if (typeof DecompressionStream !== 'undefined') {
+      for (const fmt of ['brotli', 'gzip', 'deflate']) {
+        try {
+          const ds = new DecompressionStream(fmt);
+          const stream = new Blob([buf]).stream().pipeThrough(ds);
+          return JSON.parse(await new Response(stream).text());
+        } catch (_) { /* try next */ }
       }
-      throw new Error('unrecognized response encoding: ' + url);
     }
+    throw new Error('unrecognized response encoding: ' + url);
   }
 
   class Compositor {
@@ -190,6 +195,7 @@
           this.composeCanvas.height = h;
           this.composeCtx = this.composeCanvas.getContext('2d');
           this.composeCtx.drawImage(baseImg, 0, 0);
+          ctx = this.composeCtx;                 // ← THE FIX
         } else {
           ctx = this.composeCtx;
           ctx.globalCompositeOperation = 'copy';
