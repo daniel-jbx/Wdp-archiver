@@ -30,6 +30,12 @@
   const urlBase   = urlParams.get('base');
   const urlTimeline = urlParams.get('timeline') || 'timeline.json';
 
+  // iOS has a much lower per-tab memory ceiling than Android/desktop.
+  // Detected once at startup; drives only the compositor cache sizing
+  // (and prefetch skipping). Everything else is universal.
+  const IS_IOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+                 (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
   const dataset  = location.pathname.includes('/antarktika/') ? 'antarktika' : 'wdp';
   const DEFAULT_BASE = `https://pub-e0766eb5f5114fc097a10215d5e6081b.r2.dev/${dataset === 'wdp' ? '' : 'antarktika/'}`;
   const BASE_URL = urlBase || DEFAULT_BASE;
@@ -80,7 +86,17 @@
     return new Promise((resolve, reject) => {
       const img = new Image();
       img.crossOrigin = 'anonymous';
-      img.onload = () => resolve(img);
+      img.onload = () => {
+        // Force eager decode. Safari otherwise defers the full RGBA
+        // allocation to first drawImage(), which can trigger a 224 MB spike
+        // during a memory-constrained moment. Decoding here lets the tab's
+        // memory accounting stabilise before we continue.
+        if (typeof img.decode === 'function') {
+          img.decode().then(() => resolve(img), () => resolve(img));
+        } else {
+          resolve(img);
+        }
+      };
       img.onerror = () => reject(new Error('image failed: ' + url));
       img.src = url;
     });
@@ -105,7 +121,34 @@
     }
   }
 
-  // ─── Compositor with bounded LRU caches ────────────────────────────────
+  // Some R2 objects were uploaded without Content-Encoding: br, so the
+  // browser hands us raw Brotli bytes and r.json() fails ("Unexpected token
+  // 'O'"). Sniff the first byte; if it's not JSON whitespace / '[' / '{',
+  // decompress with DecompressionStream. Only matters for those broken
+  // uploads — correctly-served files take the fast JSON.parse path.
+  async function fetchJson(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('fetch failed: ' + url + ' (' + r.status + ')');
+    const buf = await r.arrayBuffer();
+    const b = new Uint8Array(buf);
+    const f = b.length > 0 ? b[0] : -1;
+    const looksJson = f === 0x7B /* { */ || f === 0x5B /* [ */ ||
+                      f === 0x20 || f === 0x09 || f === 0x0A || f === 0x0D;
+    if (looksJson) return JSON.parse(new TextDecoder().decode(buf));
+
+    if (typeof DecompressionStream !== 'undefined') {
+      for (const fmt of ['brotli', 'gzip', 'deflate']) {
+        try {
+          const ds = new DecompressionStream(fmt);
+          const stream = new Blob([buf]).stream().pipeThrough(ds);
+          return JSON.parse(await new Response(stream).text());
+        } catch (_) { /* try next format */ }
+      }
+    }
+    throw new Error('unrecognized response encoding: ' + url);
+  }
+
+  // ─── Compositor: bounded LRU caches + reusable compose canvas ──────────
   class Compositor {
     constructor(opts) {
       opts = opts || {};
@@ -114,11 +157,16 @@
       this.baseCache = new Map();   // insertion order = LRU order
       this.diffCache = new Map();
       this.palette = null;
+      // Shared scratch canvas for navigation-driven composes. Reused across
+      // snapshots so we don't allocate ~224 MB per slider movement.
+      // Downloads use { fresh: true } to allocate their own canvas and avoid
+      // clobbering the shared one.
+      this.composeCanvas = null;
+      this.composeCtx = null;
     }
     setPalette(p) { this.palette = p; }
 
     registerBase(baseTime, imgPromise) {
-      // refresh position on repeat use
       this.baseCache.delete(baseTime);
       this.baseCache.set(baseTime, imgPromise);
       while (this.baseCache.size > this.maxBases) {
@@ -135,25 +183,44 @@
         this.diffCache.set(src, v);
         return v;
       }
-      const p = fetch(BASE_URL + src).then(r => {
-        if (!r.ok) throw new Error('diff failed: ' + src);
-        return r.json();
-      });
+      const p = fetchJson(BASE_URL + src);
       this.diffCache.set(src, p);
       while (this.diffCache.size > this.maxDiffs) {
         this.diffCache.delete(this.diffCache.keys().next().value);
       }
+      // Evict on failure so a transient network error isn't sticky.
+      p.catch(() => { this.diffCache.delete(src); });
       return p;
     }
 
-    async compose(entry) {
+    async compose(entry, opts) {
+      opts = opts || {};
       const basePromise = this.baseCache.get(entry.base);
       if (!basePromise) throw new Error('base not loaded: ' + entry.base);
       const [baseImg, diff] = await Promise.all([basePromise, this.getDiff(entry.src)]);
-      const c = document.createElement('canvas');
-      c.width = baseImg.naturalWidth;
-      c.height = baseImg.naturalHeight;
-      const ctx = c.getContext('2d');
+      const w = baseImg.naturalWidth;
+      const h = baseImg.naturalHeight;
+
+      let target, ctx;
+      if (opts.fresh) {
+        // Download path: allocate a private canvas so a concurrent
+        // navigation-driven compose can't overwrite our pixels mid-encode.
+        target = document.createElement('canvas');
+        target.width = w;
+        target.height = h;
+        ctx = target.getContext('2d');
+      } else {
+        if (!this.composeCanvas || this.composeCanvas.width !== w || this.composeCanvas.height !== h) {
+          this.composeCanvas = document.createElement('canvas');
+          this.composeCanvas.width = w;
+          this.composeCanvas.height = h;
+          this.composeCtx = this.composeCanvas.getContext('2d');
+        }
+        target = this.composeCanvas;
+        ctx = this.composeCtx;
+        ctx.clearRect(0, 0, w, h);
+      }
+
       ctx.drawImage(baseImg, 0, 0);
       const fmt = diff.format || entry.format || 'v1';
 
@@ -198,10 +265,10 @@
           }
         }
       }
-      return c;
+      return target;
     }
   }
-    
+
   class Renderer {
     constructor(canvas) {
       this.gl = canvas.getContext('webgl', { antialias: false }) ||
@@ -238,6 +305,25 @@
       this.maxTex = gl.getParameter(gl.MAX_TEXTURE_SIZE);
       this.tiles = [];
       this.single = null;
+      this._contextLost = false;
+
+      // On context loss, release the big caches immediately so the tab has a
+      // chance to survive. On restore, reload to rebuild textures cleanly.
+      canvas.addEventListener('webglcontextlost', e => {
+        e.preventDefault();
+        this._contextLost = true;
+        console.warn('[gl] context lost — dropping caches to free memory');
+        try {
+          compositor.baseCache.clear();
+          compositor.diffCache.clear();
+          compositor.composeCanvas = null;
+          compositor.composeCtx = null;
+        } catch (_) {}
+      }, false);
+      canvas.addEventListener('webglcontextrestored', () => {
+        console.warn('[gl] context restored — reloading to rebuild textures');
+        window.location.reload();
+      }, false);
     }
     setImage(img) {
       const gl = this.gl;
@@ -280,6 +366,7 @@
       this.tiles = []; this.single = null;
     }
     draw(offX, offY, scale, cssW, cssH) {
+      if (this._contextLost) return;
       const gl = this.gl;
       gl.useProgram(this.program);
       gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
@@ -644,7 +731,12 @@
   const renderer = new Renderer(canvas);
   const viewport = new Viewport(window.innerWidth, window.innerHeight);
   const selection = new SelectionManager(selCtx, viewport);
-  const compositor = new Compositor({ maxBases: 4, maxDiffs: 128 });
+  // iOS: 1 base + 24 diffs keeps peak memory under Safari's per-tab ceiling.
+  // Elsewhere: keep the larger caches — Android/desktop have the RAM, and
+  // the bigger cache avoids re-downloading bases on back-and-forth scanning.
+  const compositor = new Compositor(IS_IOS
+    ? { maxBases: 1, maxDiffs: 24 }
+    : { maxBases: 4, maxDiffs: 128 });
   let nav = null;
   let currentSource = null;
   let initialLoadDone = false;
@@ -689,6 +781,9 @@
   }
 
   function prefetchNeighbors(entry) {
+    // iOS has too little diff cache to make prefetch pay off — skip it to
+    // avoid burning bandwidth on diffs that will be evicted before reuse.
+    if (IS_IOS) return;
     const g = nav.dayGroups[nav.dayIdx];
     if (!g) return;
     const idx = g.entries.indexOf(entry);
@@ -764,6 +859,7 @@
   }
 
   function draw() {
+    if (renderer._contextLost) return;
     const bg = dataset === 'antarktika' ? [0.9725,0.9569,0.9412,1] : [0.627,0.741,1.0,1];
     renderer.gl.clearColor(...bg);
     renderer.gl.clear(renderer.gl.COLOR_BUFFER_BIT);
@@ -838,7 +934,9 @@
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
     } else if (entry.kind === 'diff') {
       try {
-        const c = await compositor.compose(entry);
+        // fresh: true — allocate a private canvas so a slider drag during
+        // the download can't overwrite our pixels before toBlob fires.
+        const c = await compositor.compose(entry, { fresh: true });
         c.toBlob(blob => {
           const url = URL.createObjectURL(blob);
           const a = document.createElement('a');
@@ -975,8 +1073,7 @@
   onResize();
 
   function loadManifest() {
-    return fetch(BASE_URL + urlTimeline)
-      .then(r => { if (!r.ok) throw new Error('no timeline'); return r.json(); })
+    return fetchJson(BASE_URL + urlTimeline)
       .then(entries => {
         if (!Array.isArray(entries)) throw new Error('bad timeline');
         console.log(`[manifest] timeline.json: ${entries.length} entries`);
@@ -987,7 +1084,7 @@
   loadManifest()
     .then(entries => Promise.all([
       Promise.resolve(entries),
-      fetch(BASE_URL + 'palette.json').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetchJson(BASE_URL + 'palette.json').catch(() => null),
     ]))
     .then(([entries, palette]) => {
       if (palette) {
